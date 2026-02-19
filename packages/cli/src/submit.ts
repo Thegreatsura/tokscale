@@ -51,6 +51,8 @@ interface SubmitOptions {
   openclaw?: boolean;
   pi?: boolean;
   kimi?: boolean;
+  roocode?: boolean;
+  kilocode?: boolean;
   since?: string;
   until?: string;
   year?: string;
@@ -76,7 +78,7 @@ interface SubmitResponse {
   details?: string[];
 }
 
-type SourceType = "opencode" | "claude" | "codex" | "gemini" | "cursor" | "amp" | "droid" | "openclaw" | "pi" | "kimi";
+type SourceType = "opencode" | "claude" | "codex" | "gemini" | "cursor" | "amp" | "droid" | "openclaw" | "pi" | "kimi" | "roocode" | "kilocode";
 
 async function checkGhCliExists(): Promise<boolean> {
   try {
@@ -219,7 +221,7 @@ export async function submit(options: SubmitOptions = {}): Promise<void> {
 
   console.log(pc.gray("  Scanning local session data..."));
 
-  const hasFilter = options.opencode || options.claude || options.codex || options.gemini || options.cursor || options.amp || options.droid || options.openclaw || options.pi || options.kimi;
+  const hasFilter = options.opencode || options.claude || options.codex || options.gemini || options.cursor || options.amp || options.droid || options.openclaw || options.pi || options.kimi || options.roocode || options.kilocode;
   let sources: SourceType[] | undefined;
   let includeCursor = true;
   if (hasFilter) {
@@ -234,6 +236,8 @@ export async function submit(options: SubmitOptions = {}): Promise<void> {
     if (options.openclaw) sources.push("openclaw");
     if (options.pi) sources.push("pi");
     if (options.kimi) sources.push("kimi");
+    if (options.roocode) sources.push("roocode");
+    if (options.kilocode) sources.push("kilocode");
     includeCursor = sources.includes("cursor");
   }
 

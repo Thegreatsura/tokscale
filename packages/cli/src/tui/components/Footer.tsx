@@ -161,6 +161,18 @@ export function Footer(props: FooterProps) {
             enabled={props.enabledSources.has("kimi")}
             onToggle={props.onSourceToggle}
           />
+          <SourceBadge
+            name={isVeryNarrowTerminal() ? "O" : "O:RC"}
+            source="roocode"
+            enabled={props.enabledSources.has("roocode")}
+            onToggle={props.onSourceToggle}
+          />
+          <SourceBadge
+            name={isVeryNarrowTerminal() ? "K" : "K:KC"}
+            source="kilocode"
+            enabled={props.enabledSources.has("kilocode")}
+            onToggle={props.onSourceToggle}
+          />
           <Show when={!isVeryNarrowTerminal()}>
             <text dim>|</text>
             <SortButton

@@ -63,6 +63,8 @@ export const SOURCE_COLORS: Record<SourceType, string> = {
   openclaw: "#ef4444",
   pi: "#fb923c",
   kimi: "#8B5CF6",
+  roocode: "#f59e0b",
+  kilocode: "#6366f1",
 };
 
 export function getSourceColor(source: SourceType | string): string {
@@ -74,5 +76,7 @@ export function getSourceDisplayName(source: string): string {
   if (source === "openclaw") return "OpenClaw";
   if (source === "pi") return "Pi";
   if (source === "kimi") return "Kimi";
+  if (source === "roocode") return "RooCode";
+  if (source === "kilocode") return "KiloCode";
   return source.charAt(0).toUpperCase() + source.slice(1);
 }

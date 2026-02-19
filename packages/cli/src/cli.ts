@@ -124,6 +124,8 @@ interface FilterOptions {
   openclaw?: boolean;
   pi?: boolean;
   kimi?: boolean;
+  roocode?: boolean;
+  kilocode?: boolean;
 }
 
 interface DateFilterOptions {
@@ -489,7 +491,7 @@ async function main() {
 
   program
     .name("tokscale")
-    .description("Tokscale - Track AI coding costs across OpenCode, Claude Code, Codex, Gemini, Cursor, and Amp")
+    .description("Tokscale - Track AI coding costs across OpenCode, Claude Code, Codex, Gemini, Cursor, Amp, RooCode, and KiloCode")
     .version(pkg.version);
 
   program
@@ -507,6 +509,8 @@ async function main() {
     .option("--openclaw", "Show only OpenClaw usage")
     .option("--pi", "Show only Pi usage")
     .option("--kimi", "Show only Kimi CLI usage")
+    .option("--roocode", "Show only Roo Code usage")
+    .option("--kilocode", "Show only KiloCode usage")
     .option("--today", "Show only today's usage")
     .option("--week", "Show last 7 days")
     .option("--month", "Show current month")
@@ -546,6 +550,8 @@ async function main() {
     .option("--openclaw", "Show only OpenClaw usage")
     .option("--pi", "Show only Pi usage")
     .option("--kimi", "Show only Kimi CLI usage")
+    .option("--roocode", "Show only Roo Code usage")
+    .option("--kilocode", "Show only KiloCode usage")
     .option("--today", "Show only today's usage")
     .option("--week", "Show last 7 days")
     .option("--month", "Show current month")
@@ -594,12 +600,16 @@ async function main() {
       ];
       const piSessions = path.join(homeDir, ".pi", "agent", "sessions");
       const kimiSessions = path.join(homeDir, ".kimi", "sessions");
+      const roocodeSessions = path.join(homeDir, ".config", "Code", "User", "globalStorage", "rooveterinaryinc.roo-cline", "tasks");
+      const kilocodeSessions = path.join(homeDir, ".config", "Code", "User", "globalStorage", "kilocode.kilo-code", "tasks");
+      const roocodeServerSessions = path.join(homeDir, ".vscode-server", "data", "User", "globalStorage", "rooveterinaryinc.roo-cline", "tasks");
+      const kilocodeServerSessions = path.join(homeDir, ".vscode-server", "data", "User", "globalStorage", "kilocode.kilo-code", "tasks");
 
       let localMessages: ParsedMessages | null = null;
       try {
         localMessages = await parseLocalSourcesAsync({
           homeDir,
-          sources: ["opencode", "claude", "codex", "gemini", "amp", "droid", "openclaw", "pi", "kimi"],
+          sources: ["opencode", "claude", "codex", "gemini", "amp", "droid", "openclaw", "pi", "kimi", "roocode", "kilocode"],
         });
       } catch (e) {
         console.error(`Error: ${(e as Error).message}`);
@@ -621,6 +631,7 @@ async function main() {
         label: string;
         sessionsPath: string;
         legacyPaths?: string[];
+        serverPaths?: string[];
         messageCount: number;
         headlessSupported: boolean;
         headlessPaths: string[];
@@ -717,6 +728,26 @@ async function main() {
           headlessPaths: [],
           headlessMessageCount: 0,
         },
+        {
+          source: "roocode",
+          label: "Roo Code",
+          sessionsPath: roocodeSessions,
+          serverPaths: [roocodeServerSessions],
+          messageCount: localMessages.roocodeCount,
+          headlessSupported: false,
+          headlessPaths: [],
+          headlessMessageCount: 0,
+        },
+        {
+          source: "kilocode",
+          label: "KiloCode",
+          sessionsPath: kilocodeSessions,
+          serverPaths: [kilocodeServerSessions],
+          messageCount: localMessages.kilocodeCount,
+          headlessSupported: false,
+          headlessPaths: [],
+          headlessMessageCount: 0,
+        },
       ];
 
       if (options.json) {
@@ -731,6 +762,12 @@ async function main() {
               ? row.legacyPaths.map((legacyPath) => ({
                   path: legacyPath,
                   exists: fs.existsSync(legacyPath),
+                }))
+              : [],
+            serverPaths: row.serverPaths
+              ? row.serverPaths.map((serverPath) => ({
+                  path: serverPath,
+                  exists: fs.existsSync(serverPath),
                 }))
               : [],
             messageCount: row.messageCount,
@@ -759,6 +796,11 @@ async function main() {
         if (row.legacyPaths && row.legacyPaths.length > 0) {
           console.log(
             pc.gray(`  legacy: ${row.legacyPaths.map(describePath).join(", ")}`)
+          );
+        }
+        if (row.serverPaths && row.serverPaths.length > 0) {
+          console.log(
+            pc.gray(`  server: ${row.serverPaths.map(describePath).join(", ")}`)
           );
         }
         if (row.headlessSupported) {
@@ -808,6 +850,8 @@ async function main() {
     .option("--openclaw", "Include only OpenClaw data")
     .option("--pi", "Include only Pi data")
     .option("--kimi", "Include only Kimi CLI data")
+    .option("--roocode", "Include only Roo Code data")
+    .option("--kilocode", "Include only KiloCode data")
     .option("--today", "Show only today's usage")
     .option("--week", "Show last 7 days")
     .option("--month", "Show current month")
@@ -835,6 +879,8 @@ async function main() {
     .option("--openclaw", "Include only OpenClaw data")
     .option("--pi", "Include only Pi data")
     .option("--kimi", "Include only Kimi CLI data")
+    .option("--roocode", "Include only Roo Code data")
+    .option("--kilocode", "Include only KiloCode data")
     .option("--no-spinner", "Disable loading spinner (for scripting)")
     .option("--short", "Display total tokens in abbreviated format (e.g., 7.14B)")
     .addOption(new Option("--agents", "Show Top OpenCode Agents (default)").conflicts("clients"))
@@ -882,6 +928,8 @@ async function main() {
     .option("--openclaw", "Include only OpenClaw data")
     .option("--pi", "Include only Pi data")
     .option("--kimi", "Include only Kimi CLI data")
+    .option("--roocode", "Include only Roo Code data")
+    .option("--kilocode", "Include only KiloCode data")
     .option("--since <date>", "Start date (YYYY-MM-DD)")
     .option("--until <date>", "End date (YYYY-MM-DD)")
     .option("--year <year>", "Filter to specific year")
@@ -898,6 +946,8 @@ async function main() {
         openclaw: options.openclaw,
         pi: options.pi,
         kimi: options.kimi,
+        roocode: options.roocode,
+        kilocode: options.kilocode,
         since: options.since,
         until: options.until,
         year: options.year,
@@ -922,6 +972,8 @@ async function main() {
     .option("--openclaw", "Show only OpenClaw usage")
     .option("--pi", "Show only Pi usage")
     .option("--kimi", "Show only Kimi CLI usage")
+    .option("--roocode", "Show only Roo Code usage")
+    .option("--kilocode", "Show only KiloCode usage")
     .option("--today", "Show only today's usage")
     .option("--week", "Show last 7 days")
     .option("--month", "Show current month")
@@ -1052,6 +1104,8 @@ async function main() {
       .option("--openclaw", "Show only OpenClaw usage")
       .option("--pi", "Show only Pi usage")
       .option("--kimi", "Show only Kimi CLI usage")
+      .option("--roocode", "Show only Roo Code usage")
+      .option("--kilocode", "Show only KiloCode usage")
       .option("--today", "Show only today's usage")
       .option("--week", "Show last 7 days")
       .option("--month", "Show current month")
@@ -1080,7 +1134,7 @@ async function main() {
 }
 
 function getEnabledSources(options: FilterOptions): SourceType[] | undefined {
-  const hasFilter = options.opencode || options.claude || options.codex || options.gemini || options.cursor || options.amp || options.droid || options.openclaw || options.pi || options.kimi;
+  const hasFilter = options.opencode || options.claude || options.codex || options.gemini || options.cursor || options.amp || options.droid || options.openclaw || options.pi || options.kimi || options.roocode || options.kilocode;
   if (!hasFilter) return undefined; // All sources
 
   const sources: SourceType[] = [];
@@ -1094,6 +1148,8 @@ function getEnabledSources(options: FilterOptions): SourceType[] | undefined {
   if (options.openclaw) sources.push("openclaw");
   if (options.pi) sources.push("pi");
   if (options.kimi) sources.push("kimi");
+  if (options.roocode) sources.push("roocode");
+  if (options.kilocode) sources.push("kilocode");
   return sources;
 }
 
@@ -1185,7 +1241,7 @@ async function showModelReport(options: FilterOptions & DateFilterOptions & { be
   const useSpinner = extraOptions?.spinner !== false;
   const spinner = useSpinner ? createSpinner({ color: "cyan" }) : null;
 
-  const localSources: SourceType[] = (enabledSources || ['opencode', 'claude', 'codex', 'gemini', 'cursor', 'amp', 'droid', 'openclaw', 'pi', 'kimi'])
+  const localSources: SourceType[] = (enabledSources || ['opencode', 'claude', 'codex', 'gemini', 'cursor', 'amp', 'droid', 'openclaw', 'pi', 'kimi', 'roocode', 'kilocode'])
     .filter(s => s !== 'cursor');
 
   spinner?.start(pc.gray("Scanning session data..."));
@@ -1215,7 +1271,7 @@ async function showModelReport(options: FilterOptions & DateFilterOptions & { be
 
   let report: ModelReport;
   try {
-    const emptyMessages: ParsedMessages = { messages: [], opencodeCount: 0, claudeCount: 0, codexCount: 0, geminiCount: 0, ampCount: 0, droidCount: 0, openclawCount: 0, piCount: 0, kimiCount: 0, processingTimeMs: 0 };
+    const emptyMessages: ParsedMessages = { messages: [], opencodeCount: 0, claudeCount: 0, codexCount: 0, geminiCount: 0, ampCount: 0, droidCount: 0, openclawCount: 0, piCount: 0, kimiCount: 0, roocodeCount: 0, kilocodeCount: 0, processingTimeMs: 0 };
     report = await finalizeReportAsync({
       localMessages: localMessages || emptyMessages,
       includeCursor: includeCursor && (cursorSync.synced || hasCursorUsageCache()),
@@ -1324,7 +1380,7 @@ async function showMonthlyReport(options: FilterOptions & DateFilterOptions & { 
 
   const dateFilters = getDateFilters(options);
   const enabledSources = getEnabledSources(options);
-  const localSources: SourceType[] = (enabledSources || ['opencode', 'claude', 'codex', 'gemini', 'cursor', 'amp', 'droid', 'openclaw', 'pi', 'kimi'])
+  const localSources: SourceType[] = (enabledSources || ['opencode', 'claude', 'codex', 'gemini', 'cursor', 'amp', 'droid', 'openclaw', 'pi', 'kimi', 'roocode', 'kilocode'])
     .filter(s => s !== 'cursor');
   const includeCursor = !enabledSources || enabledSources.includes('cursor');
 
@@ -1435,7 +1491,7 @@ async function outputJsonReport(
   const enabledSources = getEnabledSources(options);
   const onlyCursor = enabledSources?.length === 1 && enabledSources[0] === 'cursor';
   const includeCursor = !enabledSources || enabledSources.includes('cursor');
-  const localSources: SourceType[] = (enabledSources || ['opencode', 'claude', 'codex', 'gemini', 'cursor', 'amp', 'droid', 'openclaw', 'pi', 'kimi'])
+  const localSources: SourceType[] = (enabledSources || ['opencode', 'claude', 'codex', 'gemini', 'cursor', 'amp', 'droid', 'openclaw', 'pi', 'kimi', 'roocode', 'kilocode'])
     .filter(s => s !== 'cursor');
 
   const { cursorSync, localMessages } = await loadDataSourcesParallel(
@@ -1448,7 +1504,7 @@ async function outputJsonReport(
     process.exit(1);
   }
 
-  const emptyMessages: ParsedMessages = { messages: [], opencodeCount: 0, claudeCount: 0, codexCount: 0, geminiCount: 0, ampCount: 0, droidCount: 0, openclawCount: 0, piCount: 0, kimiCount: 0, processingTimeMs: 0 };
+  const emptyMessages: ParsedMessages = { messages: [], opencodeCount: 0, claudeCount: 0, codexCount: 0, geminiCount: 0, ampCount: 0, droidCount: 0, openclawCount: 0, piCount: 0, kimiCount: 0, roocodeCount: 0, kilocodeCount: 0, processingTimeMs: 0 };
 
   if (reportType === "models") {
     const report = await finalizeReportAsync({
@@ -1487,7 +1543,7 @@ async function handleGraphCommand(options: GraphCommandOptions) {
 
   const dateFilters = getDateFilters(options);
   const enabledSources = getEnabledSources(options);
-  const localSources: SourceType[] = (enabledSources || ['opencode', 'claude', 'codex', 'gemini', 'cursor', 'amp', 'droid', 'openclaw', 'pi', 'kimi'])
+  const localSources: SourceType[] = (enabledSources || ['opencode', 'claude', 'codex', 'gemini', 'cursor', 'amp', 'droid', 'openclaw', 'pi', 'kimi', 'roocode', 'kilocode'])
     .filter(s => s !== 'cursor');
   const includeCursor = !enabledSources || enabledSources.includes('cursor');
 
@@ -1722,6 +1778,10 @@ function getSourceLabel(source: string): string {
       return "Pi";
     case "kimi":
       return "Kimi";
+    case "roocode":
+      return "RooCode";
+    case "kilocode":
+      return "KiloCode";
     default:
       return source;
   }

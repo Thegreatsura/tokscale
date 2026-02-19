@@ -67,6 +67,8 @@ const SOURCE_DISPLAY_NAMES: Record<string, string> = {
   openclaw: "OpenClaw",
   pi: "Pi",
   kimi: "Kimi",
+  roocode: "RooCode",
+  kilocode: "KiloCode",
 };
 
 const ASSETS_BASE_URL = "https://tokscale.ai/assets/logos";
@@ -218,8 +220,8 @@ async function ensureFontsLoaded(): Promise<void> {
 
 async function loadWrappedData(options: WrappedOptions): Promise<WrappedData> {
   const year = options.year || new Date().getFullYear().toString();
-  const sources = options.sources || ["opencode", "claude", "codex", "gemini", "cursor", "amp", "droid", "openclaw", "pi", "kimi"];
-  const localSources = sources.filter(s => s !== "cursor") as ("opencode" | "claude" | "codex" | "gemini" | "amp" | "droid" | "openclaw" | "pi" | "kimi")[];
+  const sources = options.sources || ["opencode", "claude", "codex", "gemini", "cursor", "amp", "droid", "openclaw", "pi", "kimi", "roocode", "kilocode"];
+  const localSources = sources.filter(s => s !== "cursor") as ("opencode" | "claude" | "codex" | "gemini" | "amp" | "droid" | "openclaw" | "pi" | "kimi" | "roocode" | "kilocode")[];
   const includeCursor = sources.includes("cursor");
 
   const since = `${year}-01-01`;
@@ -229,7 +231,7 @@ async function loadWrappedData(options: WrappedOptions): Promise<WrappedData> {
     includeCursor && isCursorLoggedIn() ? syncCursorCache() : Promise.resolve({ synced: false, rows: 0, error: undefined }),
     localSources.length > 0
       ? parseLocalSourcesAsync({ sources: localSources, since, until, year })
-      : Promise.resolve({ messages: [], opencodeCount: 0, claudeCount: 0, codexCount: 0, geminiCount: 0, ampCount: 0, droidCount: 0, openclawCount: 0, piCount: 0, kimiCount: 0, processingTimeMs: 0 } as ParsedMessages),
+      : Promise.resolve({ messages: [], opencodeCount: 0, claudeCount: 0, codexCount: 0, geminiCount: 0, ampCount: 0, droidCount: 0, openclawCount: 0, piCount: 0, kimiCount: 0, roocodeCount: 0, kilocodeCount: 0, processingTimeMs: 0 } as ParsedMessages),
   ]);
 
   const cursorSync = phase1Results[0].status === "fulfilled" 
@@ -255,6 +257,8 @@ async function loadWrappedData(options: WrappedOptions): Promise<WrappedData> {
     openclawCount: 0,
     piCount: 0,
     kimiCount: 0,
+    roocodeCount: 0,
+    kilocodeCount: 0,
     processingTimeMs: 0,
   };
 

@@ -28,6 +28,8 @@ const SOURCE_HOTKEYS: Record<string, SourceType> = {
   "8": "openclaw",
   "9": "pi",
   "0": "kimi",
+  "o": "roocode",
+  "k": "kilocode",
 };
 
 function cycleTabForward(current: TabType): TabType {

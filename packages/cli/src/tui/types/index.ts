@@ -2,7 +2,7 @@ import type { ColorPaletteName } from "../config/themes.js";
 
 export type TabType = "overview" | "model" | "daily" | "stats";
 export type SortType = "cost" | "tokens" | "date";
-export type SourceType = "opencode" | "claude" | "codex" | "cursor" | "gemini" | "amp" | "droid" | "openclaw" | "pi" | "kimi";
+export type SourceType = "opencode" | "claude" | "codex" | "cursor" | "gemini" | "amp" | "droid" | "openclaw" | "pi" | "kimi" | "roocode" | "kilocode";
 
 export type { ColorPaletteName };
 
@@ -167,7 +167,9 @@ export const SOURCE_LABELS: Record<SourceType, string> = {
   openclaw: "CL",
   pi: "PI",
   kimi: "KM",
+  roocode: "RC",
+  kilocode: "KC",
 } as const;
 
 export const TABS: readonly TabType[] = ["overview", "model", "daily", "stats"] as const;
-export const ALL_SOURCES: readonly SourceType[] = ["opencode", "claude", "codex", "cursor", "gemini", "amp", "droid", "openclaw", "pi", "kimi"] as const;
+export const ALL_SOURCES: readonly SourceType[] = ["opencode", "claude", "codex", "cursor", "gemini", "amp", "droid", "openclaw", "pi", "kimi", "roocode", "kilocode"] as const;
