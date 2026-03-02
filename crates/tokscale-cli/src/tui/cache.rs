@@ -381,8 +381,8 @@ pub fn load_cache(enabled_clients: &HashSet<ClientId>, include_synthetic: bool) 
 /// Determine how the cached client set relates to the currently enabled set.
 ///
 /// - `Exact`    — same clients, same synthetic flag
-/// - `Subset`   — cached clients ⊆ enabled clients (e.g. update added a new client)
-///                AND cached doesn't carry data the user doesn't want
+/// - `Subset`   — cached clients ⊆ enabled clients (e.g. update added a new client),
+///   and cached doesn't carry data the user doesn't want
 /// - `Mismatch` — anything else (superset, disjoint, unwanted synthetic data)
 fn check_client_match(
     enabled_clients: &HashSet<ClientId>,
