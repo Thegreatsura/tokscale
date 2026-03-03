@@ -160,7 +160,10 @@ mod tests {
         assert_eq!(msgs.len(), 2);
 
         // Find the claude message
-        let claude = msgs.iter().find(|m| m.model_id == "claude-opus-4-6").unwrap();
+        let claude = msgs
+            .iter()
+            .find(|m| m.model_id == "claude-opus-4-6")
+            .unwrap();
         assert_eq!(claude.client, "mux");
         assert_eq!(claude.provider_id, "anthropic");
         assert_eq!(claude.tokens.input, 100);

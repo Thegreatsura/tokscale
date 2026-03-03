@@ -529,7 +529,8 @@ fn main() -> Result<()> {
             qwen,
             roocode,
             kilocode,
-            mux,            synthetic,
+            mux,
+            synthetic,
             today,
             week,
             month,
@@ -608,7 +609,8 @@ fn main() -> Result<()> {
             qwen,
             roocode,
             kilocode,
-            mux,            synthetic,
+            mux,
+            synthetic,
             today,
             week,
             month,
@@ -688,7 +690,8 @@ fn main() -> Result<()> {
             qwen,
             roocode,
             kilocode,
-            mux,            synthetic,
+            mux,
+            synthetic,
             today,
             week,
             month,
@@ -733,7 +736,8 @@ fn main() -> Result<()> {
             qwen,
             roocode,
             kilocode,
-            mux,            synthetic,
+            mux,
+            synthetic,
             today,
             week,
             month,
@@ -785,7 +789,8 @@ fn main() -> Result<()> {
             qwen,
             roocode,
             kilocode,
-            mux,            synthetic,
+            mux,
+            synthetic,
             today,
             week,
             month,
@@ -838,7 +843,8 @@ fn main() -> Result<()> {
             qwen,
             roocode,
             kilocode,
-            mux,            synthetic,
+            mux,
+            synthetic,
             short,
             agents,
             clients,
@@ -3075,7 +3081,6 @@ fn run_submit_command(
             std::process::exit(1);
         }
     }
-
 
     // Warm the TUI cache so the next `tokscale` launch is instant.
     // We load with all clients and no date filters (default TUI view)

@@ -829,10 +829,7 @@ mod tests {
             crate::tui::client_ui::from_hotkey('k'),
             Some(ClientId::KiloCode)
         );
-        assert_eq!(
-            crate::tui::client_ui::from_hotkey('x'),
-            Some(ClientId::Mux)
-        );
+        assert_eq!(crate::tui::client_ui::from_hotkey('x'), Some(ClientId::Mux));
         assert_eq!(crate::tui::client_ui::from_hotkey('a'), None);
     }
 
