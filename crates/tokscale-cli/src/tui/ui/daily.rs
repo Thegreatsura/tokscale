@@ -1,4 +1,4 @@
-use chrono::Local;
+use chrono::Utc;
 use ratatui::prelude::*;
 use ratatui::widgets::{
     Block, Borders, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table,
@@ -42,7 +42,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let selected_index = app.selected_index;
     let theme_accent = app.theme.accent;
     let theme_selection = app.theme.selection;
-    let today = Local::now().date_naive();
+    let today = Utc::now().date_naive();
 
     let header_cells = if is_very_narrow {
         vec!["Date", "Cost"]
@@ -138,14 +138,13 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
                 ]
             } else {
                 vec![
-                    Cell::from(day.date.format("%Y-%m-%d").to_string())
-                        .style(if is_today {
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().add_modifier(Modifier::BOLD)
-                        }),
+                    Cell::from(day.date.format("%Y-%m-%d").to_string()).style(if is_today {
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    }),
                     Cell::from(format_tokens(day.tokens.input))
                         .style(Style::default().fg(Color::Rgb(100, 200, 100))),
                     Cell::from(format_tokens(day.tokens.output))

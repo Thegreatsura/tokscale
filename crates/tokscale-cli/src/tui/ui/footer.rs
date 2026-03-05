@@ -183,10 +183,16 @@ fn render_help_row(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(" • ", Style::default().fg(app.theme.muted)),
         ];
         if app.current_tab == Tab::Daily {
-            spans.push(Span::styled("[j:today]", Style::default().fg(Color::Yellow)));
+            spans.push(Span::styled(
+                "[j:today]",
+                Style::default().fg(Color::Yellow),
+            ));
             spans.push(Span::styled(" • ", Style::default().fg(app.theme.muted)));
         }
-        spans.push(Span::styled("[s:sources]", Style::default().fg(Color::Cyan)));
+        spans.push(Span::styled(
+            "[s:sources]",
+            Style::default().fg(Color::Cyan),
+        ));
         spans.push(Span::styled(" ", Style::default()));
         spans.push(Span::styled(
             format!("[g:{}]", app.group_by.borrow()),
@@ -211,8 +217,14 @@ fn render_help_row(frame: &mut Frame, app: &App, area: Rect) {
             }),
         ));
         spans.push(Span::styled(" • ", Style::default().fg(app.theme.muted)));
-        spans.push(Span::styled("[r:refresh]", Style::default().fg(Color::Yellow)));
-        spans.push(Span::styled(" • e • q", Style::default().fg(app.theme.muted)));
+        spans.push(Span::styled(
+            "[r:refresh]",
+            Style::default().fg(Color::Yellow),
+        ));
+        spans.push(Span::styled(
+            " • e • q",
+            Style::default().fg(app.theme.muted),
+        ));
         spans
     };
 
