@@ -453,17 +453,18 @@ fn render_breakdown_panel(frame: &mut Frame, app: &App, area: Rect) {
     ];
 
     if let Some(daily) = daily_usage {
-        let mut grouped: std::collections::HashMap<
+        let mut grouped: std::collections::BTreeMap<
             String,
             Vec<(String, &crate::tui::data::DailyModelInfo)>,
-        > = std::collections::HashMap::new();
-        for (model_name, model_info) in &daily.models {
+        > = std::collections::BTreeMap::new();
+        let mut model_entries: Vec<_> = daily.models.iter().collect();
+        model_entries.sort_by_key(|(name, _)| (*name).clone());
+        for (model_name, model_info) in model_entries {
             grouped
                 .entry(model_info.client.clone())
                 .or_default()
                 .push((model_name.clone(), model_info));
         }
-
         for (client, mut models) in grouped {
             models.sort_by(|a, b| b.1.tokens.total().cmp(&a.1.tokens.total()));
 
