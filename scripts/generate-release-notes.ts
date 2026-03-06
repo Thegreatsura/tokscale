@@ -103,7 +103,7 @@ function resolveGitHubUsername(email: string, fallbackName: string): string {
 
 function findAssociatedPR(commitHash: string): PRInfo | null {
   const result = runJson<
-    Array<{ number: number; title: string; state: string; user?: { login?: string } }>
+    Array<{ number: number; title: string; state: string; merged_at?: string | null; user?: { login?: string } }>
   >(
     "gh",
     ["api", `repos/${REPO}/commits/${commitHash}/pulls`],
@@ -111,7 +111,7 @@ function findAssociatedPR(commitHash: string): PRInfo | null {
   );
   if (!result?.length) return null;
 
-  const pr = result.find((p) => p.state === "closed") ?? result[0];
+  const pr = result.find((p) => p.merged_at != null) ?? result.find((p) => p.state === "closed") ?? result[0];
   if (!pr?.number || !pr.user?.login) return null;
 
   let title = pr.title;
@@ -128,7 +128,7 @@ function findAssociatedPR(commitHash: string): PRInfo | null {
       const truncatedPrefix = title.slice(0, -1);
       title = lastSubject.startsWith(truncatedPrefix) ? lastSubject
         : firstSubject.startsWith(truncatedPrefix) ? firstSubject
-        : lastSubject;
+        : title;
     }
   }
 
