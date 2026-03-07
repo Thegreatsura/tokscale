@@ -176,6 +176,10 @@ fn render_stats_panel(frame: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
     let is_narrow = app.is_narrow();
     let graph = &app.data.graph;
 
@@ -243,6 +247,7 @@ fn render_stats_panel(frame: &mut Frame, app: &App, area: Rect) {
 
     let col1_width = if is_narrow { 36u16 } else { 60u16 };
     let col2_x = inner.x + col1_width;
+    let y_max = inner.y + inner.height;
 
     let mut y = inner.y;
 
@@ -280,6 +285,9 @@ fn render_stats_panel(frame: &mut Frame, app: &App, area: Rect) {
     );
 
     y += 1;
+    if y >= y_max {
+        return;
+    }
 
     let row2 = Line::from(vec![
         Span::styled("Sessions:", Style::default().fg(app.theme.muted)),
@@ -300,6 +308,9 @@ fn render_stats_panel(frame: &mut Frame, app: &App, area: Rect) {
     );
 
     y += 1;
+    if y >= y_max {
+        return;
+    }
 
     // Row 3: Current streak / Longest streak
     let streak_label = if is_narrow {
@@ -336,6 +347,9 @@ fn render_stats_panel(frame: &mut Frame, app: &App, area: Rect) {
     );
 
     y += 1;
+    if y >= y_max {
+        return;
+    }
 
     let active_label = if is_narrow { "Active:" } else { "Active days:" };
     let active_days_line = Line::from(vec![
@@ -352,6 +366,9 @@ fn render_stats_panel(frame: &mut Frame, app: &App, area: Rect) {
     );
 
     y += 2;
+    if y >= y_max {
+        return;
+    }
 
     let legend_spans = vec![
         Span::styled("Less ", Style::default().fg(app.theme.muted)),
@@ -372,6 +389,9 @@ fn render_stats_panel(frame: &mut Frame, app: &App, area: Rect) {
     );
 
     y += 2;
+    if y >= y_max {
+        return;
+    }
 
     if !is_narrow {
         let footer = Line::from(Span::styled(
