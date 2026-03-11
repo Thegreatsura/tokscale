@@ -929,5 +929,4 @@ after"#,
         assert_eq!(current, 2);
         assert_eq!(longest, 2);
     }
-
 }
