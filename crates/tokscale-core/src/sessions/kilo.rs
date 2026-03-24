@@ -126,8 +126,7 @@ pub fn parse_kilo_sqlite_with_fallback(
 
         let provider = msg
             .provider_id
-            .as_ref()
-            .map(|s| s.as_str())
+            .as_deref()
             .or_else(|| provider_identity::inferred_provider_from_model(&model_id))
             .unwrap_or("kilo")
             .to_string();
