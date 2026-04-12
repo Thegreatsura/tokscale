@@ -8,12 +8,24 @@ on:
       - 'crates/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'packages/cli/package.json'
+      - 'packages/tokscale/package.json'
+      - 'packages/cli-*/package.json'
+      - 'scripts/check-version-coherence.sh'
+      - '.github/workflows/publish-cli.yml'
+      - '.github/workflows/test_coverage.yml'
   pull_request:
     branches: [main, develop]
     paths:
       - 'crates/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'packages/cli/package.json'
+      - 'packages/tokscale/package.json'
+      - 'packages/cli-*/package.json'
+      - 'scripts/check-version-coherence.sh'
+      - '.github/workflows/publish-cli.yml'
+      - '.github/workflows/test_coverage.yml'
 
 env:
   CARGO_TERM_COLOR: always
@@ -35,6 +47,8 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - name: Verify version coherence
+        run: bash scripts/check-version-coherence.sh
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:

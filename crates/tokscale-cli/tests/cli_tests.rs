@@ -334,7 +334,10 @@ fn test_version_flag() {
     cmd.arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("tokscale"));
+        .stdout(predicate::str::contains(format!(
+            "tokscale {}",
+            env!("CARGO_PKG_VERSION")
+        )));
 }
 
 #[test]
