@@ -626,6 +626,20 @@ fn extract_claude_headless_message(
     ))
 }
 
+/// Internal Claude Code system/tool tags that should NOT be counted as human turns.
+/// User prompts containing arbitrary HTML/XML (e.g. `<div>hello</div>`) are still
+/// counted, only this narrow allowlist is excluded.
+const CLAUDECODE_INTERNAL_USER_TAGS: &[&str] = &[
+    "<local-command-stdout>",
+    "<local-command-stderr>",
+    "<command-name>",
+    "<command-message>",
+    "<system-reminder>",
+    "<bash-input>",
+    "<bash-stdout>",
+    "<bash-stderr>",
+];
+
 /// Returns true if a `type: "user"` JSONL entry is genuine human input (not tool results or system messages).
 fn is_human_turn(raw_line: &str) -> bool {
     if let Some(pos) = raw_line.find("\"content\":") {
@@ -635,8 +649,13 @@ fn is_human_turn(raw_line: &str) -> bool {
             return false;
         }
         if let Some(content_start) = after_trimmed.strip_prefix('"') {
-            if after_trimmed.len() > 1 && content_start.starts_with('<') {
-                return false;
+            // Only filter out content that begins with a known internal tag.
+            // Anything else (including `<div>`, `<table>`, etc. in genuine prompts)
+            // is treated as a real human turn.
+            for tag in CLAUDECODE_INTERNAL_USER_TAGS {
+                if content_start.starts_with(tag) {
+                    return false;
+                }
             }
             return true;
         }
@@ -712,6 +731,30 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::{NamedTempFile, TempDir};
+
+    #[test]
+    fn is_human_turn_counts_html_user_prompt() {
+        let line = r#"{"type":"user","message":{"content":"<div>hello</div>"}}"#;
+        assert!(is_human_turn(line));
+    }
+
+    #[test]
+    fn is_human_turn_skips_internal_tool_tags() {
+        for tag in CLAUDECODE_INTERNAL_USER_TAGS {
+            let line =
+                format!(r#"{{"type":"user","message":{{"content":"{tag}some output</...>"}}}}"#);
+            assert!(
+                !is_human_turn(&line),
+                "expected tag {tag} to be filtered as non-human"
+            );
+        }
+    }
+
+    #[test]
+    fn is_human_turn_skips_array_content() {
+        let line = r#"{"type":"user","message":{"content":[{"type":"tool_result"}]}}"#;
+        assert!(!is_human_turn(line));
+    }
 
     fn create_test_file(content: &str) -> NamedTempFile {
         let mut file = NamedTempFile::new().unwrap();

@@ -619,8 +619,10 @@ impl DataLoader {
                     .saturating_add(msg.message_count.max(0) as u64);
             }
 
-            // Hourly aggregation: derive hour from timestamp (Unix ms)
-            if let Some(hour_dt) = timestamp_to_hour(msg.timestamp) {
+            // Hourly aggregation: derive hour from timestamp (Unix ms),
+            // falling back to msg.date 00:00 when timestamp is missing/zero
+            // so we don't silently drop messages (matches CLI bucketing).
+            if let Some(hour_dt) = hour_bucket_with_fallback(msg.timestamp, &msg.date) {
                 let hourly_entry = hourly_map.entry(hour_dt).or_insert_with(|| HourlyUsage {
                     datetime: hour_dt,
                     tokens: TokenBreakdown::default(),
@@ -779,6 +781,17 @@ fn timestamp_to_hour(timestamp_ms: i64) -> Option<NaiveDateTime> {
         }
         _ => None,
     }
+}
+
+/// Derive an hour-truncated NaiveDateTime from `msg.timestamp` when present,
+/// otherwise fall back to `msg.date`'s 00:00 bucket so messages with missing
+/// timestamps are not silently dropped from hourly aggregation. Mirrors the
+/// CLI hourly bucketing behavior in `tokscale-core::lib::get_hourly_report`.
+fn hour_bucket_with_fallback(timestamp_ms: i64, date_str: &str) -> Option<NaiveDateTime> {
+    if let Some(dt) = timestamp_to_hour(timestamp_ms) {
+        return Some(dt);
+    }
+    parse_date(date_str).and_then(|d| d.and_hms_opt(0, 0, 0))
 }
 
 fn build_contribution_graph(daily: &[DailyUsage]) -> GraphData {

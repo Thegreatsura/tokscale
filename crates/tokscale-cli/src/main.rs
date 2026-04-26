@@ -359,7 +359,7 @@ fn main() -> Result<()> {
         }
         Some(Commands::Hourly {
             json,
-            light: _,
+            light,
             clients,
             date,
             benchmark,
@@ -371,19 +371,33 @@ fn main() -> Result<()> {
             let (since, until) = build_date_filter(today, week, month, date.since, date.until);
             let year = normalize_year_filter(today, week, month, date.year);
             let clients = build_client_filter(clients);
-            run_hourly_report(
-                json,
-                cli.home.clone(),
-                clients,
-                since,
-                until,
-                year,
-                benchmark,
-                no_spinner || !can_use_tui,
-                today,
-                week,
-                month,
-            )
+            if json || light || !can_use_tui {
+                run_hourly_report(
+                    json,
+                    cli.home.clone(),
+                    clients,
+                    since,
+                    until,
+                    year,
+                    benchmark,
+                    no_spinner || !can_use_tui,
+                    today,
+                    week,
+                    month,
+                )
+            } else {
+                ensure_home_supported_for_tui(&cli.home)?;
+                tui::run(
+                    &cli.theme,
+                    cli.refresh,
+                    cli.debug,
+                    clients,
+                    since,
+                    until,
+                    year,
+                    Some(Tab::Hourly),
+                )
+            }
         }
         Some(Commands::Pricing {
             model_id,
@@ -2512,10 +2526,13 @@ fn format_currency(n: f64) -> String {
 }
 
 fn format_cost_per_million(cost: f64, total_tokens: i64) -> String {
-    if total_tokens == 0 {
+    if total_tokens <= 0 || !cost.is_finite() {
+        return "—".to_string();
+    }
+    let cost_per_m = cost * 1_000_000.0 / total_tokens as f64;
+    if !cost_per_m.is_finite() {
         "—".to_string()
     } else {
-        let cost_per_m = cost * 1_000_000.0 / total_tokens as f64;
         format!("${:.2}/M", cost_per_m)
     }
 }
