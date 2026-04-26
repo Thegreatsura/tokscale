@@ -1405,7 +1405,9 @@ fn client_logo_url(client_name: &str) -> Option<&'static str> {
         "Goose" => Some(
             "https://raw.githubusercontent.com/junhoyeo/tokscale/main/.github/assets/client-goose.png",
         ),
-        "Antigravity" => Some("https://antigravity.google/favicon.ico"),
+        "Antigravity" => Some(
+            "https://raw.githubusercontent.com/junhoyeo/tokscale/main/.github/assets/client-antigravity.png",
+        ),
         "Synthetic" => Some("https://tokscale.ai/assets/logos/synthetic.png"),
         _ => None,
     }
@@ -2402,7 +2404,9 @@ mod tests {
     fn test_client_logo_url_antigravity() {
         assert_eq!(
             client_logo_url("Antigravity"),
-            Some("https://antigravity.google/favicon.ico")
+            Some(
+                "https://raw.githubusercontent.com/junhoyeo/tokscale/main/.github/assets/client-antigravity.png"
+            )
         );
     }
 

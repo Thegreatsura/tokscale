@@ -74,7 +74,7 @@
 | <img width="48px" src=".github/assets/client-mux.png" alt="Mux" /> | [Mux](https://github.com/coder/mux) | `~/.mux/sessions/` | ✅ 지원 |
 | <img width="48px" src=".github/assets/client-crush.png" alt="Crush" /> | [Crush](https://crush.ai/) | `$XDG_DATA_HOME/crush/projects.json` (프로젝트 레지스트리, 기본값: `~/.local/share/crush/projects.json`) | ✅ 지원 |
 | <img width="48px" src=".github/assets/client-goose.png" alt="Goose" /> | [Goose](https://github.com/aaif-goose/goose) | `~/.local/share/goose/sessions/sessions.db` (+ macOS Application Support, 레거시 Block/goose 경로; `GOOSE_PATH_ROOT`로 오버라이드 가능) | ✅ 지원 |
-| <img width="48px" src="https://antigravity.google/favicon.ico" alt="Antigravity" /> | [Google Antigravity](https://antigravity.google/) | `tokscale antigravity sync`로 `~/.config/tokscale/antigravity-cache/sessions/*.jsonl`에 캐싱 (로컬 언어 서버 RPC 사용) | ✅ 지원 |
+| <img width="48px" src=".github/assets/client-antigravity.png" alt="Antigravity" /> | [Google Antigravity](https://antigravity.google/) | `tokscale antigravity sync`로 `~/.config/tokscale/antigravity-cache/sessions/*.jsonl`에 캐싱 (로컬 언어 서버 RPC 사용) | ✅ 지원 |
 | <img width="48px" src=".github/assets/client-synthetic.png" alt="Synthetic" /> | [Synthetic](https://synthetic.new/) | `hf:` 모델/`synthetic` provider 감지로 다른 소스에서 재귀속 (+ [Octofriend](https://github.com/synthetic-lab/octofriend): `~/.local/share/octofriend/sqlite.db`) | ✅ 지원 |
 
 [🚅 LiteLLM의 가격 데이터](https://github.com/BerriAI/litellm)를 사용해 **실시간 비용 계산**을 제공합니다. 구간별 가격 모델(대용량 컨텍스트 등)과 **캐시 토큰 할인**도 지원합니다.

@@ -72,7 +72,7 @@ export const SOURCE_LOGOS: Record<string, string> = {
   mux: `${GITHUB_CDN_BASE}/client-mux.png`,
   crush: `${GITHUB_CDN_BASE}/client-crush.png`,
   goose: `${GITHUB_CDN_BASE}/client-goose.png`,
-  antigravity: "https://antigravity.google/favicon.ico",
+  antigravity: `${GITHUB_CDN_BASE}/client-antigravity.png`,
   synthetic: `${GITHUB_CDN_BASE}/client-synthetic.png`,
 };
 
