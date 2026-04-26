@@ -3311,9 +3311,21 @@ fn star_cache_path() -> Option<PathBuf> {
     Some(crate::paths::get_config_dir().join("star-cache.json"))
 }
 
+fn legacy_macos_star_cache_path() -> Option<PathBuf> {
+    crate::paths::legacy_macos_config_dir().map(|d| d.join("star-cache.json"))
+}
+
 fn load_star_cache(username: &str) -> Option<StarCache> {
-    let path = star_cache_path()?;
-    let content = std::fs::read_to_string(path).ok()?;
+    // Read the canonical path first; on macOS, fall back once to the
+    // pre-#468 location under `~/Library/Application Support/tokscale/`
+    // so existing users don't get re-prompted to star the repo just
+    // because their previous cache lives at the legacy path. The legacy
+    // read is suppressed when `TOKSCALE_CONFIG_DIR` is set so isolated
+    // profiles stay hermetic.
+    let primary = star_cache_path().and_then(|path| std::fs::read_to_string(path).ok());
+    let content = primary.or_else(|| {
+        legacy_macos_star_cache_path().and_then(|legacy| std::fs::read_to_string(legacy).ok())
+    })?;
     let cache: StarCache = serde_json::from_str(&content).ok()?;
     // Must match username and have hasStarred=true
     if cache.username != username || !cache.has_starred {
@@ -5204,5 +5216,99 @@ mod tests {
         assert_eq!(graph.summary.clients, original_summary.clients);
         assert_eq!(graph.summary.models, original_summary.models);
         assert_eq!(graph.years.len(), original_years.len());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[serial_test::serial]
+    fn test_load_star_cache_falls_back_to_legacy_macos_path() {
+        // Existing macOS users have star-cache.json at the pre-#468 path under
+        // `~/Library/Application Support/tokscale/`. After upgrade, the read
+        // path moves to `~/.config/tokscale/`, so without the legacy fallback
+        // load_star_cache returns None and the user gets re-prompted to star
+        // the repo even though they already starred it.
+        use std::env;
+        let temp = tempfile::TempDir::new().unwrap();
+        let prev_home = env::var_os("HOME");
+        let prev_override = env::var_os("TOKSCALE_CONFIG_DIR");
+        unsafe {
+            env::set_var("HOME", temp.path());
+            env::remove_var("TOKSCALE_CONFIG_DIR");
+        }
+
+        let legacy_dir = temp.path().join("Library/Application Support/tokscale");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::write(
+            legacy_dir.join("star-cache.json"),
+            r#"{"username":"junhoyeo","hasStarred":true,"checkedAt":"2025-01-12T03:48:00Z"}"#,
+        )
+        .unwrap();
+
+        let new_path = temp.path().join(".config/tokscale/star-cache.json");
+        assert!(!new_path.exists());
+
+        let cache = load_star_cache("junhoyeo");
+        assert!(
+            cache.is_some(),
+            "legacy macOS star-cache.json must satisfy load_star_cache after upgrade"
+        );
+        let cache = cache.unwrap();
+        assert_eq!(cache.username, "junhoyeo");
+        assert!(cache.has_starred);
+
+        unsafe {
+            match prev_home {
+                Some(v) => env::set_var("HOME", v),
+                None => env::remove_var("HOME"),
+            }
+            match prev_override {
+                Some(v) => env::set_var("TOKSCALE_CONFIG_DIR", v),
+                None => env::remove_var("TOKSCALE_CONFIG_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[serial_test::serial]
+    fn test_load_star_cache_skips_legacy_fallback_when_config_dir_overridden() {
+        // Same hermeticity contract as the Settings test: TOKSCALE_CONFIG_DIR
+        // must isolate the test/CI/sandbox profile from the real user's
+        // legacy macOS star-cache.json.
+        use std::env;
+        let temp = tempfile::TempDir::new().unwrap();
+        let legacy_root = tempfile::TempDir::new().unwrap();
+        let prev_home = env::var_os("HOME");
+        let prev_override = env::var_os("TOKSCALE_CONFIG_DIR");
+        unsafe {
+            env::set_var("HOME", legacy_root.path());
+            env::set_var("TOKSCALE_CONFIG_DIR", temp.path());
+        }
+
+        let legacy_dir = legacy_root
+            .path()
+            .join("Library/Application Support/tokscale");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::write(
+            legacy_dir.join("star-cache.json"),
+            r#"{"username":"junhoyeo","hasStarred":true,"checkedAt":"2025-01-12T03:48:00Z"}"#,
+        )
+        .unwrap();
+
+        assert!(
+            load_star_cache("junhoyeo").is_none(),
+            "override must not leak the legacy star-cache hit"
+        );
+
+        unsafe {
+            match prev_home {
+                Some(v) => env::set_var("HOME", v),
+                None => env::remove_var("HOME"),
+            }
+            match prev_override {
+                Some(v) => env::set_var("TOKSCALE_CONFIG_DIR", v),
+                None => env::remove_var("TOKSCALE_CONFIG_DIR"),
+            }
+        }
     }
 }

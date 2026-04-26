@@ -144,8 +144,14 @@ impl Settings {
         // `~/Library/Application Support/tokscale/`. Read it once if the new
         // path is empty so users don't lose theme / scanner / defaultClients
         // preferences after upgrading. The next `save()` lands at the new
-        // canonical path under `~/.config/tokscale/`.
+        // canonical path under `~/.config/tokscale/`. Skipped when the user
+        // has explicitly pinned a config root via `TOKSCALE_CONFIG_DIR` so
+        // CI sandboxes and isolated profiles stay hermetic instead of
+        // silently ingesting personal settings from the legacy macOS path.
         let raw = primary.or_else(|| {
+            if crate::paths::is_config_dir_overridden() {
+                return None;
+            }
             Self::legacy_macos_path().and_then(|legacy| fs::read_to_string(legacy).ok())
         });
 
@@ -248,9 +254,7 @@ mod tests {
             env::remove_var("TOKSCALE_CONFIG_DIR");
         }
 
-        let legacy_dir = temp
-            .path()
-            .join("Library/Application Support/tokscale");
+        let legacy_dir = temp.path().join("Library/Application Support/tokscale");
         fs::create_dir_all(&legacy_dir).unwrap();
         fs::write(
             legacy_dir.join("settings.json"),
@@ -265,6 +269,57 @@ mod tests {
         let loaded = Settings::load();
         assert_eq!(loaded.color_palette, "halloween");
         assert_eq!(loaded.default_clients, vec!["opencode".to_string()]);
+
+        unsafe {
+            match prev_home {
+                Some(v) => env::set_var("HOME", v),
+                None => env::remove_var("HOME"),
+            }
+            match prev_override {
+                Some(v) => env::set_var("TOKSCALE_CONFIG_DIR", v),
+                None => env::remove_var("TOKSCALE_CONFIG_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[serial_test::serial]
+    fn load_skips_legacy_macos_fallback_when_config_dir_overridden() {
+        // The whole point of TOKSCALE_CONFIG_DIR is hermeticity. CI sandboxes,
+        // tests, and isolated profiles MUST NOT silently inherit theme /
+        // scanner / defaultClients from `~/Library/Application Support/`
+        // when the user explicitly pinned a config root.
+        use std::env;
+        let temp = tempfile::TempDir::new().unwrap();
+        let legacy_root = tempfile::TempDir::new().unwrap();
+        let prev_home = env::var_os("HOME");
+        let prev_override = env::var_os("TOKSCALE_CONFIG_DIR");
+        unsafe {
+            env::set_var("HOME", legacy_root.path());
+            env::set_var("TOKSCALE_CONFIG_DIR", temp.path());
+        }
+
+        let legacy_dir = legacy_root
+            .path()
+            .join("Library/Application Support/tokscale");
+        fs::create_dir_all(&legacy_dir).unwrap();
+        fs::write(
+            legacy_dir.join("settings.json"),
+            r#"{"colorPalette":"halloween","defaultClients":["opencode"]}"#,
+        )
+        .unwrap();
+
+        let loaded = Settings::load();
+        assert_eq!(
+            loaded.color_palette,
+            Settings::default().color_palette,
+            "override must yield default settings, not the legacy file's halloween palette"
+        );
+        assert!(
+            loaded.default_clients.is_empty(),
+            "override must not leak defaultClients from the legacy macOS path"
+        );
 
         unsafe {
             match prev_home {

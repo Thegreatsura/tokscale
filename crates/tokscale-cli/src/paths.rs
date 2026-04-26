@@ -34,14 +34,29 @@ pub fn get_config_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".tokscale"))
 }
 
+/// Whether `TOKSCALE_CONFIG_DIR` is explicitly set in the environment.
+///
+/// Callers that want to read a legacy on-disk location during the macOS
+/// transition MUST gate that fallback on this returning `false`. When the
+/// override is set (CI sandbox, tests, isolated profile), the user has
+/// asked for an explicit, hermetic config root — silently ingesting
+/// `~/Library/Application Support/tokscale/` defeats that contract.
+pub fn is_config_dir_overridden() -> bool {
+    std::env::var_os("TOKSCALE_CONFIG_DIR").is_some_and(|v| !v.is_empty())
+}
+
 /// Legacy macOS config dir (`~/Library/Application Support/tokscale`).
 ///
-/// Returns `None` off macOS and when HOME cannot be resolved. Used by
-/// `Settings::load()` so users upgrading from a release that wrote
-/// settings.json under `~/Library/Application Support/tokscale/` keep
-/// their preferences on first launch after upgrade.
+/// Returns `None` off macOS, when HOME cannot be resolved, or when
+/// `TOKSCALE_CONFIG_DIR` is set (so the env override stays hermetic).
+/// Used by `Settings::load()` and `load_star_cache()` so users upgrading
+/// from a release that wrote files under `~/Library/Application Support/`
+/// keep their preferences on first launch after upgrade.
 #[cfg(target_os = "macos")]
 pub fn legacy_macos_config_dir() -> Option<PathBuf> {
+    if is_config_dir_overridden() {
+        return None;
+    }
     dirs::config_dir().map(|d| d.join("tokscale"))
 }
 
