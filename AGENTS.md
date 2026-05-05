@@ -30,7 +30,7 @@ Why: inline `--body "$(cat <<'EOF' ... EOF)"` patterns lead to recurring mistake
 - Use double-quoted heredoc for bodies containing backticks unless you intend command substitution.
 - Hard-wrap paragraphs at ~80 columns inside PR/issue/comment bodies. GitHub's markdown collapses single newlines into spaces so the rendered output looks fine, but the **raw markdown view is what reviewers and authors edit in**, and mid-sentence line breaks read as if the prose was chopped. Write each paragraph as one continuous line and let the renderer wrap it. Same rule for blockquotes, list items that span multiple lines, and table cells. Hard wraps are still fine inside fenced code blocks where preserving line layout matters.
 
-This applies to all GitHub-content authoring through the CLI — PR bodies, issue bodies, comments, edits.
+This applies to all GitHub-content authoring through the CLI — PR bodies, issue bodies, comments, edits. Commit message bodies should also follow this rule: write prose paragraphs as continuous lines, not hard-wrapped at 80 columns.
 
 ## Commit Message Convention
 
