@@ -513,7 +513,10 @@ mod tests {
                     "Sakana session expired or invalid. Refresh SAKANA_SESSION_COOKIE."
                 )),
             ),
-            ("Codex", Ok(vec![sample_output("Codex"), sample_output("Codex")])),
+            (
+                "Codex",
+                Ok(vec![sample_output("Codex"), sample_output("Codex")]),
+            ),
         ];
 
         let (outputs, errors) = partition_results(results);

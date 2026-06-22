@@ -1000,7 +1000,8 @@ async fn fetch_with_auth_async(
         {
             // Only let the detail response replace the summary when it carries a
             // concrete count; a null detail count must not drop a known summary.
-            reset_credits = merge_reset_credits(reset_credits, reset_credits_from_response(details));
+            reset_credits =
+                merge_reset_credits(reset_credits, reset_credits_from_response(details));
         }
     }
 
