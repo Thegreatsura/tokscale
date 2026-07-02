@@ -1697,10 +1697,20 @@ fn merge_workbuddy_messages(
     detailed_messages: Vec<UnifiedMessage>,
     fallback_messages: Vec<UnifiedMessage>,
 ) -> Vec<UnifiedMessage> {
-    let detailed_dates: HashSet<String> = detailed_messages
+    // The SQLite fallback carries ONE cumulative row per session (dated solely by
+    // `updated_at`), while the detailed JSONL carries accurate per-message rows.
+    // A fallback row is redundant exactly when its session already has detailed
+    // coverage — independent of which calendar day `updated_at` lands on. Keying
+    // this on the session (not the date) fixes two failures of the old
+    // date-overlap check: it no longer double-counts a session whose aggregate
+    // lands on a day with no detailed rows, and no longer drops a fallback-only
+    // session that merely shares a day with unrelated detailed activity. Both
+    // parsers derive `session_id` from the same WorkBuddy session identifier, so
+    // the keys are directly comparable.
+    let detailed_sessions: HashSet<String> = detailed_messages
         .iter()
-        .filter(|message| !message.date.is_empty())
-        .map(|message| message.date.clone())
+        .filter(|message| !message.session_id.is_empty())
+        .map(|message| message.session_id.clone())
         .collect();
     let mut seen: HashSet<String> = HashSet::new();
     let mut merged: Vec<UnifiedMessage> = detailed_messages
@@ -1709,7 +1719,7 @@ fn merge_workbuddy_messages(
         .collect();
 
     merged.extend(fallback_messages.into_iter().filter(|message| {
-        (detailed_dates.is_empty() || !detailed_dates.contains(&message.date))
+        !detailed_sessions.contains(&message.session_id)
             && should_keep_deduped_message(&mut seen, message)
     }));
     merged
@@ -3207,12 +3217,17 @@ mod tests {
         msg
     }
 
-    fn make_workbuddy_message(timestamp: i64, input: i64, dedup_key: &str) -> UnifiedMessage {
+    fn make_workbuddy_message(
+        session_id: &str,
+        timestamp: i64,
+        input: i64,
+        dedup_key: &str,
+    ) -> UnifiedMessage {
         let mut msg = UnifiedMessage::new(
             "workbuddy",
             "glm-5.2",
             "zai",
-            "session",
+            session_id,
             timestamp,
             TokenBreakdown {
                 input,
@@ -3252,29 +3267,53 @@ mod tests {
     }
 
     #[test]
-    fn workbuddy_fallback_fills_dates_without_detailed_usage() {
+    fn workbuddy_fallback_dedups_by_session_not_date() {
+        const DAY1: i64 = 1_782_883_200_000;
+        const DAY2: i64 = 1_782_969_600_000;
+
+        // Session A has detailed coverage on DAY1.
         let detailed = vec![make_workbuddy_message(
-            1_782_883_200_000,
+            "sess-A",
+            DAY1,
             100,
-            "workbuddy:detailed",
+            "workbuddy:detailed-A",
         )];
         let fallback = vec![
-            make_workbuddy_message(1_782_883_200_000, 1000, "workbuddy:fallback-same-day"),
-            make_workbuddy_message(1_782_969_600_000, 2000, "workbuddy:fallback-next-day"),
+            // Session A's cumulative SQLite aggregate is dated DAY2 (updated_at)
+            // even though its detailed activity was DAY1. The old date-overlap
+            // check kept it, double-counting the whole session on DAY2.
+            make_workbuddy_message("sess-A", DAY2, 5000, "workbuddy:fallback-A"),
+            // Session B has NO detailed coverage but its aggregate shares DAY1
+            // with session A's detail. The old check dropped it, losing usage.
+            make_workbuddy_message("sess-B", DAY1, 2000, "workbuddy:fallback-B"),
         ];
 
         let merged = super::merge_workbuddy_messages(detailed, fallback);
 
+        // Detailed A kept; fallback A dropped (session covered); fallback B kept.
         assert_eq!(merged.len(), 2);
         assert!(merged
             .iter()
-            .any(|message| message.dedup_key.as_deref() == Some("workbuddy:detailed")));
+            .any(|message| message.dedup_key.as_deref() == Some("workbuddy:detailed-A")));
         assert!(merged
             .iter()
-            .any(|message| message.dedup_key.as_deref() == Some("workbuddy:fallback-next-day")));
+            .any(|message| message.dedup_key.as_deref() == Some("workbuddy:fallback-B")));
         assert!(!merged
             .iter()
-            .any(|message| message.dedup_key.as_deref() == Some("workbuddy:fallback-same-day")));
+            .any(|message| message.dedup_key.as_deref() == Some("workbuddy:fallback-A")));
+    }
+
+    #[test]
+    fn workbuddy_fallback_kept_when_no_detailed_messages() {
+        // With zero detailed coverage, every fallback session survives.
+        let fallback = vec![
+            make_workbuddy_message("sess-A", 1_782_883_200_000, 1000, "workbuddy:fallback-A"),
+            make_workbuddy_message("sess-B", 1_782_969_600_000, 2000, "workbuddy:fallback-B"),
+        ];
+
+        let merged = super::merge_workbuddy_messages(Vec::new(), fallback);
+
+        assert_eq!(merged.len(), 2);
     }
 
     #[allow(clippy::too_many_arguments)]
