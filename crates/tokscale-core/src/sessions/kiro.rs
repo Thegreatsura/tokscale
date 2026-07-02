@@ -577,13 +577,13 @@ fn try_parse_kiro_execution_file(value: &Value, path: &Path) -> Option<Vec<Unifi
         .and_then(|v| v.as_str())
         .unwrap_or(execution_id)
         .to_string();
-    let timestamp = obj
-        .get("startTime")
-        .and_then(|v| v.as_i64())
-        .unwrap_or_else(|| file_modified_timestamp_ms(path));
-    let end_time = obj.get("endTime").and_then(|v| v.as_i64());
-    let _duration_ms =
-        end_time.and_then(|end| Some(end.saturating_sub(timestamp)).filter(|&d| d > 0));
+    // Reuse the shared timestamp parser so epoch-seconds, epoch-millis, RFC3339
+    // strings, and float values are all bucketed to the correct day (raw
+    // `as_i64` silently mis-buckets everything except integer milliseconds).
+    let start_time = parse_timestamp_value(obj.get("startTime"));
+    let timestamp = start_time.unwrap_or_else(|| file_modified_timestamp_ms(path));
+    let end_time = parse_timestamp_value(obj.get("endTime"));
+    let duration_ms = duration_between_ms(start_time.or(Some(timestamp)), end_time);
 
     let mut output_chars = 0usize;
     for action in actions {
@@ -645,9 +645,20 @@ fn try_parse_kiro_execution_file(value: &Value, path: &Path) -> Option<Vec<Unifi
         return Some(Vec::new());
     }
 
+    // Prefer a real model id from the execution payload (context/completionOptions),
+    // skipping Kiro-internal placeholders, and fall back to "auto" — mirroring the
+    // snapshot path so pricing can resolve these messages.
+    let model_id = find_kiro_snapshot_model_id(value).unwrap_or_else(|| "auto".to_string());
+
+    // Attribute execution usage to its workspace, matching every other
+    // globalStorage Kiro message.
+    let workspace = kiro_global_storage_workspace(path);
+    let workspace_key = workspace.as_deref().and_then(normalize_workspace_key);
+    let workspace_label = workspace_key.as_deref().and_then(workspace_label_from_key);
+
     let mut message = UnifiedMessage::new_with_dedup(
         CLIENT_ID,
-        "auto".to_string(),
+        model_id,
         PROVIDER_ID,
         session_id,
         timestamp,
@@ -663,6 +674,8 @@ fn try_parse_kiro_execution_file(value: &Value, path: &Path) -> Option<Vec<Unifi
     );
     message.message_count = 1;
     message.is_turn_start = true;
+    message.duration_ms = duration_ms;
+    message.set_workspace(workspace_key, workspace_label);
     Some(vec![message])
 }
 
@@ -966,6 +979,87 @@ not valid json at all
             messages[0].dedup_key,
             Some("workspace-a/execution:globalstorage".to_string())
         );
+    }
+
+    #[test]
+    fn test_parse_kiro_execution_file_attributes_workspace_model_and_duration() {
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join(
+            "Library/Application Support/Kiro/User/globalStorage/kiro.kiroagent/workspace-a/execution-123.json",
+        );
+        fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        fs::write(
+            &file_path,
+            r#"{
+                "executionId": "exec-123",
+                "chatSessionId": "chat-abc",
+                "status": "succeed",
+                "startTime": 1770983426000,
+                "endTime": 1770983427500,
+                "completionOptions": {"modelId": "claude-sonnet-4-5"},
+                "actions": [
+                    {"actionType": "say", "output": "the assistant replied with a full answer"},
+                    {"actionType": "reasoning", "output": {"message": "thinking it through"}}
+                ],
+                "context": {
+                    "messages": [
+                        {"entries": [{"type": "text", "text": "user asks a reasonably long question"}]}
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let messages = parse_kiro_file(&file_path);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].session_id, "chat-abc");
+        assert_eq!(
+            messages[0].dedup_key,
+            Some("execution:exec-123".to_string())
+        );
+        assert!(messages[0].tokens.input > 0);
+        assert!(messages[0].tokens.output > 0);
+        // Model is extracted from completionOptions, not hardcoded to "auto".
+        assert_eq!(messages[0].model_id, "claude-sonnet-4-5");
+        // Workspace attribution matches the snapshot path.
+        assert_eq!(messages[0].workspace_key, Some("workspace-a".to_string()));
+        assert_eq!(messages[0].workspace_label, Some("workspace-a".to_string()));
+        // Duration is carried through (endTime - startTime = 1500ms).
+        assert_eq!(messages[0].duration_ms, Some(1500));
+    }
+
+    #[test]
+    fn test_parse_kiro_execution_file_parses_seconds_epoch_start_time() {
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join(
+            "Library/Application Support/Kiro/User/globalStorage/kiro.kiroagent/workspace-a/execution-secs.json",
+        );
+        fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        // startTime as an epoch-seconds integer must be scaled to ms, not read
+        // as a millisecond value (which would file it under 1970).
+        fs::write(
+            &file_path,
+            r#"{
+                "executionId": "exec-secs",
+                "status": "succeed",
+                "startTime": 1770983426,
+                "actions": [{"actionType": "say", "output": "answer text here"}],
+                "context": {
+                    "messages": [
+                        {"entries": [{"type": "text", "text": "a question from the user"}]}
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let messages = parse_kiro_file(&file_path);
+
+        assert_eq!(messages.len(), 1);
+        // 1770983426 seconds -> 1770983426000 ms -> 2026, not 1970.
+        assert_eq!(messages[0].timestamp, 1770983426000);
+        assert!(messages[0].date.starts_with("2026-"));
     }
 
     #[test]
