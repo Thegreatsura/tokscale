@@ -337,8 +337,16 @@ pub(crate) fn parse_extension_log_file(
             tokens,
             0.0,
         );
+        // Key on the SECOND, not the millisecond. The same [AgentReporter] line
+        // is written to multiple sinks (the extension's own log AND the host's
+        // output-channel log), each prefixed by its own logger a few ms apart, so
+        // a millisecond key double-counts every mirrored execution. Distinct
+        // executions of the same agent with identical usage are seconds-to-minutes
+        // apart, so second granularity still keeps them separate (the timestamp
+        // was added to this key precisely to protect those).
+        let dedup_second = timestamp.div_euclid(1000);
         message.dedup_key = Some(format!(
-            "{client}:extension-log:{agent_id}:{timestamp}:{}:{}:{}:{}:{}",
+            "{client}:extension-log:{agent_id}:{dedup_second}:{}:{}:{}:{}:{}",
             message.tokens.input,
             message.tokens.output,
             message.tokens.cache_read,
@@ -535,5 +543,36 @@ mod tests {
 
         assert_eq!(messages.len(), 2);
         assert_ne!(messages[0].dedup_key, messages[1].dedup_key);
+    }
+
+    #[test]
+    fn parse_extension_log_file_mirrored_sinks_share_dedup_key_despite_ms_skew() {
+        // The same agent execution is logged to the extension's own sink and to
+        // the host's output-channel sink; each writer stamps its own prefix a few
+        // ms apart (and in a different format). Both copies must produce the same
+        // dedup key so cross-file dedup collapses them.
+        let dir = tempfile::tempdir().unwrap();
+
+        let extension_sink = dir.path().join("proj__session.log");
+        std::fs::write(
+            &extension_sink,
+            r#"[2026/7/1 16:56:02.200] [info] [AgentReporter] [agent-1] Agent execution successful with usage: {"inputTokens":140732,"outputTokens":635,"totalTokens":141367}"#,
+        )
+        .unwrap();
+
+        let host_sink = dir.path().join("proj__host.log");
+        std::fs::write(
+            &host_sink,
+            r#"2026-07-01 16:56:02.201 [info] [AgentReporter] [agent-1] Agent execution successful with usage: {"inputTokens":140732,"outputTokens":635,"totalTokens":141367}"#,
+        )
+        .unwrap();
+
+        let from_extension = parse_extension_log_file("codebuddy", "codebuddy", &extension_sink);
+        let from_host = parse_extension_log_file("codebuddy", "codebuddy", &host_sink);
+
+        assert_eq!(from_extension.len(), 1);
+        assert_eq!(from_host.len(), 1);
+        assert!(from_extension[0].dedup_key.is_some());
+        assert_eq!(from_extension[0].dedup_key, from_host[0].dedup_key);
     }
 }
