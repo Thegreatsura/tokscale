@@ -7,8 +7,8 @@ use tokio::runtime::{Handle, Runtime};
 
 use tokscale_core::sessions::UnifiedMessage;
 use tokscale_core::{
-    normalize_model_for_grouping, parse_local_unified_messages, sessions, ClientId, GroupBy,
-    LocalParseOptions, ModelPerformance,
+    model_name_for_grouping, normalize_model_for_grouping, parse_local_unified_messages, sessions,
+    ClientId, GroupBy, LocalParseOptions, ModelPerformance,
 };
 
 /// Returns the scanner settings that `DataLoader` should use when building
@@ -48,6 +48,7 @@ impl TokenBreakdown {
 #[derive(Debug, Clone)]
 pub struct ModelUsage {
     pub model: String,
+    pub color_key: String,
     pub provider: String,
     pub client: String,
     pub workspace_key: Option<String>,
@@ -457,7 +458,9 @@ impl DataLoader {
         let mut session_map: HashMap<String, SessionUsage> = HashMap::new();
 
         for msg in &messages {
-            let normalized_model = normalize_model_for_grouping(&msg.model_id);
+            let normalized_model =
+                model_name_for_grouping(&msg.client, &msg.provider_id, &msg.model_id);
+            let model_key = normalize_model_for_grouping(&msg.model_id);
             let (workspace_group_key, workspace_key, workspace_label) = workspace_bucket(msg);
             let key = match group_by {
                 GroupBy::Model => normalized_model.clone(),
@@ -477,6 +480,7 @@ impl DataLoader {
 
             let model_entry = model_map.entry(key.clone()).or_insert_with(|| ModelUsage {
                 model: normalized_model.clone(),
+                color_key: model_key.clone(),
                 provider: msg.provider_id.clone(),
                 client: msg.client.clone(),
                 workspace_key: if *group_by == GroupBy::WorkspaceModel {
@@ -683,7 +687,7 @@ impl DataLoader {
                             &msg.provider_id,
                             &normalized_model,
                         ),
-                        color_key: model_color_key(group_by, &msg.provider_id, &normalized_model),
+                        color_key: model_color_key(group_by, &msg.provider_id, &model_key),
                         tokens: TokenBreakdown::default(),
                         cost: 0.0,
                         messages: 0,
@@ -773,7 +777,7 @@ impl DataLoader {
                             &msg.provider_id,
                             &normalized_model,
                         ),
-                        color_key: model_color_key(group_by, &msg.provider_id, &normalized_model),
+                        color_key: model_color_key(group_by, &msg.provider_id, &model_key),
                         tokens: TokenBreakdown::default(),
                         cost: 0.0,
                     });
@@ -867,11 +871,7 @@ impl DataLoader {
                                 &msg.provider_id,
                                 &normalized_model,
                             ),
-                            color_key: model_color_key(
-                                group_by,
-                                &msg.provider_id,
-                                &normalized_model,
-                            ),
+                            color_key: model_color_key(group_by, &msg.provider_id, &model_key),
                             tokens: TokenBreakdown::default(),
                             cost: 0.0,
                         });
@@ -1020,7 +1020,13 @@ impl DataLoader {
                 .then_with(|| a.session_id.cmp(&b.session_id))
         });
 
-        let total_tokens: u64 = models.iter().map(|m| m.tokens.total()).sum();
+        // Plain `.sum()` panics (debug) / wraps (release) on overflow across
+        // many models; a single corrupt/huge bucket must not poison the
+        // whole total, so fold with saturating_add like `TokenBreakdown::total`.
+        let total_tokens: u64 = models
+            .iter()
+            .map(|m| m.tokens.total())
+            .fold(0u64, u64::saturating_add);
         let total_cost: f64 = models
             .iter()
             .map(|m| if m.cost.is_finite() { m.cost } else { 0.0 })
@@ -1994,6 +2000,40 @@ mod tests {
         assert_eq!(usage.agents[0].message_count, 2);
         assert!((usage.agents[0].cost - 4.0).abs() < f64::EPSILON);
         assert_eq!(usage.agents[0].tokens.total(), 45);
+    }
+
+    #[test]
+    fn total_tokens_saturates_across_corrupt_model_buckets() {
+        let loader = DataLoader::new(None);
+        // Three distinct models each carrying i64::MAX input tokens: no
+        // single model bucket overflows (TokenBreakdown::total saturates
+        // internally), but summing three of them plainly overflows u64.
+        let messages: Vec<UnifiedMessage> = (0..3)
+            .map(|i| {
+                UnifiedMessage::new(
+                    "claude",
+                    format!("model-{i}"),
+                    "anthropic",
+                    format!("session-{i}"),
+                    1_735_689_600_000,
+                    tokscale_core::TokenBreakdown {
+                        input: i64::MAX,
+                        output: 0,
+                        cache_read: 0,
+                        cache_write: 0,
+                        reasoning: 0,
+                    },
+                    0.0,
+                )
+            })
+            .collect();
+
+        let usage = loader
+            .aggregate_messages(messages, &GroupBy::Model)
+            .unwrap();
+
+        assert_eq!(usage.models.len(), 3);
+        assert_eq!(usage.total_tokens, u64::MAX);
     }
 
     #[test]

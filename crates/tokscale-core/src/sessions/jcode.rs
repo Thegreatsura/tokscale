@@ -20,11 +20,36 @@ struct JcodeSession {
     messages: Vec<JcodeMessage>,
 }
 
+/// Same envelope, but with `messages` left as raw JSON so a single malformed
+/// element can be skipped instead of failing the whole snapshot deserialize.
+#[derive(Debug, Deserialize)]
+struct JcodeSessionEnvelope {
+    id: Option<String>,
+    provider_key: Option<String>,
+    model: Option<String>,
+    working_dir: Option<String>,
+    #[serde(default)]
+    messages: Vec<serde_json::Value>,
+}
+
 #[derive(Debug, Deserialize)]
 struct JcodeJournalEntry {
     meta: Option<JcodeJournalMeta>,
+    // Raw values for the same reason as `JcodeSessionEnvelope::messages`: one
+    // malformed sibling in a journal batch must not drop the line's valid
+    // messages (or its meta).
     #[serde(default)]
-    append_messages: Vec<JcodeMessage>,
+    append_messages: Vec<serde_json::Value>,
+}
+
+/// Parse each raw message independently: a single wrong-typed field (e.g. a
+/// string `token_usage`) must only drop that message, not its whole snapshot
+/// or journal batch, mirroring how kimi/opencodereview skip bad lines.
+fn lenient_jcode_messages(values: Vec<serde_json::Value>) -> Vec<JcodeMessage> {
+    values
+        .into_iter()
+        .filter_map(|value| serde_json::from_value(value).ok())
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,12 +96,33 @@ fn model_id(model: Option<&str>) -> String {
     }
 }
 
+fn uses_split_cache_accounting(usage: &JcodeTokenUsage, input: i64, cache_read: i64) -> bool {
+    // Jcode stores provider/model only at session scope, so either value may
+    // describe a later route after a mid-session switch. Use message-local usage
+    // shape instead. Anthropic-style reports preserve the cache-creation field
+    // even when its value is zero; OpenAI/OpenRouter cached_tokens omit it and
+    // report cache reads as a subset of input_tokens.
+    usage.cache_creation_input_tokens.is_some() || cache_read > input
+}
+
 fn tokens_from_usage(usage: &JcodeTokenUsage) -> TokenBreakdown {
+    let reported_input = usage.input_tokens.unwrap_or(0).max(0);
+    let cache_read = usage.cache_read_input_tokens.unwrap_or(0).max(0);
+    let cache_write = usage.cache_creation_input_tokens.unwrap_or(0).max(0);
+    let input = if uses_split_cache_accounting(usage, reported_input, cache_read) {
+        reported_input
+    } else {
+        // OpenAI-style APIs report cached tokens as a subset of input_tokens.
+        // Tokscale prices input and cache buckets independently, so remove that
+        // overlap here rather than charging cached reads twice.
+        reported_input.saturating_sub(cache_read.min(reported_input))
+    };
+
     TokenBreakdown {
-        input: usage.input_tokens.unwrap_or(0).max(0),
+        input,
         output: usage.output_tokens.unwrap_or(0).max(0),
-        cache_read: usage.cache_read_input_tokens.unwrap_or(0).max(0),
-        cache_write: usage.cache_creation_input_tokens.unwrap_or(0).max(0),
+        cache_read,
+        cache_write,
         reasoning: usage.reasoning_output_tokens.unwrap_or(0).max(0),
     }
 }
@@ -89,6 +135,12 @@ struct JcodeSessionContext {
     workspace_key: Option<String>,
     workspace_label: Option<String>,
     pending_turn_start: bool,
+    // User messages never carry `token_usage`, so they never enter
+    // `index_by_dedup_key`/`known_dedup_keys` (which only track messages
+    // that were emitted). This seen-set spans the snapshot and journal
+    // passes so a journal replay of an already-seen user id can't re-arm
+    // `pending_turn_start` and mint a spurious extra turn.
+    seen_user_dedup_keys: std::collections::HashSet<String>,
 }
 
 impl JcodeSessionContext {
@@ -105,6 +157,7 @@ impl JcodeSessionContext {
             workspace_key,
             workspace_label,
             pending_turn_start: false,
+            seen_user_dedup_keys: std::collections::HashSet::new(),
         }
     }
 
@@ -172,8 +225,12 @@ fn parse_jcode_messages(
             // None for the snapshot pass, so snapshot parsing is unchanged.
             let is_replacement = known_dedup_keys.is_some_and(|keys| keys.contains_key(&dedup_key));
 
-            if !is_replacement && message.role.as_deref() == Some("user") {
-                context.pending_turn_start = true;
+            if message.role.as_deref() == Some("user") {
+                // Only a user id not already seen (snapshot or journal) arms a
+                // new turn; a replay of the same id is turn-neutral.
+                if context.seen_user_dedup_keys.insert(dedup_key.clone()) {
+                    context.pending_turn_start = true;
+                }
             }
 
             let usage = message.token_usage?;
@@ -236,9 +293,17 @@ pub fn parse_jcode_file(path: &Path) -> Vec<UnifiedMessage> {
         Ok(data) => data,
         Err(_) => return Vec::new(),
     };
-    let session: JcodeSession = match simd_json::from_slice(&mut data) {
-        Ok(session) => session,
+    let envelope: JcodeSessionEnvelope = match simd_json::from_slice(&mut data) {
+        Ok(envelope) => envelope,
         Err(_) => return Vec::new(),
+    };
+    let messages = lenient_jcode_messages(envelope.messages);
+    let session = JcodeSession {
+        id: envelope.id,
+        provider_key: envelope.provider_key,
+        model: envelope.model,
+        working_dir: envelope.working_dir,
+        messages,
     };
 
     let session_id = session.id.clone().unwrap_or_else(|| {
@@ -298,7 +363,7 @@ pub fn parse_jcode_file(path: &Path) -> Vec<UnifiedMessage> {
                 context.apply_meta(meta);
             }
             let journal_messages = parse_jcode_messages(
-                entry.append_messages,
+                lenient_jcode_messages(entry.append_messages),
                 &mut context,
                 journal_fallback_timestamp,
                 &format!("journal:{line_index}"),
@@ -371,6 +436,74 @@ mod tests {
     }
 
     #[test]
+    fn subtracts_subset_cache_reads_from_openai_input_tokens() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            r#"{
+  "id":"session_openai_cache",
+  "provider_key":"openai",
+  "model":"gpt-5.6-sol",
+  "messages":[
+    {"id":"assistant_1","role":"assistant","timestamp":"2026-06-16T12:00:01Z","token_usage":{"input_tokens":19347,"output_tokens":71,"cache_read_input_tokens":15872}}
+  ]
+}"#,
+        )
+        .unwrap();
+
+        let messages = parse_jcode_file(file.path());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.input, 3_475);
+        assert_eq!(messages[0].tokens.cache_read, 15_872);
+        assert_eq!(messages[0].tokens.output, 71);
+    }
+
+    #[test]
+    fn preserves_split_cache_reads_for_anthropic_input_tokens() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            r#"{
+  "id":"session_anthropic_cache",
+  "provider_key":"anthropic-api-key",
+  "model":"claude-sonnet-4-5",
+  "messages":[
+    {"id":"assistant_1","role":"assistant","timestamp":"2026-06-16T12:00:01Z","token_usage":{"input_tokens":20000,"output_tokens":71,"cache_read_input_tokens":15872,"cache_creation_input_tokens":0}}
+  ]
+}"#,
+        )
+        .unwrap();
+
+        let messages = parse_jcode_file(file.path());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.input, 20_000);
+        assert_eq!(messages[0].tokens.cache_read, 15_872);
+        assert_eq!(messages[0].tokens.output, 71);
+    }
+
+    #[test]
+    fn subtracts_openrouter_cache_for_routed_claude_models() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            r#"{
+  "id":"session_openrouter_claude",
+  "provider_key":"openrouter",
+  "model":"anthropic/claude-sonnet-4",
+  "messages":[
+    {"id":"assistant_1","role":"assistant","timestamp":"2026-06-16T12:00:01Z","token_usage":{"input_tokens":1000,"output_tokens":71,"cache_read_input_tokens":800}}
+  ]
+}"#,
+        )
+        .unwrap();
+
+        let messages = parse_jcode_file(file.path());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.input, 200);
+        assert_eq!(messages[0].tokens.cache_read, 800);
+    }
+
+    #[test]
     fn marks_only_first_assistant_after_user_as_turn_start() {
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(
@@ -426,7 +559,7 @@ mod tests {
         assert_eq!(messages[0].tokens.input, 100);
         assert_eq!(messages[1].model_id, "journal-model");
         assert_eq!(messages[1].provider_id, "openai");
-        assert_eq!(messages[1].tokens.input, 200);
+        assert_eq!(messages[1].tokens.input, 150);
         assert_eq!(messages[1].tokens.cache_read, 50);
         assert_eq!(
             messages[1].workspace_label.as_deref(),
@@ -519,7 +652,7 @@ mod tests {
         // Exactly one entry for the repeated id (no double-counting).
         assert_eq!(messages.len(), 1);
         // Journal value wins over the stale snapshot value.
-        assert_eq!(messages[0].tokens.input, 900);
+        assert_eq!(messages[0].tokens.input, 860);
         assert_eq!(messages[0].tokens.output, 300);
         assert_eq!(messages[0].tokens.cache_read, 40);
     }
@@ -677,6 +810,116 @@ mod tests {
         assert!(messages[1].is_turn_start);
         let turn_count = messages.iter().filter(|m| m.is_turn_start).count();
         assert_eq!(turn_count, 2);
+    }
+
+    #[test]
+    fn one_malformed_token_usage_does_not_drop_the_whole_session() {
+        // A single malformed message (token_usage as a string) must not nuke
+        // every other valid message in the snapshot (and its journal).
+        let dir = tempfile::TempDir::new().unwrap();
+        let snapshot = dir.path().join("session_test.json");
+        std::fs::write(
+            &snapshot,
+            r#"{
+  "id":"session_test",
+  "model":"snapshot-model",
+  "messages":[
+    {"id":"assistant_good","role":"assistant","timestamp":"2026-06-16T12:00:01Z","token_usage":{"input_tokens":100,"output_tokens":10}},
+    {"id":"assistant_bad","role":"assistant","timestamp":"2026-06-16T12:00:02Z","token_usage":"corrupt"}
+  ]
+}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("session_test.journal.jsonl"),
+            r#"{"append_messages":[{"id":"assistant_journal","role":"assistant","timestamp":"2026-06-16T12:00:03Z","token_usage":{"input_tokens":200,"output_tokens":20}}]}
+"#,
+        )
+        .unwrap();
+
+        let messages = parse_jcode_file(&snapshot);
+        assert_eq!(
+            messages.len(),
+            2,
+            "valid snapshot + journal messages must survive one malformed sibling"
+        );
+        let total_input: i64 = messages.iter().map(|m| m.tokens.input).sum();
+        let total_output: i64 = messages.iter().map(|m| m.tokens.output).sum();
+        assert_eq!(total_input, 300);
+        assert_eq!(total_output, 30);
+    }
+
+    #[test]
+    fn one_malformed_journal_sibling_does_not_drop_the_lines_valid_messages() {
+        // Same leniency as the snapshot: a malformed sibling inside a journal
+        // line's append_messages batch must only drop that element, not the
+        // valid messages (or meta) sharing the line.
+        let dir = tempfile::TempDir::new().unwrap();
+        let snapshot = dir.path().join("session_test.json");
+        std::fs::write(
+            &snapshot,
+            r#"{
+  "id":"session_test",
+  "model":"snapshot-model",
+  "messages":[
+    {"id":"assistant_good","role":"assistant","timestamp":"2026-06-16T12:00:01Z","token_usage":{"input_tokens":100,"output_tokens":10}}
+  ]
+}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("session_test.journal.jsonl"),
+            r#"{"append_messages":[{"id":"assistant_journal","role":"assistant","timestamp":"2026-06-16T12:00:03Z","token_usage":{"input_tokens":200,"output_tokens":20}},{"id":"assistant_bad","role":"assistant","timestamp":"2026-06-16T12:00:04Z","token_usage":"corrupt"}]}
+"#,
+        )
+        .unwrap();
+
+        let messages = parse_jcode_file(&snapshot);
+        assert_eq!(
+            messages.len(),
+            2,
+            "a valid journal message must survive a malformed sibling on its line"
+        );
+        let total_input: i64 = messages.iter().map(|m| m.tokens.input).sum();
+        assert_eq!(total_input, 300);
+    }
+
+    #[test]
+    fn journal_full_turn_replay_does_not_double_count_turns() {
+        // The journal replays a whole already-snapshotted turn (user + assistant
+        // correction), then appends a follow-up assistant step of the SAME turn.
+        // The user replay must not re-arm pending_turn_start: assistant ids are
+        // guarded via known_dedup_keys, but user messages never enter the index
+        // (no usage), so their replay is indistinguishable from a new turn.
+        let dir = tempfile::TempDir::new().unwrap();
+        let snapshot = dir.path().join("session_test.json");
+        std::fs::write(
+            &snapshot,
+            r#"{
+  "id":"session_test",
+  "model":"snapshot-model",
+  "messages":[
+    {"id":"user_1","role":"user","timestamp":"2026-06-16T12:00:00Z"},
+    {"id":"assistant_1","role":"assistant","timestamp":"2026-06-16T12:00:01Z","token_usage":{"input_tokens":100,"output_tokens":10}}
+  ]
+}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("session_test.journal.jsonl"),
+            r#"{"append_messages":[{"id":"user_1","role":"user","timestamp":"2026-06-16T12:00:00Z"},{"id":"assistant_1","role":"assistant","timestamp":"2026-06-16T12:00:01Z","token_usage":{"input_tokens":150,"output_tokens":15}}]}
+{"append_messages":[{"id":"assistant_1b","role":"assistant","timestamp":"2026-06-16T12:00:04Z","token_usage":{"input_tokens":50,"output_tokens":5}}]}
+"#,
+        )
+        .unwrap();
+
+        let messages = parse_jcode_file(&snapshot);
+        assert_eq!(messages.len(), 2);
+        let turn_count = messages.iter().filter(|m| m.is_turn_start).count();
+        assert_eq!(
+            turn_count, 1,
+            "a replayed user message must not mint a second turn"
+        );
     }
 
     #[test]
