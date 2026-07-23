@@ -818,7 +818,8 @@ fn parser_version(client: ClientId) -> u32 {
         // span context") are now treated as absent instead of as a real,
         // shared identity, and a valid span_id alone (no trace_id) is now a
         // stable dedup key instead of falling through to the line-index key.
-        ClientId::Copilot => 7,
+        // v7->v8: stabilize duplicate agent attribution and partial timing boundaries.
+        ClientId::Copilot => 8,
         // Pi subagent sessions now derive agent attribution from session_info
         // names; version-1 caches carry those messages without agent metadata.
         ClientId::Pi => 2,
@@ -2057,8 +2058,12 @@ mod tests {
     #[test]
     fn test_codex_duration_parser_version_invalidates_v4_entries() {
         assert_eq!(parser_version(ClientId::Codex), 6);
-        assert_eq!(parser_version(ClientId::Copilot), 7);
         assert_eq!(parser_version(ClientId::Claude), 2);
+    }
+
+    #[test]
+    fn test_copilot_duplicate_metadata_parser_version_invalidates_v7_entries() {
+        assert_eq!(parser_version(ClientId::Copilot), 8);
     }
 
     #[test]
