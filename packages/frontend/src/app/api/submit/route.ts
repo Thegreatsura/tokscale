@@ -175,6 +175,15 @@ function isUniqueConstraintViolation(error: unknown): boolean {
   return Boolean(cause && typeof cause === "object" && (cause as { code?: unknown }).code === "23505");
 }
 
+function mergeActiveTimeMs(
+  existing: number | null | undefined,
+  incoming: number | null | undefined,
+): number | null {
+  if (existing == null) return incoming ?? null;
+  if (incoming == null) return existing;
+  return Math.max(existing, incoming);
+}
+
 /**
  * POST /api/submit
  * Submit token usage data from CLI
@@ -292,7 +301,12 @@ export async function POST(request: Request) {
       // STEP 3a: Get or create user's submission
       // ------------------------------------------
       const [existingSubmission] = await tx
-        .select({ id: submissions.id })
+        .select({
+          id: submissions.id,
+          longestContinuousMs: submissions.longestContinuousMs,
+          maxConcurrentSessions: submissions.maxConcurrentSessions,
+          sessionCount: submissions.sessionCount,
+        })
         .from(submissions)
         .where(eq(submissions.userId, tokenRecord.userId))
         .for('update')
@@ -300,6 +314,7 @@ export async function POST(request: Request) {
 
       let submissionId: string;
       let isNewSubmission = false;
+      let storedSessionMetrics = existingSubmission;
 
       if (existingSubmission) {
         submissionId = existingSubmission.id;
@@ -335,7 +350,12 @@ export async function POST(request: Request) {
           }
 
           const [racedSubmission] = await tx
-            .select({ id: submissions.id })
+            .select({
+              id: submissions.id,
+              longestContinuousMs: submissions.longestContinuousMs,
+              maxConcurrentSessions: submissions.maxConcurrentSessions,
+              sessionCount: submissions.sessionCount,
+            })
             .from(submissions)
             .where(eq(submissions.userId, tokenRecord.userId))
             .for('update')
@@ -346,6 +366,7 @@ export async function POST(request: Request) {
           }
 
           submissionId = racedSubmission.id;
+          storedSessionMetrics = racedSubmission;
         }
       }
 
@@ -570,6 +591,15 @@ export async function POST(request: Request) {
           warnings.push(
             ...mergeResult.warnings.map((warning) => `Day ${incomingDay.date}: ${warning}`)
           );
+          if (
+            existingDay.activeTimeMs != null &&
+            incomingDay.activeTimeMs != null &&
+            incomingDay.activeTimeMs < existingDay.activeTimeMs
+          ) {
+            warnings.push(
+              `Day ${incomingDay.date}: Preserved ${existingDay.activeTimeMs}ms active time because this same-device resubmit reported only ${incomingDay.activeTimeMs}ms.`
+            );
+          }
           const mergedClientBreakdown = mergeResult.merged;
           // A preserved fold must keep its ORIGINAL raw alias keys in storage
           // (e.g. both "kilocode" and "kilo"), not the collapsed sum: the
@@ -594,7 +624,7 @@ export async function POST(request: Request) {
             inputTokens: dayTotals.inputTokens,
             outputTokens: dayTotals.outputTokens,
             timestampMs: mergeTimestampMs(existingDay.timestampMs, incomingDay.timestampMs ?? null),
-            activeTimeMs: incomingDay.activeTimeMs ?? existingDay.activeTimeMs ?? null,
+            activeTimeMs: mergeActiveTimeMs(existingDay.activeTimeMs, incomingDay.activeTimeMs),
             sourceBreakdown: mergedClientBreakdown,
           });
         } else {
@@ -754,9 +784,18 @@ export async function POST(request: Request) {
           totalActiveTimeMs: aggregates.totalActiveTimeMs,
           // Session-shape metrics cannot be safely recomputed from daily active-time buckets.
           ...(data.timeMetrics ? {
-            longestContinuousMs: data.timeMetrics.longestContinuousMs,
-            maxConcurrentSessions: data.timeMetrics.maxConcurrentSessions,
-            sessionCount: data.timeMetrics.sessionCount,
+            longestContinuousMs: Math.max(
+              storedSessionMetrics?.longestContinuousMs ?? 0,
+              data.timeMetrics.longestContinuousMs,
+            ),
+            maxConcurrentSessions: Math.max(
+              storedSessionMetrics?.maxConcurrentSessions ?? 0,
+              data.timeMetrics.maxConcurrentSessions,
+            ),
+            sessionCount: Math.max(
+              storedSessionMetrics?.sessionCount ?? 0,
+              data.timeMetrics.sessionCount,
+            ),
           } : {}),
           mcpServers: mcpServers && mcpServers.length > 0 ? mcpServers : null,
           updatedAt: new Date(),

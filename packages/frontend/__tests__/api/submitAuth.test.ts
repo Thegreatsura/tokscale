@@ -1295,7 +1295,7 @@ describe("POST /api/submit auth path", () => {
     }));
   });
 
-  it("updates same-device active time totals without double-counting the replaced row", async () => {
+  it("preserves same-device active time and session metrics when local history shrinks", async () => {
     mockState.authenticatePersonalToken.mockResolvedValue({
       status: "valid",
       tokenId: "token-1",
@@ -1396,12 +1396,17 @@ describe("POST /api/submit auth path", () => {
     mockState.mergeTimestampMs.mockReturnValue(456);
 
     const selectResults = [
-      [{ id: "submission-1" }],
+      [{
+        id: "submission-1",
+        longestContinuousMs: 9_000,
+        maxConcurrentSessions: 4,
+        sessionCount: 12,
+      }],
       [{
         id: "daily-1",
         date: "2026-04-30",
         timestampMs: 123,
-        activeTimeMs: 2_000,
+        activeTimeMs: 7_000,
         sourceBreakdown: existingBreakdown,
       }],
       [{
@@ -1466,8 +1471,14 @@ describe("POST /api/submit auth path", () => {
     expect(response.status).toBe(200);
     expect(tx.insert).toHaveBeenCalledTimes(1);
     expect(tx.execute).toHaveBeenCalledTimes(1);
+    expect(flattenSqlChunks(tx.execute.mock.calls[0][0])).toEqual(
+      expect.arrayContaining([7_000]),
+    );
     expect(submissionUpdateSets.at(-1)).toEqual(expect.objectContaining({
       totalActiveTimeMs: 13_000,
+      longestContinuousMs: 9_000,
+      maxConcurrentSessions: 4,
+      sessionCount: 12,
     }));
   });
   it("adopts legacy daily rows into the first modern device instead of duplicating totals", async () => {
