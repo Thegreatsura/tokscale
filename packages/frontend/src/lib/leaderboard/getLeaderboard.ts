@@ -13,6 +13,10 @@ import {
   hasDirectives,
   parseSearchDirectives,
 } from "@/lib/leaderboard/searchDirectives";
+import {
+  scopeBreakdownToDirectives,
+  type PeriodSourceBreakdown,
+} from "@/lib/leaderboard/sourceBreakdown";
 
 export type { LeaderboardData, LeaderboardUser, Period, SortBy } from "@/lib/leaderboard/types";
 
@@ -33,7 +37,7 @@ interface LeaderboardPeriodRow {
   avatarUrl: string | null;
   tokens: number;
   cost: number;
-  sourceBreakdown: Record<string, { models: Record<string, unknown> }> | null;
+  sourceBreakdown: PeriodSourceBreakdown | null;
   /**
    * Carried through so the period path can drop the user from the rankings
    * while still counting them in the period totals. Internal only — it must
@@ -54,7 +58,7 @@ interface PeriodLeaderboardDbRow {
   avatarUrl: string | null;
   tokens: number | string | null;
   cost: number | string | null;
-  sourceBreakdown: Record<string, { models: Record<string, unknown> }> | null;
+  sourceBreakdown: PeriodSourceBreakdown | null;
   leaderboardHidden: boolean;
 }
 
@@ -206,29 +210,9 @@ function buildPeriodLeaderboardData(
 
   let filteredRows = rows;
   if (hasDirectives(parsed)) {
-    filteredRows = rows.filter((row) => {
-      if (!row.sourceBreakdown) return false;
-
-      const clientKeys = Object.keys(row.sourceBreakdown).map((k) => k.toLowerCase());
-      const modelKeys = Object.values(row.sourceBreakdown).flatMap((client) =>
-        client.models ? Object.keys(client.models).map((m) => m.toLowerCase()) : []
-      );
-
-      if (parsed.clients.length > 0) {
-        const hasMatchingClient = parsed.clients.some((c) =>
-          clientKeys.some((k) => k.includes(c))
-        );
-        if (!hasMatchingClient) return false;
-      }
-
-      if (parsed.models.length > 0) {
-        const hasMatchingModel = parsed.models.some((m) =>
-          modelKeys.some((k) => k.includes(m))
-        );
-        if (!hasMatchingModel) return false;
-      }
-
-      return true;
+    filteredRows = rows.flatMap((row) => {
+      const scoped = scopeBreakdownToDirectives(row.sourceBreakdown, parsed);
+      return scoped ? [{ ...row, tokens: scoped.tokens, cost: scoped.cost }] : [];
     });
   }
 
