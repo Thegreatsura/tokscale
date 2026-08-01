@@ -228,6 +228,58 @@ SUM(daily tokens in that bucket) / tokens_highwater
 
 Nothing can regress, because nothing reads it yet.
 
+### What it costs, measured (2026-07-31)
+
+"Inert" describes the read side. It says nothing about the write side, so this
+was measured against production rather than asserted.
+
+```
+rows per full-history submit — actual distinct (client, bucket) pairs
+  both widths      p50   33    p95   122    max   349
+  month only       p50    9    p95    32    max    91
+  daily_breakdown
+  writes today     p50   64    p95   218    max  1257
+
+steady-state table   108,866 rows (both widths) / 29,640 (month only)
+daily_breakdown      204,696 rows / 305 MB
+```
+
+**Phase 1 writes roughly half of what the submit path already writes**, and its
+rows are narrow — five key columns and two numerics, against
+`daily_breakdown`'s JSONB payload. Storage is not a consideration.
+
+A first estimate put this 6–7x higher by multiplying bucket count by client
+count. That is an upper bound, not a count: a device with nine clients runs one
+to three of them in any given month, so the real cardinality is far below the
+product. Measure this rather than deriving it.
+
+### The real exposure is placement, not volume
+
+The submit path runs inside a single `db.transaction` (`route.ts:322`) and
+takes `.for('update')` on the submissions row inside it (`:341`), which
+serializes every submit for a user across all their devices until commit. A
+Phase 1 write placed there inherits both properties:
+
+- it extends the lock hold, modestly — about +50% on write volume at p95;
+- **a defect in it fails the user's submit entirely.** "Nothing reads it" is no
+  protection here. This repo has already seen a `COALESCE(SUM(x),0)::int`
+  overflow abort a transaction, and `tokens_highwater` is exactly the kind of
+  column that invites the same mistake.
+
+**It does not have to live there.** The write is a `GREATEST` upsert, so it is
+idempotent: applying it twice is applying it once. That means it can run after
+the submit transaction commits, at which point a failure costs one deferred
+measurement — repaired by the next submit — instead of a rejected submission.
+The reconciliation Phase 4b needs is unaffected either way.
+
+The cost of moving it out is that the table lags the daily rows by one submit
+for any request that dies between commit and the follow-up write. Phase 2 must
+therefore treat a missing bucket as *unknown*, never as zero — which is already
+required for a different reason, see that phase's coverage gate.
+
+Writing only one bucket width halves everything above again, and Phase 3 makes
+the width question much less interesting by permitting daily buckets outright.
+
 **One thing the census cannot see — fixed, but it still distorts the baseline.**
 `ClientId::OpenCodeReview` declared `submit_default: true`
 (`crates/tokscale-core/src/clients.rs:509-517`) while being parsed only by
@@ -243,6 +295,67 @@ Audited against the whole registry at the time: of 37 `submit_default` clients
 it was the only one missing (Goose, Hermes and Kilo look absent from a naive
 `ClientId::` grep but are handled at `lib.rs:1171`, `:1161`, and via
 `ClientId::KiloCode` at `:1087`).
+
+## Phase 1.5 — Dual read: compute both, serve the old, record the delta
+
+Phase 1 and Phase 2 are already a dual-*write* followed by a cutover. What sits
+between them is a **flip gated by a rule**, not by evidence: the coverage gate
+below asks "do rows exist?", never "do the two derivations agree?". Nothing in
+the plan as written ever compares them on live traffic before the switch.
+
+So add a stage that does. On each submission recompute, derive the total **both**
+ways — `SUM(dailyBreakdown.tokens)` and `SUM(tokens_highwater)` — serve the old
+one, and record the pair.
+
+It costs one extra aggregate per submit and carries no read risk, because the
+value served is unchanged. In exchange:
+
+- **The token-axis census arrives as a by-product**, on real traffic, without
+  anyone running a script. This is the measurement the 2026-07-31 census could
+  not reach.
+- **Phase 2's gate stops being a rule and becomes a measurement**: switch when
+  the recorded deltas agree within tolerance, for a stated share of users, over
+  a stated window. "Coverage exists" is a much weaker claim than "the numbers
+  match".
+- **The zero-out failure is observed rather than reasoned about.** A user whose
+  high-water sum is 0 or partial shows up as an enormous recorded delta long
+  before any read depends on it.
+
+### The table cannot be seeded from `daily_breakdown` — the warm-up is forced
+
+This is the part that makes dual mode mandatory rather than merely prudent, and
+it is worth stating plainly because the obvious shortcut is actively harmful.
+
+Backfilling `tokens_highwater` from existing daily rows would set it to
+`SUM(daily in bucket)` — **the inflated value**. A later full scan reports the
+true, lower bucket total, and `GREATEST(inflated, true)` keeps the inflated one.
+Permanently. Seeding the table from the data it exists to correct would cement
+the very inflation it is measuring, with no path back.
+
+So the table starts empty and can only be filled by incoming payloads. The
+warm-up period is not a convenience to be optimised away; it is forced by the
+merge semantics. That is also the real reason Phase 2 needs a coverage gate at
+all, and why row 9 of the state table insists a missing baseline must never be
+read as `0`.
+
+### What can be deprecated afterwards, and what cannot
+
+- **Can be retired:** the `SUM(daily)` derivation *for submission totals*, once
+  Phase 2 is stable and the deltas have stayed flat.
+- **Cannot be retired:** `daily_breakdown` itself. The heatmap and per-day views
+  read it, Phase 4 repairs it, and the high-water table holds bucket totals with
+  no day-level detail to replace it with.
+
+Dual mode ends by retiring a *derivation*, not a table.
+
+### Make the write killable without a deploy
+
+The migration is effectively irreversible — drizzle stores the content hash of
+each applied migration, so migrations are immutable once applied (see
+`AGENTS.md`). The *write* need not inherit that property. Put it behind a flag
+so a misbehaving Phase 1 can be switched off in seconds, without reverting a
+migration or shipping a rollback. Combined with after-commit placement, that
+leaves Phase 1 with no failure mode that reaches a user.
 
 ## Phase 2 — Switch the read path
 
@@ -322,6 +435,58 @@ waiting on full adoption.
 Trade-off: a user who relocates keeps bucketing into their old zone until they
 change the setting. For historical data that is arguably correct — day boundaries
 stay stable — but it is a product decision.
+
+### What it costs, verified (2026-07-31)
+
+This phase was called "cheap" throughout earlier drafts on no evidence. It
+mostly is, but via a route those drafts had not identified, and it carries a
+dependency decision they never mentioned.
+
+**Already in place, so not part of the cost:**
+
+- Both bucketing functions already have injectable variants —
+  `compute_daily_active_time_with_timezone` (`sessionize.rs:291`) and
+  `timestamp_to_date_with_timezone` (`sessions/mod.rs:447`), each generic over
+  `Tz`. Today's callers simply pass `&chrono::Local`.
+- `settings.json` already exists, and adding a field to it is a documented
+  drop-in pattern: `#[serde(default)]` so files written before the field still
+  load (`tui/settings.rs:141`).
+- `ScannerSettings` is a single shared type (`tokscale_core::scanner`, re-used
+  by the TUI) and **already flows through the parse path** — `LocalParseOptions`
+  carries it at `lib.rs:410`/`:510` and threads it to `:620`, `:1020`, `:2421`,
+  `:2478`, `:2577`.
+- `compute_daily_active_time` has exactly **one** caller (`lib.rs:2687`).
+
+**The trap.** `timestamp_to_date` is called from `UnifiedMessage::new_full`, a
+constructor. Threading a timezone through it means touching every parser:
+`UnifiedMessage::new` has **92 call sites across 42 files**. Done naively, this
+phase is not cheap at all.
+
+**The cheap route, which exists by luck rather than design.**
+`refresh_derived_fields` (`sessions/mod.rs:380`) already recomputes
+`self.date` from `self.timestamp` after construction, and it is **already
+called in a post-parse pass at `lib.rs:634`** — inside
+`parse_all_messages_with_pricing_with_env_strategy`, which already holds
+`scanner_settings`. So the date is already treated as a derived field that gets
+re-normalised where the settings are in scope. Pinning the zone becomes a
+parameter on that pass, not a change to 92 constructor calls.
+
+**The unpriced decision: `chrono-tz` is not a dependency.** The workspace has
+`chrono` only (`Cargo.toml:35`). That forces a choice the earlier drafts never
+raised:
+
+| | `chrono::FixedOffset` | `chrono-tz` named zone |
+|---|---|---|
+| new dependency | none | yes, embeds the tz database |
+| binary size | unchanged | grows, across all 9 build targets |
+| DST correctness | **drifts an hour twice a year** | correct |
+
+A fixed offset reintroduces a bounded version of the very bug this phase
+removes: after a DST transition the pinned offset no longer matches local
+midnight, so usage within an hour of the boundary lands on the wrong day. It is
+far smaller than the current failure — an hour twice a year, not a full re-split
+on every rescan — but it is not zero, and calling this "the only exact fix"
+above is only true of the named-zone variant.
 
 ## Phase 4 — Heal the daily rows
 
