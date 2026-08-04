@@ -223,7 +223,7 @@ fn file_modified_ms(path: &Path) -> i64 {
 /// Convert a `file://` URI to a filesystem path, percent-decoding UTF-8 escapes
 /// (workspace paths on cloud drives can be percent-encoded CJK). After the
 /// scheme the remainder is `authority + path`; the three shapes RFC 8089 (and
-/// Antigravity) produce are handled:
+/// Antigravity) produces are handled:
 /// - `file:///C:/x`        → `C:/x`            (empty authority, Windows drive: drop the leading slash)
 /// - `file:///home/x`      → `/home/x`         (empty authority, POSIX absolute: keep as-is)
 /// - `file://host/share/x` → `//host/share/x`  (non-empty authority → UNC: restore the leading `//`)
@@ -523,6 +523,19 @@ mod tests {
         let message = parse_gen_metadata(&blob, "session", 1_000, &mut seen).unwrap();
 
         assert_eq!(message.model_id, "gemini-3.5-flash-high");
+        assert_eq!(message.provider_id, "google");
+    }
+
+    // The generic routing label is preserved verbatim. It is not a concrete
+    // billable model id, so submit can exclude it instead of inventing a cost.
+    #[test]
+    fn gemini_default_response_model_is_preserved() {
+        let blob = build_gen_metadata_with_model("gemini-default");
+        let mut seen = HashSet::new();
+
+        let message = parse_gen_metadata(&blob, "session", 1_000, &mut seen).unwrap();
+
+        assert_eq!(message.model_id, "gemini-default");
         assert_eq!(message.provider_id, "google");
     }
 

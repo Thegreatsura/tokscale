@@ -1,6 +1,7 @@
 #![deny(clippy::all)]
 
 mod aggregator;
+pub mod bucket_tz;
 mod cc_mirror;
 pub mod clients;
 pub mod content_extractor;
@@ -20,13 +21,14 @@ pub mod tui_signal;
 pub mod wiki;
 
 pub use aggregator::*;
+pub use bucket_tz::BucketTimezone;
 pub use clients::{ClientCounts, ClientDef, ClientId, PathRoot};
 pub use model_alias::ModelAliasMap;
 pub use parser::*;
 pub use scanner::*;
 pub use sessionize::{
-    compute_daily_active_time, compute_time_metrics, sessionize, SessionInterval, TimeMetrics,
-    DEFAULT_IDLE_GAP_MS,
+    compute_daily_active_time, compute_daily_active_time_in, compute_time_metrics, sessionize,
+    SessionInterval, TimeMetrics, DEFAULT_IDLE_GAP_MS,
 };
 pub use sessions::{CostSource, UnifiedMessage};
 
@@ -494,6 +496,19 @@ pub struct GraphResult {
     pub contributions: Vec<DailyContribution>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time_metrics: Option<sessionize::TimeMetrics>,
+    #[serde(skip)]
+    pub unpriced_submission_exclusions: Vec<UnpricedSubmissionExclusion>,
+}
+
+/// Token-bearing usage excluded only from a submission because its generic
+/// routing label has no authoritative model-to-price mapping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnpricedSubmissionExclusion {
+    pub provider_id: String,
+    pub model_id: String,
+    pub message_count: usize,
+    pub total_tokens: i64,
+    pub reason: &'static str,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -587,11 +602,25 @@ pub struct HourlyReport {
     pub processing_time_ms: u32,
 }
 
+/// Resolve the home directory every `from_dir`-style parser scans from.
+///
+/// An explicit `--home` always wins. Everything else goes through
+/// [`crate::paths::home_dir`], which is the *only* place allowed to read
+/// `$HOME`.
+///
+/// Reading `$HOME` here directly — as this used to — defeated that resolver
+/// entirely, because the raw read ran first and always won. On Windows a Git
+/// Bash `HOME=/home/user` therefore still reached every caller, and `Path`
+/// resolves that against the current drive, so the model/monthly/hourly
+/// reports and local parsing scanned `C:\home\user` instead of the real
+/// profile — precisely the case `paths::home_dir` was written to prevent. An
+/// exported-but-empty `HOME` was worse: it produced `Ok("")`, and the
+/// `format!("{home}/...")` joins downstream turned that into absolute scans
+/// from the filesystem root.
 pub fn get_home_dir_string(home_dir_option: &Option<String>) -> Result<String, String> {
     home_dir_option
         .clone()
-        .or_else(|| std::env::var("HOME").ok())
-        .or_else(|| dirs::home_dir().map(|p| p.to_string_lossy().into_owned()))
+        .or_else(|| crate::paths::home_dir().map(|p| p.to_string_lossy().into_owned()))
         .ok_or_else(|| {
             "HOME directory not specified and could not determine home directory".to_string()
         })
@@ -1488,25 +1517,29 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         .get(ClientId::Grok)
         .par_iter()
         .map(|path| {
-            // Use a Grok-aware fingerprint: parse output depends on the sibling
-            // signals.json rollup, so that file must participate in the cache key
-            // or a late/updated rollup is ignored forever for cached sessions.
+            // Use a Grok-aware fingerprint: legacy output depends on session
+            // sidecars, while unified output reads metadata across the complete
+            // sessions tree; all of those inputs must invalidate cached output.
             load_or_parse_source_with_fingerprint(
                 message_cache::CacheIdentity::for_client(ClientId::Grok),
                 path,
                 &source_cache,
                 pricing,
                 message_cache::SourceFingerprint::check_grok_path_samples_only,
-                sessions::grok::parse_grok_updates_file,
+                sessions::grok::parse_grok_file,
             )
         })
         .collect();
+    let mut grok_messages = Vec::new();
     for outcome in grok_outcomes {
-        all_messages.extend(outcome.messages);
+        grok_messages.extend(outcome.messages);
         if let Some(entry) = outcome.cache_entry {
             source_cache.insert(entry);
         }
     }
+    let mut selected_grok_messages = sessions::grok::prefer_unified_log_messages(grok_messages);
+    apply_pricing_to_messages(&mut selected_grok_messages, pricing);
+    all_messages.extend(selected_grok_messages);
 
     let jcode_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Jcode)
@@ -2076,9 +2109,13 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         all_messages.extend(kiro_db_messages);
     }
 
+    // Crush decides its day split at parse time (it allocates session cost
+    // across days), so it needs the pinned zone here — the post-parse
+    // `rebucket_days` pass cannot recover a split this grouping collapsed.
+    let crush_bucket_timezone = bucket_tz::BucketTimezone::from_scanner_settings(scanner_settings);
     for source in &scan_result.crush_dbs {
         let crush_messages: Vec<UnifiedMessage> =
-            sessions::crush::parse_crush_sqlite(&source.db_path)
+            sessions::crush::parse_crush_sqlite_in(&source.db_path, &crush_bucket_timezone)
                 .into_iter()
                 .map(|mut msg| {
                     msg.set_workspace(source.workspace_key.clone(), source.workspace_label.clone());
@@ -2301,7 +2338,35 @@ fn parse_all_messages_with_pricing_with_env_strategy(
 
     source_cache.save_if_dirty();
 
+    rebucket_days(&mut all_messages, scanner_settings);
+
     all_messages
+}
+
+/// Re-key every message onto the device's pinned bucketing timezone.
+///
+/// The parsers derive `date` from `chrono::Local`, read afresh on every scan,
+/// so which day a message lands in changes when the machine's zone does. This
+/// is the one pass that knows the user's settings and sees every message, so it
+/// is where the day key gets fixed to something a rescan cannot move.
+///
+/// Runs after the source cache is written on purpose: the cache stores raw
+/// parser output and `refresh_derived_fields` re-derives `date` on every load,
+/// so cached entries never carry a stale day key past this point and changing
+/// the pinned zone needs no cache invalidation.
+///
+/// **No-op when nothing is pinned.** An unpinned device must report exactly
+/// what it reported before, so the pass is skipped rather than re-derived
+/// through `Local`.
+fn rebucket_days(messages: &mut [UnifiedMessage], scanner_settings: &scanner::ScannerSettings) {
+    let timezone = bucket_tz::BucketTimezone::from_scanner_settings(scanner_settings);
+    if !timezone.is_pinned() {
+        return;
+    }
+
+    for message in messages.iter_mut() {
+        message.rebucket_date(&timezone);
+    }
 }
 
 fn dedupe_latest_trae_messages(mut messages: Vec<UnifiedMessage>) -> Vec<UnifiedMessage> {
@@ -2719,8 +2784,6 @@ struct HourAggregator {
 /// Derives the hour slot from `UnifiedMessage.timestamp` (Unix ms).
 /// Falls back to date + "00:00" when timestamp is zero or missing.
 pub async fn get_hourly_report(options: ReportOptions) -> Result<HourlyReport, String> {
-    use chrono::{Local, TimeZone};
-
     let start = Instant::now();
 
     let home_dir = get_home_dir_string(&options.home_dir)?;
@@ -2747,13 +2810,18 @@ pub async fn get_hourly_report(options: ReportOptions) -> Result<HourlyReport, S
 
     let mut hour_map: HashMap<String, HourAggregator> = HashMap::new();
 
+    // The hour key embeds a date, and the timestamp-less fallback below builds
+    // one out of `msg.date` — which the rebucket pass has already moved to the
+    // pinned zone. Deriving the primary key from the host instead would let a
+    // single report disagree with itself about which day an hour belongs to.
+    let bucket_timezone =
+        bucket_tz::BucketTimezone::from_scanner_settings(&options.scanner_settings);
+
     for msg in filtered {
         let hour_key = if msg.timestamp > 0 {
-            let ts_secs = msg.timestamp / 1000;
-            match Local.timestamp_opt(ts_secs, 0) {
-                chrono::LocalResult::Single(dt) => dt.format("%Y-%m-%d %H:00").to_string(),
-                _ => format!("{} 00:00", msg.date),
-            }
+            bucket_timezone
+                .hour_key(msg.timestamp)
+                .unwrap_or_else(|| format!("{} 00:00", msg.date))
         } else {
             format!("{} 00:00", msg.date)
         };
@@ -2853,7 +2921,16 @@ async fn generate_graph_with_loaded_pricing(
 
     let filtered = filter_messages_for_report(all_messages, &options);
 
-    build_graph_from_messages(filtered, pricing, pricing_requirement, start)
+    let bucket_timezone =
+        bucket_tz::BucketTimezone::from_scanner_settings(&options.scanner_settings);
+
+    build_graph_from_messages(
+        filtered,
+        pricing,
+        pricing_requirement,
+        start,
+        &bucket_timezone,
+    )
 }
 
 fn build_graph_from_messages(
@@ -2861,21 +2938,32 @@ fn build_graph_from_messages(
     pricing: Option<&pricing::PricingService>,
     pricing_requirement: GraphPricingRequirement,
     start: Instant,
+    bucket_timezone: &bucket_tz::BucketTimezone,
 ) -> Result<GraphResult, String> {
-    if matches!(pricing_requirement, GraphPricingRequirement::Submission) {
-        validate_priced_messages(&filtered, pricing)?;
-    }
+    let (filtered, unpriced_submission_exclusions) = match pricing_requirement {
+        GraphPricingRequirement::Lenient => (filtered, Vec::new()),
+        GraphPricingRequirement::Submission => {
+            let (submitted, exclusions) =
+                exclude_generic_unpriced_submission_messages(filtered, pricing);
+            validate_priced_messages(&submitted, pricing)?;
+            (submitted, exclusions)
+        }
+    };
 
     let intervals = sessionize::sessionize(&filtered, sessionize::DEFAULT_IDLE_GAP_MS);
     let time_metrics =
         sessionize::compute_time_metrics(&intervals, sessionize::DEFAULT_IDLE_GAP_MS);
 
-    let daily_active_time = sessionize::compute_daily_active_time(&intervals);
+    // Keyed by the same zone the messages were rebucketed into. Active time is
+    // joined onto contributions by date below, so a mismatch here silently
+    // drops a day's active time rather than misplacing it.
+    let daily_active_time = sessionize::compute_daily_active_time_in(&intervals, bucket_timezone);
     let contributions = aggregator::aggregate_by_date(filtered);
 
     let processing_time_ms = start.elapsed().as_millis() as u32;
     let mut result = aggregator::generate_graph_result(contributions, processing_time_ms);
     result.time_metrics = Some(time_metrics);
+    result.unpriced_submission_exclusions = unpriced_submission_exclusions;
 
     for contribution in &mut result.contributions {
         if let Some(&ms) = daily_active_time.get(&contribution.date) {
@@ -2884,6 +2972,58 @@ fn build_graph_from_messages(
     }
 
     Ok(result)
+}
+
+const GEMINI_DEFAULT_UNPRICED_REASON: &str =
+    "generic routing label has no authoritative model-to-price mapping";
+
+fn exclude_generic_unpriced_submission_messages(
+    messages: Vec<UnifiedMessage>,
+    pricing: Option<&pricing::PricingService>,
+) -> (Vec<UnifiedMessage>, Vec<UnpricedSubmissionExclusion>) {
+    let Some(pricing) = pricing else {
+        return (messages, Vec::new());
+    };
+
+    let mut submitted = Vec::with_capacity(messages.len());
+    let mut exclusions: std::collections::BTreeMap<(String, String), (usize, i64)> =
+        std::collections::BTreeMap::new();
+
+    for message in messages {
+        let is_unpriced_gemini_default = message.tokens.total() > 0
+            && !message.has_authoritative_cost()
+            && message.provider_id.eq_ignore_ascii_case("google")
+            && message.model_id.eq_ignore_ascii_case("gemini-default")
+            && !pricing.covers_usage_with_provider(
+                &message.model_id,
+                Some(&message.provider_id),
+                &message.tokens,
+            );
+
+        if is_unpriced_gemini_default {
+            let entry = exclusions
+                .entry((message.provider_id.clone(), message.model_id.clone()))
+                .or_default();
+            entry.0 += 1;
+            entry.1 = entry.1.saturating_add(message.tokens.total());
+        } else {
+            submitted.push(message);
+        }
+    }
+
+    let exclusions = exclusions
+        .into_iter()
+        .map(|((provider_id, model_id), (message_count, total_tokens))| {
+            UnpricedSubmissionExclusion {
+                provider_id,
+                model_id,
+                message_count,
+                total_tokens,
+                reason: GEMINI_DEFAULT_UNPRICED_REASON,
+            }
+        })
+        .collect();
+    (submitted, exclusions)
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -3693,11 +3833,14 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
         messages.extend(kiro_db_msgs);
     }
 
+    // See the crush block in `parse_all_messages_with_pricing_with_env_strategy`.
+    let crush_bucket_timezone =
+        bucket_tz::BucketTimezone::from_scanner_settings(&options.scanner_settings);
     let crush_msgs: Vec<ParsedMessage> = scan_result
         .crush_dbs
         .par_iter()
         .flat_map(|source| {
-            sessions::crush::parse_crush_sqlite(&source.db_path)
+            sessions::crush::parse_crush_sqlite_in(&source.db_path, &crush_bucket_timezone)
                 .into_iter()
                 .map(|mut msg| {
                     msg.set_workspace(source.workspace_key.clone(), source.workspace_label.clone());
@@ -3868,15 +4011,14 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     counts.set(ClientId::WorkBuddy, workbuddy_count);
     messages.extend(workbuddy_msgs);
 
-    let grok_msgs: Vec<ParsedMessage> = scan_result
+    let grok_messages: Vec<UnifiedMessage> = scan_result
         .get(ClientId::Grok)
         .par_iter()
-        .flat_map(|path| {
-            sessions::grok::parse_grok_updates_file(path)
-                .into_iter()
-                .map(|msg| unified_to_parsed(&msg))
-                .collect::<Vec<_>>()
-        })
+        .flat_map(|path| sessions::grok::parse_grok_file(path))
+        .collect();
+    let grok_msgs: Vec<ParsedMessage> = sessions::grok::prefer_unified_log_messages(grok_messages)
+        .into_iter()
+        .map(|msg| unified_to_parsed(&msg))
         .collect();
     let grok_count = summed_parsed_message_count(&grok_msgs);
     counts.set(ClientId::Grok, grok_count);
@@ -3925,6 +4067,16 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
         }
     }
 
+    // Before the date filter, not after: `--since`/`--until` compare against
+    // `date`, so filtering first would select rows by the machine's live zone
+    // and then relabel them with the pinned one.
+    //
+    // This path builds `ParsedMessage` straight from the parsers instead of
+    // going through `parse_all_messages_with_pricing_with_env_strategy`, so it
+    // needs its own rebucket — `tokscale report` and `tokscale wrapped` read
+    // day keys from here.
+    rebucket_parsed_days(&mut messages, &options.scanner_settings);
+
     let filtered = filter_parsed_messages(messages, &options);
 
     Ok(ParsedMessages {
@@ -3932,6 +4084,30 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
         counts,
         processing_time_ms: start.elapsed().as_millis() as u32,
     })
+}
+
+/// [`rebucket_days`] for the `ParsedMessage` lane. Same contract: no-op unless
+/// a zone is pinned.
+fn rebucket_parsed_days(
+    messages: &mut [ParsedMessage],
+    scanner_settings: &scanner::ScannerSettings,
+) {
+    let timezone = bucket_tz::BucketTimezone::from_scanner_settings(scanner_settings);
+    if !timezone.is_pinned() {
+        return;
+    }
+
+    for message in messages.iter_mut() {
+        // See `UnifiedMessage::rebucket_date` for why a non-positive timestamp
+        // and an empty key are both kept out.
+        if message.timestamp <= 0 {
+            continue;
+        }
+        let key = timezone.day_key(message.timestamp);
+        if !key.is_empty() {
+            message.date = key;
+        }
+    }
 }
 
 #[doc(hidden)]
@@ -4032,6 +4208,7 @@ pub fn parsed_to_unified(msg: &ParsedMessage, cost: f64) -> UnifiedMessage {
         dedup_key: None,
         session_title: None,
         is_turn_start: false,
+        model_attribution_conflicted: false,
     }
 }
 
@@ -4040,12 +4217,15 @@ mod tests {
     use super::{
         aggregate_model_usage_entries, apply_pricing_if_available, build_graph_from_messages,
         dedupe_latest_trae_messages, filter_messages_for_report,
-        generate_graph_with_loaded_pricing, message_cache, normalize_model_for_grouping,
-        parse_all_messages_with_pricing_with_env_strategy, parse_local_clients, parsed_to_unified,
-        pricing, retain_for_requested_clients, scanner, select_local_parse_pricing,
-        unified_to_parsed, validate_priced_messages, ClientId, GraphPricingRequirement, GroupBy,
-        LocalParseOptions, ReportOptions, TokenBreakdown, UnifiedMessage, UNKNOWN_WORKSPACE_LABEL,
+        generate_graph_with_loaded_pricing, get_home_dir_string, message_cache,
+        normalize_model_for_grouping, parse_all_messages_with_pricing_with_env_strategy,
+        parse_local_clients, parsed_to_unified, paths, pricing, retain_for_requested_clients,
+        scanner, select_local_parse_pricing, unified_to_parsed, validate_priced_messages, ClientId,
+        GraphPricingRequirement, GroupBy, LocalParseOptions, ReportOptions, TokenBreakdown,
+        UnifiedMessage, UnpricedSubmissionExclusion, GEMINI_DEFAULT_UNPRICED_REASON,
+        UNKNOWN_WORKSPACE_LABEL,
     };
+    use serial_test::serial;
     use std::collections::{HashMap, HashSet};
     use std::io::Write;
     use std::str::FromStr;
@@ -4063,6 +4243,73 @@ mod tests {
             false,
             &scanner::ScannerSettings::default(),
         )
+    }
+
+    fn home_guard() -> crate::paths::test_env::EnvGuard {
+        crate::paths::test_env::EnvGuard::capture(&["HOME"])
+    }
+
+    /// An explicit `--home` outranks every environment lookup. Pinned so the
+    /// reordering that routed the fallback through `paths::home_dir` cannot
+    /// quietly promote the resolver above the caller's own argument.
+    #[test]
+    #[serial]
+    fn get_home_dir_string_prefers_the_explicit_option() {
+        let mut env = home_guard();
+        env.set("HOME", "/tmp/tokscale-env-home");
+        assert_eq!(
+            get_home_dir_string(&Some("/tmp/tokscale-explicit-home".to_string())),
+            Ok("/tmp/tokscale-explicit-home".to_string())
+        );
+    }
+
+    /// The bypass this test exists for: reading `$HOME` directly meant an
+    /// exported-but-blank value won outright and produced `Ok("")`. Every
+    /// consumer builds scan roots with `format!("{home}/...")`, so an empty
+    /// home turns each of them into an absolute path from the filesystem root
+    /// — `/.codex/sessions` rather than `~/.codex/sessions`.
+    ///
+    /// `paths::home_dir` delegates to `dirs`, which treats a blank `HOME` as
+    /// unset and falls back to the passwd entry, so the empty string can no
+    /// longer escape. Asserting "not `Ok("")`" rather than a concrete path
+    /// keeps this honest on a runner with no passwd home, where the correct
+    /// answer is the `Err` arm.
+    #[test]
+    #[serial]
+    fn get_home_dir_string_never_returns_an_empty_home() {
+        let mut env = home_guard();
+        env.set("HOME", "");
+        let resolved = get_home_dir_string(&None);
+        assert_ne!(
+            resolved,
+            Ok(String::new()),
+            "a blank HOME must not resolve to the empty string; \
+             every caller joins it into a scan root"
+        );
+    }
+
+    /// MSYS2, Cygwin and Git Bash export `HOME=/home/<user>` on Windows.
+    /// Returning that verbatim points the model, monthly, hourly and local
+    /// parsers at `C:\home\<user>` — `Path` reads the leading `/` as the root
+    /// of the current drive — so a Git Bash user sees none of their own usage.
+    /// `paths::home_dir` rejects the shape; this test pins that
+    /// `get_home_dir_string` actually goes through it rather than around it.
+    ///
+    /// Windows-only by construction: `/home/runner` is a legitimate absolute
+    /// path on macOS and the resolver rightly honors it there. It does run —
+    /// on the `windows-latest` leg this PR adds.
+    #[test]
+    #[serial]
+    #[cfg(windows)]
+    fn get_home_dir_string_ignores_a_posix_shaped_home_on_windows() {
+        let mut env = home_guard();
+        env.set("HOME", "/home/runner");
+        let resolved = get_home_dir_string(&None);
+        assert_ne!(
+            resolved,
+            Ok("/home/runner".to_string()),
+            "a POSIX-shaped HOME must not reach the scanners on Windows"
+        );
     }
 
     #[test]
@@ -5612,6 +5859,168 @@ mod tests {
 {"timestamp": 1770983450.0, "message": {"type": "StatusUpdate", "payload": {"token_usage": {"input_other": 8, "output": 1, "input_cache_read": 0, "input_cache_creation": 0}}}}"#,
         )
         .unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_parse_all_messages_with_pricing_prefers_grok_unified_log() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", cache_home.path());
+
+        {
+            let session_dir = source_home
+                .path()
+                .join(".grok/sessions/%2Ftmp%2Fproject/session-1");
+            std::fs::create_dir_all(&session_dir).unwrap();
+            std::fs::write(
+                session_dir.join("updates.jsonl"),
+                r#"{"method":"session/update","params":{"sessionId":"session-1","_meta":{"totalTokens":999,"agentTimestampMs":1700000000000}}}"#,
+            )
+            .unwrap();
+
+            let logs_dir = source_home.path().join(".grok/logs");
+            std::fs::create_dir_all(&logs_dir).unwrap();
+            std::fs::write(
+                logs_dir.join("unified.jsonl"),
+                r#"{"ts":"2023-11-14T22:13:20Z","pid":7,"sid":"session-1","msg":"shell.turn.inference_done","ctx":{"loop_index":1,"prompt_tokens":100,"cached_prompt_tokens":60,"completion_tokens":25,"reasoning_tokens":5}}"#,
+            )
+            .unwrap();
+
+            let messages = parse_all_messages_with_pricing(
+                source_home.path().to_str().unwrap(),
+                &["grok".to_string()],
+                None,
+            );
+
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].tokens.input, 40);
+            assert_eq!(messages[0].tokens.cache_read, 60);
+            assert_eq!(messages[0].tokens.output, 20);
+            assert_eq!(messages[0].tokens.reasoning, 5);
+            assert_eq!(messages[0].tokens.total(), 125);
+        }
+
+        match original_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_parse_all_messages_reprices_grok_after_legacy_model_attribution() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", cache_home.path());
+
+        {
+            let session_dir = source_home
+                .path()
+                .join(".grok/sessions/%2Ftmp%2Fproject/session-1");
+            std::fs::create_dir_all(&session_dir).unwrap();
+            std::fs::write(
+                session_dir.join("updates.jsonl"),
+                r#"{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"user_message_chunk","_meta":{"modelId":"grok-code"}},"_meta":{"agentTimestampMs":1700000000000}}}
+{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"totalTokens":999,"agentTimestampMs":1700000000000}}}"#,
+            )
+            .unwrap();
+
+            let logs_dir = source_home.path().join(".grok/logs");
+            std::fs::create_dir_all(&logs_dir).unwrap();
+            std::fs::write(
+                logs_dir.join("unified.jsonl"),
+                r#"{"ts":"2023-11-14T22:13:20Z","pid":7,"sid":"session-1","msg":"shell.turn.inference_done","ctx":{"loop_index":1,"prompt_tokens":100,"cached_prompt_tokens":60,"completion_tokens":25,"reasoning_tokens":5}}"#,
+            )
+            .unwrap();
+
+            let mut litellm = HashMap::new();
+            litellm.insert(
+                "grok-code".to_string(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(0.001),
+                    output_cost_per_token: Some(0.002),
+                    ..Default::default()
+                },
+            );
+            let pricing = pricing::PricingService::new(litellm, HashMap::new());
+
+            let first = parse_all_messages_with_pricing_with_env_strategy(
+                source_home.path().to_str().unwrap(),
+                &["grok".to_string()],
+                Some(&pricing),
+                false,
+                &scanner::ScannerSettings::default(),
+            );
+            assert_eq!(first.len(), 1);
+            assert_eq!(first[0].model_id, "grok-code");
+            assert!(first[0].cost > 0.0);
+
+            let second = parse_all_messages_with_pricing_with_env_strategy(
+                source_home.path().to_str().unwrap(),
+                &["grok".to_string()],
+                Some(&pricing),
+                false,
+                &scanner::ScannerSettings::default(),
+            );
+            assert_eq!(second.len(), 1);
+            assert_eq!(second[0].model_id, "grok-code");
+            assert!(second[0].cost > 0.0);
+        }
+
+        match original_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_parse_all_messages_keeps_conflicted_grok_scoped_model_change_unpriced_cold_and_warm() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let mut env = paths::test_env::EnvGuard::capture(&["HOME"]);
+        env.set("HOME", cache_home.path());
+
+        {
+            let logs_dir = source_home.path().join(".grok/logs");
+            std::fs::create_dir_all(&logs_dir).unwrap();
+            std::fs::write(
+                logs_dir.join("unified.jsonl"),
+                r#"{"ts":"2026-07-31T00:00:01Z","pid":19,"msg":"subagent spawn credentials","ctx":{"subagent_id":"child","effective_model":"grok-4.8"}}
+{"ts":"2026-07-31T00:00:02Z","pid":19,"sid":"child","msg":"model changed","ctx":{"model":"grok-code"}}
+{"ts":"2026-07-31T00:00:03Z","pid":19,"msg":"subagent failed","ctx":{"subagent_id":"child","effective_model":"grok-4.9"}}
+{"ts":"2026-07-31T00:00:04Z","pid":19,"sid":"child","msg":"shell.turn.inference_done","ctx":{"loop_index":1,"prompt_tokens":100,"cached_prompt_tokens":60,"completion_tokens":25,"reasoning_tokens":5}}"#,
+            )
+            .unwrap();
+
+            let mut litellm = HashMap::new();
+            litellm.insert(
+                "grok-code".to_string(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(0.001),
+                    output_cost_per_token: Some(0.002),
+                    ..Default::default()
+                },
+            );
+            let pricing = pricing::PricingService::new(litellm, HashMap::new());
+
+            for scan in ["cold", "warm"] {
+                let messages = parse_all_messages_with_pricing_with_env_strategy(
+                    source_home.path().to_str().unwrap(),
+                    &["grok".to_string()],
+                    Some(&pricing),
+                    false,
+                    &scanner::ScannerSettings::default(),
+                );
+                assert_eq!(messages.len(), 1, "{scan} scan message count");
+                assert_eq!(messages[0].model_id, "grok-unknown", "{scan} scan");
+                assert!(messages[0].model_attribution_conflicted, "{scan} scan");
+                assert_eq!(messages[0].cost, 0.0, "{scan} scan");
+            }
+        }
     }
 
     #[test]
@@ -7490,6 +7899,7 @@ mod tests {
             Some(&pricing),
             GraphPricingRequirement::Lenient,
             std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
         )
         .expect("reporting graphs should retain unpriced usage");
         let submission_error = build_graph_from_messages(
@@ -7497,11 +7907,100 @@ mod tests {
             Some(&pricing),
             GraphPricingRequirement::Submission,
             std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
         )
         .expect_err("submission graphs should reject unpriced usage");
 
         assert_eq!(report.summary.total_tokens, 1);
         assert!(submission_error.contains("unknown-provider/genuinely-unpriced-model"));
+    }
+
+    #[test]
+    fn submission_excludes_unpriced_generic_gemini_default_but_keeps_priceable_usage() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "gpt-4o".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(1e-6),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+        let generic = UnifiedMessage::new(
+            "antigravity-cli",
+            "gemini-default",
+            "google",
+            "generic",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input: 7,
+                cache_read: 11,
+                ..Default::default()
+            },
+            0.0,
+        );
+        let concrete = UnifiedMessage::new(
+            "synthetic",
+            "gpt-4o",
+            "openai",
+            "concrete",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input: 13,
+                ..Default::default()
+            },
+            0.0,
+        );
+
+        let graph = build_graph_from_messages(
+            vec![generic, concrete],
+            Some(&pricing),
+            GraphPricingRequirement::Submission,
+            std::time::Instant::now(),
+        )
+        .expect("generic routing label must not block fully priced submission usage");
+
+        assert_eq!(graph.summary.total_tokens, 13);
+        assert_eq!(graph.contributions[0].clients.len(), 1);
+        assert_eq!(graph.contributions[0].clients[0].model_id, "gpt-4o");
+        assert_eq!(graph.unpriced_submission_exclusions.len(), 1);
+        assert_eq!(
+            graph.unpriced_submission_exclusions[0],
+            UnpricedSubmissionExclusion {
+                provider_id: "google".to_string(),
+                model_id: "gemini-default".to_string(),
+                message_count: 1,
+                total_tokens: 18,
+                reason: GEMINI_DEFAULT_UNPRICED_REASON,
+            }
+        );
+    }
+
+    #[test]
+    fn submission_still_rejects_unpriced_concrete_models() {
+        let concrete = UnifiedMessage::new(
+            "synthetic",
+            "gemini-3.5-pro",
+            "google",
+            "concrete",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input: 1,
+                ..Default::default()
+            },
+            0.0,
+        );
+        let pricing = pricing::PricingService::new(HashMap::new(), HashMap::new());
+
+        let error = build_graph_from_messages(
+            vec![concrete],
+            Some(&pricing),
+            GraphPricingRequirement::Submission,
+            std::time::Instant::now(),
+        )
+        .expect_err("concrete unpriced models must remain a submission error");
+
+        assert!(error.contains("google/gemini-3.5-pro"));
     }
 
     #[test]

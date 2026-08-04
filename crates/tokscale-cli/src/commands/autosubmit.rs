@@ -447,6 +447,21 @@ pub fn record_run_error(error: &str) -> Result<()> {
     settings.save()
 }
 
+/// Today, in the zone this device buckets day keys into.
+///
+/// A scheduled run submits, so "today" has to be the pinned zone's today — the
+/// same one the day buckets are keyed by. Reading the host clock here would
+/// select a partial pinned day out of correctly-keyed buckets, and a partial
+/// day is exactly what the server's monotonic per-day guard then freezes at the
+/// low value. `--home` is rejected for autosubmit, so there is only ever one
+/// profile in play.
+fn current_bucket_date() -> chrono::NaiveDate {
+    tokscale_core::BucketTimezone::from_scanner_settings(
+        &crate::tui::settings::load_scanner_settings(),
+    )
+    .today()
+}
+
 pub fn submit_filters(
     settings: &AutosubmitSettings,
 ) -> (
@@ -469,7 +484,7 @@ pub fn submit_filters(
         until: settings.until.clone(),
         year: settings.year.clone(),
     };
-    let (since, until) = build_date_filter_for_date(&date, chrono::Local::now().date_naive());
+    let (since, until) = build_date_filter_for_date(&date, current_bucket_date());
     let year = if date.today || date.yesterday || date.week || date.month {
         None
     } else {
@@ -963,7 +978,7 @@ fn render_scheduler_spec(
 }
 
 fn render_launchd_spec(exe: &Path, settings: &AutosubmitSettings) -> Result<SchedulerSpec> {
-    let home = dirs::home_dir().context("Could not determine home directory")?;
+    let home = crate::paths::home_dir().context("Could not determine home directory")?;
     render_launchd_spec_for_home(exe, settings, &home)
 }
 
@@ -1066,7 +1081,7 @@ fn systemd_user_dir() -> Result<PathBuf> {
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .or_else(dirs::config_dir)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".config")));
+        .or_else(|| crate::paths::home_dir().map(|home| home.join(".config")));
     Ok(config_dir
         .context("Could not determine XDG config directory")?
         .join("systemd")
@@ -1967,13 +1982,30 @@ mod tests {
             SchedulerKind::WindowsTaskScheduler,
         ] {
             let spec = render_scheduler_spec(scheduler, &managed, &settings).unwrap();
-            // `Debug` escapes each `\` as `\\`, so a Windows path compared
-            // against the unescaped `to_string_lossy` never matches. Escape
-            // the needle the same way instead of rendering the spec with
-            // `Display`, which `SchedulerSpec` does not implement.
+            // Two escaping layers stack here, and #1007 only accounted for
+            // one, so this still failed on Windows.
+            //
+            // Layer 1 is the renderer: `systemd_escape_path` doubles every
+            // `\` (and turns spaces into `\x20`) *before* the value reaches
+            // the unit file, while every other renderer stores the path
+            // verbatim. Layer 2 is `Debug`, which doubles whatever it finds.
+            // A Windows path therefore appears as `\\\\` in the systemd spec
+            // and `\\` in the other three; a needle escaped once matches
+            // three of the four and silently fails the fourth.
+            //
+            // Deriving the needle through the renderer's own escaper keeps
+            // the two in step rather than restating its rules here.
+            let stored = match scheduler {
+                SchedulerKind::Systemd => systemd_escape_path(&managed),
+                _ => managed.to_string_lossy().into_owned(),
+            };
             let rendered = format!("{spec:?}");
-            let needle = managed.to_string_lossy().replace('\\', "\\\\");
-            assert!(rendered.contains(&needle));
+            let needle = stored.replace('\\', "\\\\");
+            assert!(
+                rendered.contains(&needle),
+                "{scheduler:?} spec does not reference the managed executable\n\
+                 needle: {needle}\nrendered: {rendered}"
+            );
             let absent = process_executable.to_string_lossy().replace('\\', "\\\\");
             assert!(!rendered.contains(&absent));
         }
@@ -2422,6 +2454,64 @@ mod tests {
         assert_eq!(since.as_deref(), Some("2026-01-01"));
         assert_eq!(until.as_deref(), Some("2026-01-31"));
         assert_eq!(year, None);
+    }
+
+    /// Scheduled autosubmit is the one date-filtered path that *submits*, so a
+    /// "today" resolved from the host instead of the pinned zone selects a
+    /// partial day out of correctly-keyed buckets — and the server's monotonic
+    /// per-day guard then freezes that low value forever.
+    ///
+    /// Pacific/Kiritimati (UTC+14) and Pacific/Niue (UTC-11) are 25 hours
+    /// apart, so they are never on the same calendar date. Reading
+    /// `chrono::Local` would hand back the same day for both pins; only reading
+    /// the pin can tell them apart.
+    #[test]
+    #[serial_test::serial]
+    fn submit_filters_resolve_today_in_the_pinned_bucket_timezone() {
+        fn today_for_pinned_zone(zone: &str) -> Option<String> {
+            let temp = TempDir::new().unwrap();
+            std::fs::write(
+                temp.path().join("settings.json"),
+                format!(r#"{{"scanner":{{"bucketTimezone":"{zone}"}}}}"#),
+            )
+            .unwrap();
+            let _guard = EnvVarGuard::set("TOKSCALE_CONFIG_DIR", temp.path());
+
+            let settings = AutosubmitSettings {
+                today: true,
+                ..AutosubmitSettings::default()
+            };
+            let (_, since, until, _) = submit_filters(&settings);
+            assert_eq!(since, until, "--today is a single-day range");
+            since
+        }
+
+        let kiritimati_zone =
+            tokscale_core::BucketTimezone::from_pinned_name(Some("Pacific/Kiritimati"));
+        // Bracket the call: `submit_filters` reads the clock itself, so a date
+        // sampled only afterwards would disagree with it across a rollover.
+        let before = kiritimati_zone.today();
+        let kiritimati = today_for_pinned_zone("Pacific/Kiritimati");
+        let after = kiritimati_zone.today();
+
+        let niue = today_for_pinned_zone("Pacific/Niue");
+
+        let acceptable: Vec<String> = [before, after]
+            .iter()
+            .map(|date| date.format("%Y-%m-%d").to_string())
+            .collect();
+        assert!(
+            kiritimati
+                .as_deref()
+                .is_some_and(|day| acceptable.iter().any(|expected| expected == day)),
+            "autosubmit must resolve today in the pinned zone, not the host's — \
+             got {kiritimati:?}, expected one of {acceptable:?}"
+        );
+        assert_ne!(
+            kiritimati, niue,
+            "two pins 25 hours apart can never share a calendar date — equal \
+             values mean the host clock was read instead of the pin"
+        );
     }
 
     #[test]
