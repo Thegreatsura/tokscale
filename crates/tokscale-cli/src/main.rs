@@ -1075,6 +1075,8 @@ pub enum ClientFilter {
     Senpi,
     #[value(alias = "auggie")]
     Augment,
+    Kimchi,
+    Reasonix,
     Synthetic,
 }
 
@@ -1126,6 +1128,8 @@ impl ClientFilter {
             Self::DevinDesktop => "devin-desktop",
             Self::Senpi => "senpi",
             Self::Augment => "augment",
+            Self::Kimchi => "kimchi",
+            Self::Reasonix => "reasonix",
             Self::Synthetic => "synthetic",
         }
     }
@@ -1180,6 +1184,8 @@ impl ClientFilter {
             Self::DevinDesktop => Some(ClientId::DevinDesktop),
             Self::Senpi => Some(ClientId::Senpi),
             Self::Augment => Some(ClientId::Augment),
+            Self::Kimchi => Some(ClientId::Kimchi),
+            Self::Reasonix => Some(ClientId::Reasonix),
             Self::Synthetic => None,
         }
     }
@@ -1230,6 +1236,8 @@ impl ClientFilter {
             ClientId::DevinDesktop => Self::DevinDesktop,
             ClientId::Senpi => Self::Senpi,
             ClientId::Augment => Self::Augment,
+            ClientId::Kimchi => Self::Kimchi,
+            ClientId::Reasonix => Self::Reasonix,
         }
     }
 
@@ -3906,6 +3914,7 @@ fn capitalize_client(client: &str) -> String {
         "devin-desktop" => "Devin Desktop".to_string(),
         "senpi" => "Senpi (OmO Native)".to_string(),
         "augment" => "Augment Code".to_string(),
+        "kimchi" => "Kimchi".to_string(),
         other => other.to_string(),
     }
 }
@@ -5488,9 +5497,11 @@ fn report_unpriced_submission_exclusions(
     use colored::Colorize;
 
     for row in excluded {
-        let remaining_usage_message = has_remaining_usage
-            .then_some(" Remaining priced usage will be submitted.")
-            .unwrap_or_default();
+        let remaining_usage_message = if has_remaining_usage {
+            " Remaining priced usage will be submitted."
+        } else {
+            ""
+        };
         println!(
             "{}",
             format!(

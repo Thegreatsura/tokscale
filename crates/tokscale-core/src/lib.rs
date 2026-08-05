@@ -1669,6 +1669,53 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         }
     }
 
+    let kimchi_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::Kimchi)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source(
+                message_cache::CacheIdentity::for_client(ClientId::Kimchi),
+                path,
+                &source_cache,
+                pricing,
+                sessions::kimchi::parse_kimchi_file,
+            )
+        })
+        .collect();
+    let mut kimchi_seen: HashSet<String> = HashSet::new();
+    for outcome in kimchi_outcomes {
+        all_messages.extend(
+            outcome
+                .messages
+                .into_iter()
+                .filter(|message| should_keep_deduped_message(&mut kimchi_seen, message)),
+        );
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
+    let reasonix_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::Reasonix)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source_with_fingerprint(
+                message_cache::CacheIdentity::for_client(ClientId::Reasonix),
+                path,
+                &source_cache,
+                pricing,
+                message_cache::SourceFingerprint::check_reasonix_path_samples_only,
+                sessions::reasonix::parse_reasonix_file,
+            )
+        })
+        .collect();
+    for outcome in reasonix_outcomes {
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
     let senpi_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Senpi)
         .par_iter()
@@ -1953,13 +2000,19 @@ fn parse_all_messages_with_pricing_with_env_strategy(
                 path,
                 &source_cache,
                 pricing,
-                message_cache::SourceFingerprint::check_roo_path_samples_only,
+                message_cache::SourceFingerprint::check_cline_path_samples_only,
                 sessions::cline::parse_cline_file,
             )
         })
         .collect();
+    let mut cline_seen: HashSet<String> = HashSet::new();
     for outcome in cline_outcomes {
-        all_messages.extend(outcome.messages);
+        all_messages.extend(
+            outcome
+                .messages
+                .into_iter()
+                .filter(|message| should_keep_deduped_message(&mut cline_seen, message)),
+        );
         if let Some(entry) = outcome.cache_entry {
             source_cache.insert(entry);
         }
@@ -3095,40 +3148,60 @@ fn validate_priced_messages(
         return Err("pricing data is unavailable for submission".to_string());
     };
 
-    let unpriced: Vec<String> = messages
-        .iter()
-        .filter(|message| {
-            let tokens = &message.tokens;
-            let token_bearing = tokens.input > 0
-                || tokens.output > 0
-                || tokens.cache_read > 0
-                || tokens.cache_write > 0
-                || tokens.reasoning > 0;
-            token_bearing
-                && !message.has_authoritative_cost()
-                && !pricing.covers_usage_with_provider(
-                    &message.model_id,
-                    Some(&message.provider_id),
-                    &message.tokens,
-                )
-        })
-        .map(|message| {
-            if message.provider_id.is_empty() {
-                message.model_id.clone()
-            } else {
-                format!("{}/{}", message.provider_id, message.model_id)
-            }
-        })
-        .collect();
+    // Counted rather than listed per message: a real submission repeats the
+    // same handful of ids thousands of times, and the raw list buried the
+    // actionable model names under hundreds of kilobytes of output (#1013).
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut order: Vec<String> = Vec::new();
 
-    if unpriced.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "pricing is unavailable for submitted token usage: {}",
-            unpriced.join(", ")
-        ))
+    for message in messages {
+        let tokens = &message.tokens;
+        let token_bearing = tokens.input > 0
+            || tokens.output > 0
+            || tokens.cache_read > 0
+            || tokens.cache_write > 0
+            || tokens.reasoning > 0;
+        let unpriced = token_bearing
+            && !message.has_authoritative_cost()
+            && !pricing.covers_usage_with_provider(
+                &message.model_id,
+                Some(&message.provider_id),
+                &message.tokens,
+            );
+        if !unpriced {
+            continue;
+        }
+
+        let id = if message.provider_id.is_empty() {
+            message.model_id.clone()
+        } else {
+            format!("{}/{}", message.provider_id, message.model_id)
+        };
+        match counts.get_mut(&id) {
+            Some(count) => *count += 1,
+            None => {
+                counts.insert(id.clone(), 1);
+                order.push(id);
+            }
+        }
     }
+
+    if order.is_empty() {
+        return Ok(());
+    }
+
+    let summary = order
+        .into_iter()
+        .map(|id| match counts.get(&id).copied().unwrap_or(1) {
+            1 => id,
+            count => format!("{id} (x{count})"),
+        })
+        .collect::<Vec<String>>()
+        .join(", ");
+
+    Err(format!(
+        "pricing is unavailable for submitted token usage: {summary}"
+    ))
 }
 
 fn filter_messages_for_report(
@@ -3550,6 +3623,37 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     counts.set(ClientId::Pi, pi_count);
     messages.extend(pi_msgs);
 
+    let kimchi_msgs_raw: Vec<UnifiedMessage> = scan_result
+        .get(ClientId::Kimchi)
+        .par_iter()
+        .flat_map(|path| sessions::kimchi::parse_kimchi_file(path))
+        .collect();
+    let mut kimchi_seen: HashSet<String> = HashSet::new();
+    let kimchi_msgs: Vec<ParsedMessage> = kimchi_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut kimchi_seen, message))
+        .map(|message| unified_to_parsed(&message))
+        .collect();
+    let kimchi_count = kimchi_msgs.len() as i32;
+    counts.set(ClientId::Kimchi, kimchi_count);
+    messages.extend(kimchi_msgs);
+
+    let reasonix_msgs: Vec<ParsedMessage> = scan_result
+        .get(ClientId::Reasonix)
+        .par_iter()
+        .flat_map(|path| {
+            sessions::reasonix::parse_reasonix_file(path)
+                .into_iter()
+                .map(|message| unified_to_parsed(&message))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let reasonix_count = reasonix_msgs.iter().fold(0_i32, |count, message| {
+        count.saturating_add(message.message_count)
+    });
+    counts.set(ClientId::Reasonix, reasonix_count);
+    messages.extend(reasonix_msgs);
+
     let senpi_msgs: Vec<ParsedMessage> = scan_result
         .get(ClientId::Senpi)
         .par_iter()
@@ -3731,15 +3835,16 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     counts.set(ClientId::KiloCode, kilocode_count);
     messages.extend(kilocode_msgs);
 
-    let cline_msgs: Vec<ParsedMessage> = scan_result
+    let cline_msgs_raw: Vec<UnifiedMessage> = scan_result
         .get(ClientId::Cline)
         .par_iter()
-        .flat_map(|path| {
-            sessions::cline::parse_cline_file(path)
-                .into_iter()
-                .map(|msg| unified_to_parsed(&msg))
-                .collect::<Vec<_>>()
-        })
+        .flat_map(|path| sessions::cline::parse_cline_file(path))
+        .collect();
+    let mut cline_seen: HashSet<String> = HashSet::new();
+    let cline_msgs: Vec<ParsedMessage> = cline_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut cline_seen, message))
+        .map(|message| unified_to_parsed(&message))
         .collect();
     let cline_count = summed_parsed_message_count(&cline_msgs);
     counts.set(ClientId::Cline, cline_count);
@@ -4247,6 +4352,76 @@ mod tests {
 
     fn home_guard() -> crate::paths::test_env::EnvGuard {
         crate::paths::test_env::EnvGuard::capture(&["HOME"])
+    }
+
+    /// Point the message-cache root at a scratch directory for as long as the
+    /// returned guard is alive.
+    ///
+    /// Redirecting `HOME` is enough on Unix and does nothing on Windows:
+    /// `paths::get_config_dir` resolves the Windows root through
+    /// `dirs::config_dir()`, a known-folder lookup that reads no environment
+    /// variable at all. Every test in this module then shared one real
+    /// `%APPDATA%\tokscale\cache` and loaded back the shards its neighbours had
+    /// written, so the counts came out higher than the entries the test itself
+    /// inserted — and which neighbours had run first decided by how much.
+    ///
+    /// `TOKSCALE_CONFIG_DIR` is the override `paths.rs` documents for exactly
+    /// this ("CI sandbox, tests, isolated profile") and it is consulted first on
+    /// every platform. On Unix it names the directory the `HOME` redirect
+    /// already produced, so nothing moves there; it also pins the root against a
+    /// globally-set `XDG_CONFIG_HOME`, which a `HOME`-only redirect leaks past
+    /// on Linux runners.
+    ///
+    /// That reach is exactly why the restore has to be a `Drop` guard rather
+    /// than a trailing call. The `HOME`-only redirect this replaced was inert
+    /// on Windows, so leaking it past a panicking assertion cost nothing there;
+    /// `TOKSCALE_CONFIG_DIR` is consulted first on *every* platform, so a leaked
+    /// one points every later test in the binary at a `TempDir` that has already
+    /// been dropped — the cross-test contamination this redirect exists to
+    /// remove, reintroduced one layer down. `serial_test` does not help: it
+    /// prevents overlap, not inheritance.
+    #[must_use = "the redirect is undone as soon as the guard drops; bind it to a \
+                  named variable that outlives the test body"]
+    fn redirect_cache_home(home: &std::path::Path) -> crate::paths::test_env::EnvGuard {
+        let mut env = crate::paths::test_env::EnvGuard::capture(&["HOME", "TOKSCALE_CONFIG_DIR"]);
+        point_cache_home(&mut env, home);
+        env
+    }
+
+    /// Re-aim a live [`redirect_cache_home`] at a different scratch directory.
+    ///
+    /// The tests that compare a warm cache against a cold one switch roots
+    /// mid-body, and one switches back again to assert on the first root. They
+    /// want a re-point, not a nested guard: the guard already holds the values
+    /// from before the *first* redirect, and restoring those once at scope exit
+    /// is the correct end state no matter how many times the root moved.
+    fn point_cache_home(env: &mut crate::paths::test_env::EnvGuard, home: &std::path::Path) {
+        env.set("HOME", home);
+        env.set("TOKSCALE_CONFIG_DIR", home.join(".config").join("tokscale"));
+    }
+
+    /// A client's scan root under `home`, spelled the way a scan will spell it.
+    ///
+    /// `ClientDef::resolve_path` builds the root with `format!("{root}/{rel}")`
+    /// and `WalkDir` appends each component below it with the platform
+    /// separator, so on Windows a discovered file reads
+    /// `C:\home/.claude/projects\demo\session.jsonl`. A fixture that builds the
+    /// same file with `Path::join` gets all backslashes — the same file, a
+    /// different string.
+    ///
+    /// That difference is invisible until a test seeds the message cache by
+    /// hand and expects the next scan to find it, because `CachedPath` keys on
+    /// the OS string as written: two spellings are two keys, so the seeded
+    /// entry is never read and the parse silently falls back to a cold parse.
+    /// Seeding under the spelling the scan produces is what these tests mean.
+    /// Whether the cache *ought* to fold the two spellings into one key is a
+    /// separate question about the product; nothing here depends on the answer.
+    fn client_scan_root(home: &std::path::Path, client: ClientId) -> std::path::PathBuf {
+        std::path::PathBuf::from(
+            client
+                .data()
+                .resolve_path_with_env_strategy(&home.to_string_lossy(), false),
+        )
     }
 
     /// An explicit `--home` outranks every environment lookup. Pinned so the
@@ -5396,8 +5571,7 @@ mod tests {
     fn test_micode_authoritative_cost_is_not_repriced_on_first_parse_or_cache_hit() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _cache_env = redirect_cache_home(cache_home.path());
 
         {
             let micode_dir = source_home.path().join(".local/share/mimocode");
@@ -5468,11 +5642,6 @@ mod tests {
                 second[0].cost
             );
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -5480,8 +5649,7 @@ mod tests {
     fn test_micode_cross_database_dedup_prefers_explicit_zero_cost() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _cache_env = redirect_cache_home(cache_home.path());
 
         {
             let micode_dir = source_home.path().join(".local/share/mimocode");
@@ -5536,11 +5704,6 @@ mod tests {
             assert!(messages[0].has_authoritative_cost());
             assert!(validate_priced_messages(&messages, Some(&pricing)).is_ok());
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     /// Claude Code rewrites a session transcript in place on resume/compact:
@@ -5554,8 +5717,7 @@ mod tests {
     fn test_claude_in_place_rewrite_preserves_previously_seen_messages() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _cache_env = redirect_cache_home(cache_home.path());
 
         {
             let claude_dir = source_home.path().join(".claude/projects/myproject");
@@ -5634,11 +5796,6 @@ mod tests {
                 before_output
             );
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     /// Retention is only sound because a retained message still collapses
@@ -5656,8 +5813,7 @@ mod tests {
     fn test_claude_retained_message_collapses_against_a_forked_transcript() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _cache_env = redirect_cache_home(cache_home.path());
 
         {
             let claude_dir = source_home.path().join(".claude/projects/myproject");
@@ -5709,11 +5865,6 @@ mod tests {
             );
             assert_eq!(after.iter().map(|m| m.tokens.input).sum::<i64>(), 600);
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     /// A Claude tool-result key embeds the session id, which is the
@@ -5726,8 +5877,7 @@ mod tests {
     fn test_claude_path_scoped_tool_result_is_not_retained_across_a_rewrite() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _cache_env = redirect_cache_home(cache_home.path());
 
         {
             let claude_dir = source_home.path().join(".claude/projects/myproject");
@@ -5770,11 +5920,6 @@ mod tests {
             );
             assert_eq!(after.iter().map(|m| m.tokens.input).sum::<i64>(), 100);
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     /// The retention above must not resurrect a session the user deleted:
@@ -5790,8 +5935,7 @@ mod tests {
     fn test_claude_deleted_transcript_is_not_resurrected_by_retention() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _cache_env = redirect_cache_home(cache_home.path());
 
         {
             let claude_dir = source_home.path().join(".claude/projects/myproject");
@@ -5839,11 +5983,6 @@ mod tests {
                 "a deleted transcript stays deleted, retained turns and all; local disk remains the source of truth"
             );
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     fn write_kimi_repeated_status_fixture(source_home: &std::path::Path) {
@@ -5861,13 +6000,104 @@ mod tests {
         .unwrap();
     }
 
+    fn write_kimchi_fixture(path: &std::path::Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            r#"{"type":"session","id":"kimchi-session","timestamp":"2026-08-01T00:00:00.000Z","cwd":"/tmp/kimchi-project"}
+{"type":"message","id":"kimchi-message","timestamp":"2026-08-01T00:00:01.000Z","message":{"role":"assistant","model":"kimi-k2.6","provider":"kimchi-dev","usage":{"input":100,"output":10,"cacheRead":5,"cacheWrite":2,"totalTokens":117}}}"#,
+        )
+        .unwrap();
+    }
+    fn write_cline_cli_fixture(path: &std::path::Path, messages: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            format!(r#"{{"sessionId":"cline-dedup-session","messages":[{messages}]}}"#),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_cline_cli_deduplicates_duplicate_records_in_cached_and_local_paths() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+
+        {
+            let duplicate = r#"{"id":"duplicate","role":"assistant","ts":1785320475705,"modelInfo":{"id":"cline-free/glm-5.2","provider":"cline-pass"},"metrics":{"inputTokens":100,"outputTokens":10}}"#;
+            let distinct_a = r#"{"id":"distinct-a","role":"assistant","ts":1785320476705,"metrics":{"inputTokens":200,"outputTokens":20}}"#;
+            let distinct_b = r#"{"id":"distinct-b","role":"assistant","ts":1785320477705,"metrics":{"inputTokens":300,"outputTokens":30}}"#;
+            write_cline_cli_fixture(
+                &source_home
+                    .path()
+                    .join(".cline/data/sessions/first/first.messages.json"),
+                &format!("{duplicate},{distinct_a}"),
+            );
+            write_cline_cli_fixture(
+                &source_home
+                    .path()
+                    .join(".cline/data/sessions/second/second.messages.json"),
+                &format!("{duplicate},{distinct_b}"),
+            );
+
+            let clients = ["cline".to_string()];
+            let scanner_settings = scanner::ScannerSettings::default();
+            let cached = parse_all_messages_with_pricing_with_env_strategy(
+                source_home.path().to_str().unwrap(),
+                &clients,
+                None,
+                false,
+                &scanner_settings,
+            );
+            let mut cached_inputs = cached
+                .iter()
+                .map(|message| message.tokens.input)
+                .collect::<Vec<_>>();
+            cached_inputs.sort_unstable();
+            assert_eq!(cached_inputs, vec![100, 200, 300]);
+            let cached_again = parse_all_messages_with_pricing_with_env_strategy(
+                source_home.path().to_str().unwrap(),
+                &clients,
+                None,
+                false,
+                &scanner_settings,
+            );
+            let mut cached_again_inputs = cached_again
+                .iter()
+                .map(|message| message.tokens.input)
+                .collect::<Vec<_>>();
+            cached_again_inputs.sort_unstable();
+            assert_eq!(cached_again_inputs, vec![100, 200, 300]);
+
+            let parsed = parse_local_clients(LocalParseOptions {
+                home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+                use_env_roots: false,
+                clients: Some(clients.to_vec()),
+                since: None,
+                until: None,
+                year: None,
+                scanner_settings,
+            })
+            .unwrap();
+            let mut local_inputs = parsed
+                .messages
+                .iter()
+                .map(|message| message.input)
+                .collect::<Vec<_>>();
+            local_inputs.sort_unstable();
+            assert_eq!(local_inputs, vec![100, 200, 300]);
+            assert_eq!(parsed.counts.get(ClientId::Cline), 3);
+        }
+    }
+
     #[test]
     #[serial_test::serial]
     fn test_parse_all_messages_with_pricing_prefers_grok_unified_log() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _cache_env = redirect_cache_home(cache_home.path());
 
         {
             let session_dir = source_home
@@ -5901,11 +6131,6 @@ mod tests {
             assert_eq!(messages[0].tokens.reasoning, 5);
             assert_eq!(messages[0].tokens.total(), 125);
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -5913,8 +6138,7 @@ mod tests {
     fn test_parse_all_messages_reprices_grok_after_legacy_model_attribution() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _cache_env = redirect_cache_home(cache_home.path());
 
         {
             let session_dir = source_home
@@ -5968,11 +6192,6 @@ mod tests {
             assert_eq!(second.len(), 1);
             assert_eq!(second[0].model_id, "grok-code");
             assert!(second[0].cost > 0.0);
-        }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
         }
     }
 
@@ -6028,8 +6247,7 @@ mod tests {
     fn test_parse_all_messages_with_pricing_kimi_deduplicates_repeated_status_updates() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _cache_env = redirect_cache_home(cache_home.path());
 
         {
             write_kimi_repeated_status_fixture(source_home.path());
@@ -6044,11 +6262,6 @@ mod tests {
             assert_eq!(messages.iter().map(|m| m.tokens.input).sum::<i64>(), 40);
             assert_eq!(messages.iter().map(|m| m.tokens.output).sum::<i64>(), 5);
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -6056,8 +6269,7 @@ mod tests {
     fn test_parse_local_clients_kimi_deduplicates_repeated_status_updates() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _cache_env = redirect_cache_home(cache_home.path());
 
         {
             write_kimi_repeated_status_fixture(source_home.path());
@@ -6078,11 +6290,59 @@ mod tests {
             assert_eq!(parsed.messages.iter().map(|m| m.input).sum::<i64>(), 40);
             assert_eq!(parsed.messages.iter().map(|m| m.output).sum::<i64>(), 5);
         }
+    }
 
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
+    #[test]
+    #[serial_test::serial]
+    fn test_kimchi_deduplicates_same_message_across_scan_roots() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+
+        let default_path = source_home
+            .path()
+            .join(".config/kimchi/harness/sessions/workspace/session.jsonl");
+        let extra_path = source_home
+            .path()
+            .join("kimchi-extra/workspace/session.jsonl");
+        write_kimchi_fixture(&default_path);
+        write_kimchi_fixture(&extra_path);
+
+        let mut extra_scan_paths = std::collections::BTreeMap::new();
+        extra_scan_paths.insert(
+            "kimchi".to_string(),
+            vec![source_home.path().join("kimchi-extra")],
+        );
+        let scanner_settings = scanner::ScannerSettings {
+            extra_scan_paths,
+            ..Default::default()
+        };
+
+        let parsed = parse_local_clients(LocalParseOptions {
+            home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["kimchi".to_string()]),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner_settings.clone(),
+        })
+        .unwrap();
+        assert_eq!(parsed.counts.get(ClientId::Kimchi), 1);
+        assert_eq!(parsed.messages.len(), 1);
+
+        let messages = parse_all_messages_with_pricing_with_env_strategy(
+            source_home.path().to_str().unwrap(),
+            &["kimchi".to_string()],
+            None,
+            false,
+            &scanner_settings,
+        );
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].dedup_key.as_deref(),
+            Some("kimchi:kimchi-session:kimchi-message")
+        );
     }
 
     #[test]
@@ -6097,8 +6357,7 @@ mod tests {
         // parse_local_clients test cannot catch this.
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _cache_env = redirect_cache_home(cache_home.path());
 
         {
             let session_dir = source_home
@@ -6132,11 +6391,6 @@ mod tests {
                 100
             );
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -6144,8 +6398,7 @@ mod tests {
     fn test_source_cache_refreshes_stale_date_on_cache_hit() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _cache_env = redirect_cache_home(cache_home.path());
 
         {
             let message_dir = source_home
@@ -6216,10 +6469,90 @@ mod tests {
                 .date
             );
         }
+    }
 
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_warm_cache_removes_synthetic_placeholder_before_submit_validation() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+
+        {
+            let claude_dir = client_scan_root(source_home.path(), ClientId::Claude).join("demo");
+            std::fs::create_dir_all(&claude_dir).unwrap();
+            let transcript = claude_dir.join("session.jsonl");
+            std::fs::write(
+                &transcript,
+                r#"{"type":"assistant","timestamp":"2026-06-24T01:00:00.000Z","requestId":"req_live","message":{"id":"live","model":"claude-3-5-sonnet","usage":{"input_tokens":1,"output_tokens":1}}}"#,
+            )
+            .unwrap();
+
+            let identity = message_cache::CacheIdentity::for_client(ClientId::Claude);
+            let fingerprint = message_cache::SourceFingerprint::from_claude_code_path_with_home(
+                &transcript,
+                Some(source_home.path()),
+            )
+            .unwrap();
+            let retained = UnifiedMessage::new_with_dedup(
+                "claude",
+                "claude-3-5-sonnet",
+                "anthropic",
+                "session",
+                1_782_259_200_000,
+                TokenBreakdown {
+                    input: 10,
+                    output: 5,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning: 0,
+                },
+                0.0,
+                Some("old:req_old".to_string()),
+            );
+            let poisoned = UnifiedMessage::new_with_dedup(
+                "claude",
+                "<synthetic>",
+                "unknown",
+                "session",
+                1_782_259_201_000,
+                TokenBreakdown {
+                    input: 100,
+                    output: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning: 0,
+                },
+                0.0,
+                Some("claude:tool_result:session:tool_result:toolu_1".to_string()),
+            );
+            let mut cache = message_cache::SourceMessageCache::default();
+            cache.insert(message_cache::CachedSourceEntry::new(
+                identity,
+                &transcript,
+                fingerprint,
+                vec![retained, poisoned],
+                Vec::new(),
+                None,
+            ));
+            cache.save_if_dirty();
+
+            let messages = parse_all_messages_with_pricing(
+                source_home.path().to_str().unwrap(),
+                &["claude".to_string()],
+                None,
+            );
+
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].model_id, "claude-3-5-sonnet");
+            assert_eq!(messages[0].tokens.input, 10);
+
+            let repaired = message_cache::SourceMessageCache::load();
+            let cached = repaired
+                .get(identity, &transcript)
+                .expect("the retained Claude cache entry should remain");
+            assert_eq!(cached.messages.len(), 1);
+            assert_eq!(cached.messages[0].dedup_key.as_deref(), Some("old:req_old"));
         }
     }
 
@@ -6231,8 +6564,7 @@ mod tests {
 
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _cache_env = redirect_cache_home(cache_home.path());
 
         {
             let message_dir = source_home
@@ -6276,11 +6608,6 @@ mod tests {
             );
             assert_eq!(second_messages.len(), 1);
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -6288,13 +6615,11 @@ mod tests {
     fn test_empty_cache_hits_are_reparsed_for_optional_file_sources() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _cache_env = redirect_cache_home(cache_home.path());
 
         {
-            let message_dir = source_home
-                .path()
-                .join(".local/share/opencode/storage/message/project-1");
+            let message_dir =
+                client_scan_root(source_home.path(), ClientId::OpenCode).join("project-1");
             std::fs::create_dir_all(&message_dir).unwrap();
             let path = message_dir.join("msg_001.json");
             std::fs::write(
@@ -6331,11 +6656,6 @@ mod tests {
                 .unwrap();
             assert_eq!(repaired_entry.messages.len(), 1);
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -6343,8 +6663,7 @@ mod tests {
     fn test_sqlite_source_cache_invalidates_on_wal_change() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _cache_env = redirect_cache_home(cache_home.path());
 
         {
             let db_dir = source_home.path().join(".local/share/opencode");
@@ -6408,11 +6727,6 @@ mod tests {
             );
             assert_eq!(refreshed_messages.len(), 2);
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -6423,8 +6737,7 @@ mod tests {
         // must only be counted once.
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _cache_env = redirect_cache_home(cache_home.path());
 
         {
             let db_dir = source_home.path().join(".local/share/opencode");
@@ -6524,11 +6837,6 @@ mod tests {
                 "warm cache must also dedup shared message across channel dbs"
             );
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -6536,8 +6844,7 @@ mod tests {
     fn test_parse_all_messages_with_pricing_opencode_sqlite_deduplicates_forked_history() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _cache_env = redirect_cache_home(cache_home.path());
 
         {
             let db_dir = source_home.path().join(".local/share/opencode");
@@ -6602,11 +6909,6 @@ mod tests {
             assert_eq!(messages.iter().map(|m| m.tokens.output).sum::<i64>(), 250);
             assert_eq!(messages.iter().map(|m| m.cost).sum::<f64>(), 0.06);
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -6614,8 +6916,7 @@ mod tests {
     fn test_parse_local_clients_opencode_sqlite_counts_deduplicated_forked_history() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _cache_env = redirect_cache_home(cache_home.path());
 
         {
             let db_dir = source_home.path().join(".local/share/opencode");
@@ -6684,11 +6985,6 @@ mod tests {
             assert_eq!(parsed.messages.len(), 3);
             assert_eq!(parsed.messages.iter().map(|m| m.input).sum::<i64>(), 600);
             assert_eq!(parsed.messages.iter().map(|m| m.output).sum::<i64>(), 250);
-        }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
         }
     }
 
@@ -6841,8 +7137,7 @@ mod tests {
     fn test_parse_all_messages_with_pricing_codex_deduplicates_forked_history() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _cache_env = redirect_cache_home(cache_home.path());
 
         {
             write_codex_forked_history_fixture(source_home.path());
@@ -6876,11 +7171,6 @@ mod tests {
                 33
             );
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -6888,8 +7178,7 @@ mod tests {
     fn test_parse_all_messages_with_pricing_codex_keeps_user_fork_own_turn() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _cache_env = redirect_cache_home(cache_home.path());
 
         {
             write_codex_user_fork_replay_fixture(source_home.path());
@@ -6912,11 +7201,6 @@ mod tests {
                 500
             );
             assert_eq!(messages.iter().map(|m| m.tokens.output).sum::<i64>(), 150);
-        }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
         }
     }
 
@@ -6988,8 +7272,7 @@ mod tests {
     {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _cache_env = redirect_cache_home(cache_home.path());
 
         {
             write_codex_sessions_and_archived_sessions_fixture(source_home.path());
@@ -7024,11 +7307,6 @@ mod tests {
             // 5 (live-only) + 7 (archived-only) + 3 (shared, once) = 15.
             assert_eq!(messages.iter().map(|m| m.tokens.output).sum::<i64>(), 15);
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -7036,8 +7314,7 @@ mod tests {
     fn test_parse_all_messages_with_pricing_codex_deduplicates_parent_replay_across_forks() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _cache_env = redirect_cache_home(cache_home.path());
 
         {
             write_codex_parent_replay_fixture(source_home.path());
@@ -7060,11 +7337,6 @@ mod tests {
             assert_eq!(messages.len(), 3);
             assert_eq!(messages.iter().map(|m| m.tokens.input).sum::<i64>(), 140);
             assert_eq!(messages.iter().map(|m| m.tokens.output).sum::<i64>(), 14);
-        }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
         }
     }
 
@@ -7097,8 +7369,7 @@ mod tests {
     fn test_parse_all_messages_with_pricing_codex_keeps_twin_token_counts_at_distinct_timestamps() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _cache_env = redirect_cache_home(cache_home.path());
 
         {
             write_codex_twin_token_count_fixture(source_home.path());
@@ -7137,11 +7408,6 @@ mod tests {
                 4,
             );
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -7149,8 +7415,7 @@ mod tests {
     fn test_parse_local_clients_codex_counts_deduplicated_forked_history() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _cache_env = redirect_cache_home(cache_home.path());
 
         {
             write_codex_forked_history_fixture(source_home.path());
@@ -7193,11 +7458,6 @@ mod tests {
                 33
             );
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -7206,11 +7466,10 @@ mod tests {
         let cache_home = tempfile::TempDir::new().unwrap();
         let fresh_cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let mut cache_env = redirect_cache_home(cache_home.path());
 
         {
-            let codex_dir = source_home.path().join(".codex/sessions");
+            let codex_dir = client_scan_root(source_home.path(), ClientId::Codex);
             std::fs::create_dir_all(&codex_dir).unwrap();
             let path = codex_dir.join("session.jsonl");
             std::fs::write(
@@ -7258,7 +7517,7 @@ mod tests {
                 &["codex".to_string()],
                 None,
             );
-            std::env::set_var("HOME", fresh_cache_home.path());
+            point_cache_home(&mut cache_env, fresh_cache_home.path());
             let fresh_messages = parse_all_messages_with_pricing(
                 source_home.path().to_str().unwrap(),
                 &["codex".to_string()],
@@ -7271,11 +7530,6 @@ mod tests {
                 .iter()
                 .all(|message| message.model_id == "gpt-5.5"));
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -7284,8 +7538,7 @@ mod tests {
         let cache_home = tempfile::TempDir::new().unwrap();
         let fresh_cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let mut cache_env = redirect_cache_home(cache_home.path());
 
         {
             let codex_dir = source_home.path().join(".codex/sessions");
@@ -7329,7 +7582,7 @@ mod tests {
                 &["codex".to_string()],
                 None,
             );
-            std::env::set_var("HOME", fresh_cache_home.path());
+            point_cache_home(&mut cache_env, fresh_cache_home.path());
             let fresh_messages = parse_all_messages_with_pricing(
                 source_home.path().to_str().unwrap(),
                 &["codex".to_string()],
@@ -7337,11 +7590,6 @@ mod tests {
             );
 
             assert_eq!(warm_messages, fresh_messages);
-        }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
         }
     }
 
@@ -7351,8 +7599,7 @@ mod tests {
         let cache_home = tempfile::TempDir::new().unwrap();
         let fresh_cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let mut cache_env = redirect_cache_home(cache_home.path());
 
         {
             let codex_dir = source_home.path().join(".codex/sessions");
@@ -7405,7 +7652,7 @@ mod tests {
                 )
                 .is_none());
 
-            std::env::set_var("HOME", fresh_cache_home.path());
+            point_cache_home(&mut cache_env, fresh_cache_home.path());
             let fresh_messages = parse_all_messages_with_pricing(
                 source_home.path().to_str().unwrap(),
                 &["codex".to_string()],
@@ -7414,11 +7661,6 @@ mod tests {
 
             assert_eq!(warm_messages, fresh_messages);
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -7426,8 +7668,7 @@ mod tests {
     fn test_exact_hit_codex_cache_repairs_fallback_timestamps_without_incremental_state() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _cache_env = redirect_cache_home(cache_home.path());
 
         {
             let session_dir = source_home.path().join(".codex/sessions");
@@ -7471,11 +7712,6 @@ mod tests {
 
             assert_eq!(messages, expected);
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -7484,8 +7720,7 @@ mod tests {
         let cache_home = tempfile::TempDir::new().unwrap();
         let fresh_cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let mut cache_env = redirect_cache_home(cache_home.path());
 
         {
             let session_dir = source_home.path().join(".codex/sessions");
@@ -7515,7 +7750,7 @@ mod tests {
                 None,
             );
 
-            std::env::set_var("HOME", fresh_cache_home.path());
+            point_cache_home(&mut cache_env, fresh_cache_home.path());
             let fresh_messages = parse_all_messages_with_pricing(
                 source_home.path().to_str().unwrap(),
                 &["codex".to_string()],
@@ -7525,11 +7760,6 @@ mod tests {
             assert_eq!(warm_messages, fresh_messages);
             assert_ne!(warm_messages[0].timestamp, initial_messages[0].timestamp);
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -7537,8 +7767,7 @@ mod tests {
     fn test_full_log_parse_preserves_valid_messages_before_invalid_line_error() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _cache_env = redirect_cache_home(cache_home.path());
 
         {
             let session_dir = source_home.path().join(".codex/sessions");
@@ -7575,11 +7804,6 @@ mod tests {
                 )
                 .is_none());
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -7588,11 +7812,10 @@ mod tests {
         let cache_home = tempfile::TempDir::new().unwrap();
         let fresh_cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let mut cache_env = redirect_cache_home(cache_home.path());
 
         {
-            let session_dir = source_home.path().join(".codex/sessions");
+            let session_dir = client_scan_root(source_home.path(), ClientId::Codex);
             std::fs::create_dir_all(&session_dir).unwrap();
             let path = session_dir.join("session.jsonl");
             std::fs::write(
@@ -7641,7 +7864,7 @@ mod tests {
                 None,
             );
 
-            std::env::set_var("HOME", fresh_cache_home.path());
+            point_cache_home(&mut cache_env, fresh_cache_home.path());
             let fresh_messages = parse_all_messages_with_pricing(
                 source_home.path().to_str().unwrap(),
                 &["codex".to_string()],
@@ -7652,18 +7875,13 @@ mod tests {
             assert_eq!(resumed_messages.len(), 1);
             assert_eq!(resumed_messages[0].model_id, "gpt-5.5");
 
-            std::env::set_var("HOME", cache_home.path());
+            point_cache_home(&mut cache_env, cache_home.path());
             assert!(message_cache::SourceMessageCache::load()
                 .get(
                     message_cache::CacheIdentity::for_client(ClientId::Codex),
                     &path,
                 )
                 .is_some());
-        }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
         }
     }
 
@@ -7673,8 +7891,7 @@ mod tests {
         let cache_home = tempfile::TempDir::new().unwrap();
         let fresh_cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let mut cache_env = redirect_cache_home(cache_home.path());
 
         {
             let session_dir = source_home.path().join(".codex/sessions");
@@ -7725,7 +7942,7 @@ mod tests {
                 None,
             );
 
-            std::env::set_var("HOME", fresh_cache_home.path());
+            point_cache_home(&mut cache_env, fresh_cache_home.path());
             let fresh_messages = parse_all_messages_with_pricing(
                 source_home.path().to_str().unwrap(),
                 &["codex".to_string()],
@@ -7735,11 +7952,6 @@ mod tests {
             assert_eq!(warm_messages, fresh_messages);
             assert_eq!(warm_messages.len(), 2);
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -7747,8 +7959,7 @@ mod tests {
     fn test_source_cache_does_not_reuse_priced_cost_without_pricing_service() {
         let temp_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", temp_home.path());
+        let _cache_env = redirect_cache_home(temp_home.path());
         {
             let cursor_cache_dir = source_home.path().join(".config/tokscale/cursor-cache");
             std::fs::create_dir_all(&cursor_cache_dir).unwrap();
@@ -7785,11 +7996,6 @@ mod tests {
 
             assert_eq!(cached_messages.len(), 1);
             assert_eq!(cached_messages[0].cost, 0.0);
-        }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
         }
     }
 
@@ -7878,6 +8084,51 @@ mod tests {
         assert!(error.contains("provider/unlisted-model"));
     }
 
+    // Regression: #1013. The message used to repeat one entry per affected
+    // message, so a real submission produced a ~290KB error that scrolled the
+    // actionable model ids off screen.
+    #[test]
+    fn strict_pricing_validation_error_deduplicates_models_with_counts() {
+        let unpriced = |model: &str, session: &str| {
+            UnifiedMessage::new(
+                "synthetic",
+                model,
+                "provider",
+                session,
+                1_733_011_200_000,
+                TokenBreakdown {
+                    input: 1,
+                    ..Default::default()
+                },
+                0.0,
+            )
+        };
+        let messages = vec![
+            unpriced("repeated-model", "a"),
+            unpriced("repeated-model", "b"),
+            unpriced("repeated-model", "c"),
+            unpriced("single-model", "d"),
+        ];
+        let pricing = pricing::PricingService::new(HashMap::new(), HashMap::new());
+
+        let error = validate_priced_messages(&messages, Some(&pricing)).unwrap_err();
+
+        assert_eq!(error.matches("provider/repeated-model").count(), 1);
+        assert_eq!(error.matches("provider/single-model").count(), 1);
+        assert!(
+            error.contains("provider/repeated-model (x3)"),
+            "repeated ids must carry an occurrence count: {error}"
+        );
+        assert!(
+            !error.contains("provider/single-model (x"),
+            "single occurrences must not be annotated: {error}"
+        );
+        assert!(
+            error.find("provider/repeated-model") < error.find("provider/single-model"),
+            "ids must keep first-seen order: {error}"
+        );
+    }
+
     #[test]
     fn graph_pricing_policy_is_strict_only_for_submission() {
         let message = UnifiedMessage::new(
@@ -7957,6 +8208,7 @@ mod tests {
             Some(&pricing),
             GraphPricingRequirement::Submission,
             std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
         )
         .expect("generic routing label must not block fully priced submission usage");
 
@@ -7997,6 +8249,7 @@ mod tests {
             Some(&pricing),
             GraphPricingRequirement::Submission,
             std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
         )
         .expect_err("concrete unpriced models must remain a submission error");
 
@@ -9692,9 +9945,16 @@ mod tests {
     #[test]
     fn test_submit_default_graph_includes_antigravity_cache_rows() {
         let temp_dir = tempfile::TempDir::new().unwrap();
-        let sessions_dir = temp_dir
-            .path()
-            .join(".config/tokscale/antigravity-cache/sessions");
+        // Resolved rather than hardcoded: under an explicit home the config
+        // root is `~/.config/tokscale` on Unix and
+        // `%HOME%\AppData\Roaming\tokscale` on Windows, so the Unix spelling
+        // put the fixture outside the tree the scan walks and the graph came
+        // back empty.
+        let sessions_dir = std::path::PathBuf::from(
+            ClientId::Antigravity
+                .data()
+                .resolve_path_with_env_strategy(&temp_dir.path().to_string_lossy(), false),
+        );
         std::fs::create_dir_all(&sessions_dir).unwrap();
         std::fs::write(
             sessions_dir.join("ag-submit.jsonl"),
@@ -10000,8 +10260,7 @@ mod tests {
     fn test_parse_all_messages_refreshes_cc_mirror_provider_when_variant_metadata_changes() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _cache_env = redirect_cache_home(cache_home.path());
 
         {
             let variant_dir = source_home.path().join(".cc-mirror/kimi-code");
@@ -10013,8 +10272,8 @@ mod tests {
             std::fs::write(
                 &variant_path,
                 format!(
-                    r#"{{"name":"kimi-code","provider":"kimi","configDir":"{}"}}"#,
-                    config_dir.display()
+                    r#"{{"name":"kimi-code","provider":"kimi","configDir":{}}}"#,
+                    paths::json_path_literal(&config_dir)
                 ),
             )
             .unwrap();
@@ -10038,8 +10297,8 @@ mod tests {
             std::fs::write(
                 &variant_path,
                 format!(
-                    r#"{{"name":"kimi-code","provider":"minimax","configDir":"{}"}}"#,
-                    config_dir.display()
+                    r#"{{"name":"kimi-code","provider":"minimax","configDir":{}}}"#,
+                    paths::json_path_literal(&config_dir)
                 ),
             )
             .unwrap();
@@ -10053,11 +10312,6 @@ mod tests {
             assert_eq!(refreshed_messages[0].client, "cc-mirror/kimi-code");
             assert_eq!(refreshed_messages[0].provider_id, "minimax");
         }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -10065,8 +10319,7 @@ mod tests {
     fn test_parse_all_messages_keeps_normal_claude_when_cc_mirror_points_at_claude_config() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", cache_home.path());
+        let _cache_env = redirect_cache_home(cache_home.path());
 
         {
             let claude_dir = source_home.path().join(".claude");
@@ -10085,8 +10338,8 @@ mod tests {
             std::fs::write(
                 variant_dir.join("variant.json"),
                 format!(
-                    r#"{{"name":"plain-mirror","provider":"mirror","configDir":"{}"}}"#,
-                    claude_dir.display()
+                    r#"{{"name":"plain-mirror","provider":"mirror","configDir":{}}}"#,
+                    paths::json_path_literal(&claude_dir)
                 ),
             )
             .unwrap();
@@ -10098,11 +10351,6 @@ mod tests {
             );
             assert_eq!(messages.len(), 1);
             assert_eq!(messages[0].client, "claude");
-        }
-
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
         }
     }
 
@@ -10187,6 +10435,45 @@ mod tests {
         assert!(dates.contains(&local_date(thread_created + 2000)));
         assert!(dates.contains(&local_date(ledger_timestamp)));
     }
+
+    #[test]
+    fn test_parse_local_clients_reasonix_counts_reported_requests() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        // Where the scan will actually look, rather than the Unix spelling of
+        // it: under an explicit home Reasonix lives at `~/.reasonix` on Unix
+        // and `%HOME%\AppData\Roaming\reasonix` on Windows, so a hardcoded
+        // `.reasonix/stats` fixture is written somewhere the scanner never
+        // reads and the test asserts on an empty parse. The path layout has its
+        // own coverage in `clients::tests`; this test is about the request
+        // count.
+        let stats_dir = std::path::PathBuf::from(
+            ClientId::Reasonix
+                .data()
+                .resolve_path_with_env_strategy(&temp_dir.path().to_string_lossy(), false),
+        );
+        std::fs::create_dir_all(&stats_dir).unwrap();
+        std::fs::write(
+            stats_dir.join("2026-08-04.jsonl"),
+            "{\"ts\":\"2026-08-04T09:10:11Z\",\"model\":\"deepseek/chat\",\"prompt\":100,\"completion\":20,\"total\":120,\"requests\":3}\n",
+        )
+        .unwrap();
+
+        let parsed = parse_local_clients(LocalParseOptions {
+            home_dir: Some(temp_dir.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["reasonix".to_string()]),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings::default(),
+        })
+        .unwrap();
+
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(parsed.messages[0].message_count, 3);
+        assert_eq!(parsed.counts.get(ClientId::Reasonix), 3);
+    }
+
     #[test]
     fn test_retain_for_requested_clients_gjc_superset_of_9router() {
         let gjc_requested: HashSet<&str> = HashSet::from(["gjc"]);

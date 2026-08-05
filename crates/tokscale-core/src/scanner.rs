@@ -396,6 +396,7 @@ pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
                 "unified.jsonl" => file_name == "unified.jsonl",
                 "events.jsonl" => file_name == "events.jsonl",
                 "ui_messages.json" => file_name == "ui_messages.json",
+                "cline-cli-messages" => file_name.ends_with(".messages.json"),
                 "session-usage.json" => file_name == "session-usage.json",
                 "chat-messages.json" => file_name == "chat-messages.json",
                 "workbuddy.db" => file_name == "workbuddy.db",
@@ -873,6 +874,32 @@ fn cline_additional_vscode_task_roots(home_dir: &str, use_env_roots: bool) -> Ve
     );
 
     roots
+}
+
+fn cline_cli_session_roots(home_dir: &str, use_env_roots: bool) -> Vec<PathBuf> {
+    let home_fallback = || PathBuf::from(home_dir).join(".cline/data/sessions");
+
+    if !use_env_roots {
+        return vec![home_fallback()];
+    }
+
+    let non_blank_env_path = |name: &str| {
+        std::env::var_os(name)
+            .filter(|value| !value.to_string_lossy().trim().is_empty())
+            .map(PathBuf::from)
+    };
+
+    if let Some(path) = non_blank_env_path("CLINE_SESSION_DATA_DIR") {
+        return vec![path];
+    }
+    if let Some(path) = non_blank_env_path("CLINE_DATA_DIR") {
+        return vec![path.join("sessions")];
+    }
+    if let Some(path) = non_blank_env_path("CLINE_DIR") {
+        return vec![path.join("data/sessions")];
+    }
+
+    vec![home_fallback()]
 }
 
 pub fn devin_desktop_additional_roots(home_dir: &str, use_env_roots: bool) -> Vec<PathBuf> {
@@ -1615,6 +1642,16 @@ fn scan_all_clients_with_env_strategy_inner(
         for root in cline_additional_vscode_task_roots(home_dir, use_env_roots) {
             push_unique_scan_task(&mut tasks, &mut seen_scan_roots, ClientId::Cline, root);
         }
+
+        for root in cline_cli_session_roots(home_dir, use_env_roots) {
+            push_unique_scan_task_with_pattern(
+                &mut tasks,
+                &mut seen_scan_roots,
+                ClientId::Cline,
+                root,
+                "cline-cli-messages",
+            );
+        }
     }
 
     if enabled.contains(&ClientId::DevinDesktop) {
@@ -1961,6 +1998,7 @@ pub fn scan_all_clients(home_dir: &str, clients: &[String]) -> ScanResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paths::json_path_literal;
     use crate::paths::test_env::EnvGuard;
     use serial_test::serial;
     use std::fs::{self, File};
@@ -2206,6 +2244,19 @@ mod tests {
                 .unwrap_or_default()
                 == "ui_messages.json"
         }));
+    }
+
+    #[test]
+    fn test_scan_directory_cline_cli_messages_pattern() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path();
+
+        File::create(path.join("session.messages.json")).unwrap();
+        File::create(path.join("session.json")).unwrap();
+        File::create(path.join("session.messages.jsonl")).unwrap();
+
+        let files = scan_directory(path.to_str().unwrap(), "cline-cli-messages");
+        assert_eq!(files, vec![path.join("session.messages.json")]);
     }
 
     #[test]
@@ -2482,6 +2533,14 @@ mod tests {
         let pi_path = base.join(".pi/agent/sessions/--test--");
         fs::create_dir_all(&pi_path).unwrap();
         let mut file = File::create(pi_path.join("1733011200000_pi_ses_001.jsonl")).unwrap();
+        file.write_all(b"{}").unwrap();
+    }
+
+    fn setup_mock_kimchi_dir(base: &std::path::Path) {
+        let kimchi_path = base.join(".config/kimchi/harness/sessions/--test--");
+        fs::create_dir_all(&kimchi_path).unwrap();
+        let mut file =
+            File::create(kimchi_path.join("2026-08-01T00-00-00Z_kimchi_ses_001.jsonl")).unwrap();
         file.write_all(b"{}").unwrap();
     }
 
@@ -2783,6 +2842,16 @@ mod tests {
         File::create(macos.join("ui_messages.json")).unwrap();
         File::create(windows.join("ui_messages.json")).unwrap();
         File::create(server.join("ui_messages.json")).unwrap();
+    }
+
+    fn setup_mock_cline_cli_dir(data_dir: &std::path::Path) {
+        setup_mock_cline_cli_session_root(&data_dir.join("sessions"));
+    }
+
+    fn setup_mock_cline_cli_session_root(sessions_root: &std::path::Path) {
+        let sessions = sessions_root.join("cli-session");
+        fs::create_dir_all(&sessions).unwrap();
+        File::create(sessions.join("cli-session.messages.json")).unwrap();
     }
 
     fn setup_mock_crush_registry(registry_path: &Path, projects_json: &str) {
@@ -3746,6 +3815,24 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_all_clients_kimchi() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_kimchi_dir(home);
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["kimchi".to_string()],
+            false,
+        );
+        assert_eq!(result.get(ClientId::Kimchi).len(), 1);
+        assert!(result.get(ClientId::Kimchi)[0]
+            .to_string_lossy()
+            .ends_with(".jsonl"));
+        assert!(result.get(ClientId::Pi).is_empty());
+    }
+
+    #[test]
     fn test_scan_all_clients_senpi() {
         let dir = TempDir::new().unwrap();
         let home = dir.path();
@@ -3933,8 +4020,8 @@ mod tests {
         fs::write(
             &variant_file,
             format!(
-                r#"{{"name":"kimi-code","provider":"kimi","configDir":"{}"}}"#,
-                config_dir.display()
+                r#"{{"name":"kimi-code","provider":"kimi","configDir":{}}}"#,
+                json_path_literal(&config_dir)
             ),
         )
         .unwrap();
@@ -3971,8 +4058,8 @@ mod tests {
         fs::write(
             variant_dir.join("variant.json"),
             format!(
-                r#"{{"name":"plain-mirror","provider":"mirror","configDir":"{}"}}"#,
-                normal_claude_dir.display()
+                r#"{{"name":"plain-mirror","provider":"mirror","configDir":{}}}"#,
+                json_path_literal(&normal_claude_dir)
             ),
         )
         .unwrap();
@@ -4180,6 +4267,32 @@ mod tests {
             .any(|p| p.ends_with("messages.jsonl")));
     }
 
+    /// The `workspace_key` a Crush fixture path should produce, spelled out
+    /// here rather than obtained from the production normalizer.
+    ///
+    /// `scan_crush_registry` keys a workspace with `normalize_workspace_key`,
+    /// which folds `\` to `/` on purpose so one workspace reached under two
+    /// separator spellings is one key. That fold is the claim these tests
+    /// carry on Windows, and a raw `display()` expectation could not state it —
+    /// it only agreed with the normalizer on Unix, where there is nothing to
+    /// fold.
+    ///
+    /// Calling `normalize_workspace_key` in the expectation states it, but
+    /// states it self-referentially: production applies the same function to
+    /// the same input, so the assertion would hold no matter what that function
+    /// did, including nothing. The fold is one line to write out, so write it
+    /// out — this expectation is wrong whenever the normalizer stops folding,
+    /// which is the entire point of having it.
+    ///
+    /// The single `replace` is the whole rule for these inputs. The normalizer
+    /// also collapses repeated separators and trims a trailing one; a
+    /// `TempDir`-rooted `join` produces neither, so nothing else applies. (It
+    /// agrees on a UNC root too: `\\srv\share\p` folds to `//srv/share/p` with
+    /// no doubled separator left inside to collapse.)
+    fn expected_workspace_key(path: &Path) -> Option<String> {
+        Some(path.to_string_lossy().replace('\\', "/"))
+    }
+
     #[test]
     fn test_scan_crush_registry_resolves_relative_and_absolute_data_dirs() {
         let dir = TempDir::new().unwrap();
@@ -4194,15 +4307,15 @@ mod tests {
         let projects_json = format!(
             r#"{{
   "projects": [
-    {{ "path": "{}", "data_dir": ".crush" }},
-    {{ "path": "{}", "data_dir": "{}" }},
-    {{ "path": "{}", "data_dir": ".crush" }}
+    {{ "path": {}, "data_dir": ".crush" }},
+    {{ "path": {}, "data_dir": {} }},
+    {{ "path": {}, "data_dir": ".crush" }}
   ]
 }}"#,
-            project_a.display(),
-            dir.path().join("project-b").display(),
-            project_b_data.display(),
-            dir.path().join("missing-project").display(),
+            json_path_literal(&project_a),
+            json_path_literal(&dir.path().join("project-b")),
+            json_path_literal(&project_b_data),
+            json_path_literal(&dir.path().join("missing-project")),
         );
         setup_mock_crush_registry(&registry_path, &projects_json);
 
@@ -4212,12 +4325,12 @@ mod tests {
             vec![
                 CrushDbSource {
                     db_path: project_a.join(".crush").join("crush.db"),
-                    workspace_key: Some(project_a.display().to_string()),
+                    workspace_key: expected_workspace_key(&project_a),
                     workspace_label: Some("project-a".to_string()),
                 },
                 CrushDbSource {
                     db_path: project_b_data.join("crush.db"),
-                    workspace_key: Some(dir.path().join("project-b").display().to_string()),
+                    workspace_key: expected_workspace_key(&dir.path().join("project-b")),
                     workspace_label: Some("project-b".to_string()),
                 },
             ]
@@ -4235,13 +4348,13 @@ mod tests {
         let projects_json = format!(
             r#"{{
   "projects": [
-    {{ "path": "{}", "data_dir": ".crush" }},
+    {{ "path": {}, "data_dir": ".crush" }},
     {{ "path": 123, "data_dir": ".crush" }},
     {{ "data_dir": ".crush" }},
     "not-an-object"
   ]
 }}"#,
-            valid_project.display()
+            json_path_literal(&valid_project)
         );
         setup_mock_crush_registry(&registry_path, &projects_json);
 
@@ -4250,7 +4363,7 @@ mod tests {
             result,
             vec![CrushDbSource {
                 db_path: valid_project.join(".crush").join("crush.db"),
-                workspace_key: Some(valid_project.display().to_string()),
+                workspace_key: expected_workspace_key(&valid_project),
                 workspace_label: Some("valid-project".to_string()),
             }]
         );
@@ -4304,8 +4417,8 @@ mod tests {
         File::create(project.join(".crush").join("crush.db")).unwrap();
 
         let projects_json = format!(
-            r#"{{ "projects": [ {{ "path": "{}", "data_dir": ".crush" }} ] }}"#,
-            project.display()
+            r#"{{ "projects": [ {{ "path": {}, "data_dir": ".crush" }} ] }}"#,
+            json_path_literal(&project)
         );
         setup_mock_crush_registry(&global_data.join("projects.json"), &projects_json);
 
@@ -4342,8 +4455,8 @@ mod tests {
         File::create(project.join(".crush").join("crush.db")).unwrap();
 
         let projects_json = format!(
-            r#"{{ "projects": [ {{ "path": "{}", "data_dir": ".crush" }} ] }}"#,
-            project.display()
+            r#"{{ "projects": [ {{ "path": {}, "data_dir": ".crush" }} ] }}"#,
+            json_path_literal(&project)
         );
         setup_mock_crush_registry(
             &home.join("AppData/Local/crush/projects.json"),
@@ -4374,8 +4487,8 @@ mod tests {
         File::create(project.join(".crush").join("crush.db")).unwrap();
 
         let projects_json = format!(
-            r#"{{ "projects": [ {{ "path": "{}", "data_dir": ".crush" }} ] }}"#,
-            project.display()
+            r#"{{ "projects": [ {{ "path": {}, "data_dir": ".crush" }} ] }}"#,
+            json_path_literal(&project)
         );
         setup_mock_crush_registry(&xdg.join("crush/projects.json"), &projects_json);
         setup_mock_crush_registry(
@@ -4419,10 +4532,10 @@ mod tests {
         let projects_json = format!(
             r#"{{
   "projects": [
-    {{ "path": "{}", "data_dir": ".crush" }}
+    {{ "path": {}, "data_dir": ".crush" }}
   ]
 }}"#,
-            project.display()
+            json_path_literal(&project)
         );
         setup_mock_crush_registry(&registry_path, &projects_json);
 
@@ -4433,7 +4546,7 @@ mod tests {
             result.crush_dbs,
             vec![CrushDbSource {
                 db_path: data_dir.join("crush.db"),
-                workspace_key: Some(project.display().to_string()),
+                workspace_key: expected_workspace_key(&project),
                 workspace_label: Some("project".to_string()),
             }]
         );
@@ -4597,6 +4710,16 @@ mod tests {
     /// resolves — trimming the value here would silently miss it.
     #[test]
     #[serial]
+    // Unix-only because the fixture cannot exist on Windows: a directory name
+    // ending in a space is not addressable there. `CreateDirectoryW` strips the
+    // trailing space, so `<tmp>\ padded-kimi-code ` becomes
+    // `<tmp>\ padded-kimi-code`, and the very next call — which carries that
+    // component in the middle of a longer path, where no stripping happens —
+    // fails with ERROR_PATH_NOT_FOUND. The claim being made here (a padded
+    // KIMI_CODE_HOME is honored verbatim rather than trimmed) is also one
+    // Windows cannot violate: the OS trims the name before tokscale sees a
+    // directory at all.
+    #[cfg(unix)]
     fn test_scan_all_clients_kimi_code_home_override_is_not_trimmed() {
         let mut env = EnvGuard::capture(&["KIMI_CODE_HOME"]);
         let dir = TempDir::new().unwrap();
@@ -4757,6 +4880,152 @@ mod tests {
             .get(ClientId::Cline)
             .iter()
             .all(|p| p.ends_with("ui_messages.json")));
+    }
+
+    #[test]
+    fn test_scan_all_clients_cline_cli() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_cline_cli_dir(&home.join(".cline/data"));
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["cline".to_string()],
+            false,
+        );
+        assert_eq!(result.get(ClientId::Cline).len(), 1);
+        assert!(result.get(ClientId::Cline)[0]
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".messages.json")));
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_cline_cli_session_data_dir_takes_precedence() {
+        let mut env = EnvGuard::capture(&["CLINE_SESSION_DATA_DIR", "CLINE_DATA_DIR", "CLINE_DIR"]);
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        let session_data_dir = dir.path().join("custom-cline-sessions");
+        let data_dir = dir.path().join("custom-cline-data");
+        let cline_dir = dir.path().join("custom-cline");
+
+        setup_mock_cline_cli_session_root(&session_data_dir);
+        setup_mock_cline_cli_dir(&data_dir);
+        setup_mock_cline_cli_dir(&cline_dir.join("data"));
+        setup_mock_cline_cli_dir(&home.join(".cline/data"));
+        env.set("CLINE_SESSION_DATA_DIR", &session_data_dir);
+        env.set("CLINE_DATA_DIR", &data_dir);
+        env.set("CLINE_DIR", &cline_dir);
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["cline".to_string()],
+            true,
+        );
+        let expected = session_data_dir.join("cli-session/cli-session.messages.json");
+
+        assert_eq!(result.get(ClientId::Cline), &vec![expected]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_cline_cli_uses_data_dir_override() {
+        let mut env = EnvGuard::capture(&["CLINE_SESSION_DATA_DIR", "CLINE_DATA_DIR", "CLINE_DIR"]);
+        env.remove("CLINE_SESSION_DATA_DIR");
+        env.remove("CLINE_DIR");
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        let data_dir = dir.path().join("custom-cline-data");
+        let cline_dir = dir.path().join("custom-cline");
+
+        setup_mock_cline_cli_dir(&data_dir);
+        setup_mock_cline_cli_dir(&cline_dir.join("data"));
+        setup_mock_cline_cli_dir(&home.join(".cline/data"));
+        env.set("CLINE_DATA_DIR", &data_dir);
+        env.set("CLINE_DIR", &cline_dir);
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["cline".to_string()],
+            true,
+        );
+        let expected = data_dir.join("sessions/cli-session/cli-session.messages.json");
+
+        assert_eq!(result.get(ClientId::Cline), &vec![expected]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_cline_cli_uses_cline_dir_override() {
+        let mut env = EnvGuard::capture(&["CLINE_SESSION_DATA_DIR", "CLINE_DATA_DIR", "CLINE_DIR"]);
+        env.remove("CLINE_SESSION_DATA_DIR");
+        env.remove("CLINE_DATA_DIR");
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        let cline_dir = dir.path().join("custom-cline");
+
+        setup_mock_cline_cli_dir(&cline_dir.join("data"));
+        setup_mock_cline_cli_dir(&home.join(".cline/data"));
+        env.set("CLINE_DIR", &cline_dir);
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["cline".to_string()],
+            true,
+        );
+        let expected = cline_dir.join("data/sessions/cli-session/cli-session.messages.json");
+
+        assert_eq!(result.get(ClientId::Cline), &vec![expected]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_cline_cli_ignores_env_roots_when_disabled() {
+        let mut env = EnvGuard::capture(&["CLINE_SESSION_DATA_DIR", "CLINE_DATA_DIR", "CLINE_DIR"]);
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        let session_data_dir = dir.path().join("custom-cline-sessions");
+        let data_dir = dir.path().join("custom-cline-data");
+        let cline_dir = dir.path().join("custom-cline");
+
+        setup_mock_cline_cli_session_root(&session_data_dir);
+        setup_mock_cline_cli_dir(&data_dir);
+        setup_mock_cline_cli_dir(&cline_dir.join("data"));
+        setup_mock_cline_cli_dir(&home.join(".cline/data"));
+        env.set("CLINE_SESSION_DATA_DIR", &session_data_dir);
+        env.set("CLINE_DATA_DIR", &data_dir);
+        env.set("CLINE_DIR", &cline_dir);
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["cline".to_string()],
+            false,
+        );
+        let expected = home.join(".cline/data/sessions/cli-session/cli-session.messages.json");
+
+        assert_eq!(result.get(ClientId::Cline), &vec![expected]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_cline_cli_whitespace_data_dir_uses_default() {
+        let mut env = EnvGuard::capture(&["CLINE_SESSION_DATA_DIR", "CLINE_DATA_DIR", "CLINE_DIR"]);
+        env.remove("CLINE_SESSION_DATA_DIR");
+        env.remove("CLINE_DIR");
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_cline_cli_dir(&home.join(".cline/data"));
+        env.set("CLINE_DATA_DIR", " \t ");
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["cline".to_string()],
+            true,
+        );
+        let expected = home.join(".cline/data/sessions/cli-session/cli-session.messages.json");
+
+        assert_eq!(result.get(ClientId::Cline), &vec![expected]);
     }
 
     #[test]

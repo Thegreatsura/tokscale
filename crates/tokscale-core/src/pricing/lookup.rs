@@ -53,12 +53,22 @@ const RESELLER_PROVIDER_PREFIXES: &[&str] = &[
 // opus-fast key, or `gemini-default` eroding to `gemini` and landing on a
 // native-audio preview key), so such a match is never trustworthy.
 //
-// Generic English words ("model", "router") are blocked for the same reason:
-// they carry no model identity, yet substring-match real priced keys
-// (`azure_ai/model_router`, `kilo/switchpoint/router`). Without this guard an
-// id whose only fuzzy-eligible remnant after suffix stripping is the word
-// `model` (e.g. `model-zero-usage-v1` -> stripped `model`) misprices at the
-// router key's rate. See `fuzzy_match_does_not_resolve_generic_model_token`.
+// Generic English words ("model", "router", "default") are blocked for the same
+// reason: they carry no model identity, yet substring-match real priced keys
+// (`azure_ai/model_router`, `kilo/switchpoint/router`, `fireworks-ai-default`).
+// Without this guard an id whose only fuzzy-eligible remnant after suffix
+// stripping is the word `model` (e.g. `model-zero-usage-v1` -> stripped
+// `model`) misprices at the router key's rate. See
+// `fuzzy_match_does_not_resolve_generic_model_token`.
+//
+// `default` is the same failure with a live victim: the generic routing label
+// `gemini-default` strips to `default`, which fuzzy-hits LiteLLM's real
+// `fireworks-ai-default` row. That row prices at 0.0/0.0, and
+// `ModelPricing::covers_usage` treats an explicit zero as a real rate, so the
+// label looked *priced* — enough to slip past
+// `exclude_generic_unpriced_submission_messages` and be submitted at
+// Fireworks AI's rates. A Google routing label is not a Fireworks model.
+// See `fuzzy_match_does_not_resolve_generic_default_token`.
 const FUZZY_BLOCKLIST: &[&str] = &[
     "auto",
     "mini",
@@ -69,6 +79,7 @@ const FUZZY_BLOCKLIST: &[&str] = &[
     "gemini",
     "model",
     "router",
+    "default",
 ];
 
 const MAX_LOOKUP_CACHE_ENTRIES: usize = 512;
@@ -404,6 +415,16 @@ impl PricingLookup {
         // matchers.
         if let Some(terminal) = strip_generic_provider_prefix(lower_ref) {
             if let Some(result) = guarded_lookup(terminal) {
+                return Some(result);
+            }
+
+            // The terminal segment can still carry a tier suffix, and the two
+            // transformations have to compose here or they never meet: the
+            // suffix stage below only ever sees the prefixed id, and it splits
+            // on `-`, so it can peel `-xhigh` off `cx/gpt-5.5-xhigh` but is
+            // left with `cx/gpt-5.5`, which is not a dataset key either. Both
+            // halves resolve alone while the combination billed $0 (#846).
+            if let Some(result) = try_strip_unknown_suffix(terminal, guarded_lookup) {
                 return Some(result);
             }
         }
@@ -1161,13 +1182,116 @@ impl PricingLookup {
         usage: &TokenBreakdown,
     ) -> f64 {
         let provider_id = normalize_provider_hint(provider_id);
-        let result = match self.lookup_with_provider(model_id, provider_id) {
+        let result = match self.resolve_for_usage(model_id, provider_id, usage) {
             Some(r) => r,
             None => return 0.0,
         };
 
         compute_cost_for_lookup(&result, provider_id, usage)
     }
+
+    pub(crate) fn covers_usage_with_provider(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+        usage: &TokenBreakdown,
+    ) -> bool {
+        self.resolve_for_usage(model_id, provider_id, usage)
+            .is_some_and(|result| result.pricing.covers_usage(usage))
+    }
+
+    /// Resolve `model_id` for pricing `usage`, borrowing the rates the
+    /// provider-hinted row omits from the canonical unhinted row.
+    ///
+    /// A provider hint can steer resolution onto a gateway or reseller key
+    /// that lists input and output rates only — OpenRouter's
+    /// `openai/gpt-5.2-codex` and LiteLLM's `gmi/google/gemini-3-pro-preview`
+    /// both do — while the canonical key for the same model publishes the
+    /// cache rates as well. Pricing the hinted row alone bills cached tokens
+    /// at zero and makes `covers_usage` false, which aborted whole
+    /// submissions for every Codex session (#1013).
+    ///
+    /// Only buckets the hinted row cannot price are filled, so a reseller row
+    /// keeps its own markup rather than silently repricing to the author's
+    /// cheaper rate. If the filled row still cannot cover the usage, the
+    /// hinted row is returned unchanged and the usage stays unpriced.
+    fn resolve_for_usage(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+        usage: &TokenBreakdown,
+    ) -> Option<LookupResult> {
+        let hinted = self.lookup_with_provider(model_id, provider_id)?;
+        if normalize_provider_hint(provider_id).is_none() || hinted.pricing.covers_usage(usage) {
+            return Some(hinted);
+        }
+
+        let Some(canonical) = self.lookup_with_provider(model_id, None) else {
+            return Some(hinted);
+        };
+        if canonical.matched_key == hinted.matched_key
+            || !quote_same_base_rates(&hinted.pricing, &canonical.pricing)
+        {
+            return Some(hinted);
+        }
+
+        let filled = hinted
+            .pricing
+            .with_missing_rates_from(&canonical.pricing, usage);
+        if !filled.covers_usage(usage) {
+            return Some(hinted);
+        }
+
+        // Keep the hinted row's source and matched key: `compute_cost_for_lookup`
+        // branches on both for OpenAI's full-request 272k tiering, so borrowing
+        // rates must not change which pricing model applies.
+        Some(LookupResult {
+            pricing: filled,
+            ..hinted
+        })
+    }
+}
+
+/// Whether two rows price the same deal, judged on the base rates they both
+/// publish.
+///
+/// Borrowing a rate across rows that disagree would invent a tariff neither
+/// provider charges: `azure_ai/grok-code-fast-1` bills $3.50/$17.50 per
+/// million with no cache-read rate, while the canonical `xai/` row bills
+/// $0.20/$1.50 with one, so an Azure row must never inherit xAI's cache
+/// price. Rows must also agree on at least one bucket — without a single
+/// shared rate there is no evidence they describe the same deal at all.
+fn quote_same_base_rates(hinted: &ModelPricing, canonical: &ModelPricing) -> bool {
+    let mut shared = false;
+
+    for (hinted_rate, canonical_rate) in [
+        (hinted.input_cost_per_token, canonical.input_cost_per_token),
+        (
+            hinted.output_cost_per_token,
+            canonical.output_cost_per_token,
+        ),
+        (
+            hinted.cache_read_input_token_cost,
+            canonical.cache_read_input_token_cost,
+        ),
+        (
+            hinted.cache_creation_input_token_cost,
+            canonical.cache_creation_input_token_cost,
+        ),
+    ] {
+        let (Some(hinted_rate), Some(canonical_rate)) = (hinted_rate, canonical_rate) else {
+            continue;
+        };
+        if !hinted_rate.is_finite() || !canonical_rate.is_finite() {
+            return false;
+        }
+        if (hinted_rate - canonical_rate).abs() > canonical_rate.abs() * 1e-9 {
+            return false;
+        }
+        shared = true;
+    }
+
+    shared
 }
 
 fn matches_model_or_snapshot(model_id: &str, base: &str) -> bool {
@@ -1428,9 +1552,12 @@ pub fn compute_cost(
     // because upstream LiteLLM does not currently declare 128k or 256k
     // cache-read pricing for any model. If upstream begins emitting
     // those keys, also add matching fields to `ModelPricing`,
-    // `has_any_usable_pricing`, `has_any_valid_above_tier_value`, and
-    // `has_meaningful_tier_support`; otherwise tier walks will silently
-    // undercost long-context cache reads on those models.
+    // `has_any_valid_above_tier_value`, and `has_meaningful_tier_support`;
+    // otherwise tier walks will silently undercost long-context cache reads
+    // on those models. `has_any_usable_pricing` and
+    // `quotes_zero_for_every_published_rate` need no entry here: they read
+    // `ModelPricing::all_rates`, whose exhaustive destructure fails to
+    // compile until the new field is added there.
     let cache_read_cost = tiered_cost(
         cache_read_clamped,
         pricing.cache_read_input_token_cost,
@@ -1816,25 +1943,10 @@ fn is_valid_price_value(value: f64) -> bool {
 /// subscription-based providers like Perplexity) are useless for
 /// pay-per-token cost estimation and should be deprioritized.
 fn has_any_usable_pricing(pricing: &ModelPricing) -> bool {
-    [
-        pricing.input_cost_per_token,
-        pricing.output_cost_per_token,
-        pricing.cache_read_input_token_cost,
-        pricing.cache_creation_input_token_cost,
-        pricing.input_cost_per_token_above_128k_tokens,
-        pricing.input_cost_per_token_above_200k_tokens,
-        pricing.input_cost_per_token_above_256k_tokens,
-        pricing.input_cost_per_token_above_272k_tokens,
-        pricing.output_cost_per_token_above_128k_tokens,
-        pricing.output_cost_per_token_above_200k_tokens,
-        pricing.output_cost_per_token_above_256k_tokens,
-        pricing.output_cost_per_token_above_272k_tokens,
-        pricing.cache_read_input_token_cost_above_200k_tokens,
-        pricing.cache_read_input_token_cost_above_272k_tokens,
-        pricing.cache_creation_input_token_cost_above_200k_tokens,
-    ]
-    .into_iter()
-    .any(|opt| opt.is_some_and(is_valid_price_value))
+    pricing
+        .all_rates()
+        .into_iter()
+        .any(|opt| opt.is_some_and(is_valid_price_value))
 }
 
 fn lookup_result_if_usable(
@@ -3183,6 +3295,81 @@ mod tests {
         );
     }
 
+    // Regression: `gemini-default` is a generic routing label — it names which
+    // router served the request, never which model did — so it must stay
+    // unpriced and be excluded from submission. Its fuzzy-eligible remnant
+    // after prefix stripping is the bare word `default`, which substring-hits
+    // LiteLLM's real `fireworks-ai-default` row.
+    //
+    // That row is priced 0.0/0.0, and `covers_usage` counts an explicit zero as
+    // a real rate, so before `default` joined the FUZZY_BLOCKLIST the label
+    // looked priced and `exclude_generic_unpriced_submission_messages` let it
+    // through — a Google routing label submitted at Fireworks AI's rates.
+    // Verified against the live LiteLLM dataset: `fireworks-ai-default` is a
+    // real key with input and output cost 0.0.
+    #[test]
+    fn fuzzy_match_does_not_resolve_generic_default_token() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "fireworks-ai-default".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0),
+                output_cost_per_token: Some(0.0),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        // The bare token must not resolve.
+        assert!(lookup.lookup("default").is_none());
+        // Nor the routing label that strips down to it, with or without the
+        // provider hint the submission path passes.
+        assert!(lookup.lookup("gemini-default").is_none());
+        assert!(lookup
+            .lookup_with_provider("gemini-default", Some("google"))
+            .is_none());
+
+        // But an EXACT key match is still honored — `fireworks-ai-default` is a
+        // real id in the dataset, not a fuzzy remnant.
+        assert_eq!(
+            lookup.lookup("fireworks-ai-default").unwrap().matched_key,
+            "fireworks-ai-default"
+        );
+    }
+
+    // The blocklist is consulted with the *query* remnant, so blocking
+    // `default` must not stop a query from matching INTO a dataset key that
+    // merely ends in `@default`. LiteLLM ships seven of those
+    // (`vertex_ai/claude-*@default`), and they are ordinary priced models.
+    #[test]
+    fn blocking_the_default_token_still_matches_vertex_default_suffixed_keys() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "vertex_ai/claude-opus-4-7@default".into(),
+            ModelPricing {
+                input_cost_per_token: Some(5e-06),
+                output_cost_per_token: Some(2.5e-05),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        assert_eq!(
+            lookup
+                .lookup("vertex_ai/claude-opus-4-7@default")
+                .unwrap()
+                .matched_key,
+            "vertex_ai/claude-opus-4-7@default"
+        );
+        assert_eq!(
+            lookup
+                .lookup("claude-opus-4-7@default")
+                .unwrap()
+                .matched_key,
+            "vertex_ai/claude-opus-4-7@default"
+        );
+    }
+
     #[test]
     fn incomplete_unhinted_result_does_not_replace_provider_pricing() {
         let mut litellm = HashMap::new();
@@ -3209,14 +3396,16 @@ mod tests {
             reasoning: 0,
         };
 
-        // Neither row covers both populated buckets. Retain the provider row
-        // rather than replacing it with an unhinted row that silently prices
-        // the input bucket at zero.
+        // Neither row covers both populated buckets, and they share no base
+        // bucket that would show they price the same deal, so no rate is
+        // borrowed. Retain the provider row rather than replacing it with an
+        // unhinted row that silently prices the input bucket at zero.
         assert_eq!(
             lookup.calculate_cost_with_provider("gpt-fallback-guard", Some("azure"), &usage),
             1.0
         );
     }
+
     #[test]
     fn test_provider_hint_normalizes_openai_codex_alias() {
         let mut litellm = HashMap::new();
@@ -4043,6 +4232,33 @@ mod tests {
             prefixed.pricing.output_cost_per_token,
             direct.pricing.output_cost_per_token
         );
+    }
+
+    /// Regression (#846): an id carrying both a routing prefix and a tier
+    /// suffix resolved to nothing, so real usage billed $0. Each id below
+    /// resolves once one transformation is applied, but the two were never
+    /// applied together: prefix stripping only retried the terminal segment
+    /// as-is, and suffix stripping splits on `-`, so it never shed the `cx/`.
+    #[test]
+    fn test_routing_prefix_and_tier_suffix_strip_together() {
+        let lookup = create_lookup();
+        let expected = lookup.lookup("gpt-5.5").unwrap();
+
+        for id in [
+            "cx/gpt-5.5-xhigh",
+            "cx/gpt-5.5-high",
+            "cx/gpt-5.5-medium",
+            "cx/gpt-5.5-low",
+        ] {
+            let result = lookup
+                .lookup(id)
+                .unwrap_or_else(|| panic!("{id} must resolve"));
+            assert_eq!(result.matched_key, expected.matched_key, "id: {id}");
+            assert_eq!(
+                result.pricing.input_cost_per_token, expected.pricing.input_cost_per_token,
+                "id: {id}"
+            );
+        }
     }
 
     /// Regression (#831): a dataset key that legitimately keeps its own

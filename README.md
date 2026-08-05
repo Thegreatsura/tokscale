@@ -69,6 +69,8 @@
 | <img width="48px" src=".github/assets/client-droid.png" alt="Droid" /> | [Droid (Factory Droid)](https://factory.ai/) | `~/.factory/sessions/` |
 | <img width="48px" src=".github/assets/client-pi.png" alt="Pi" /> | [Pi](https://github.com/badlogic/pi-mono) | `~/.pi/agent/sessions/` and `~/.omp/agent/sessions/` ([Oh My Pi](https://github.com/can1357/oh-my-pi)) |
 | <img width="48px" src=".github/assets/client-senpi.png" alt="Senpi" /> | [Senpi (OmO Native)](https://github.com/code-yeongyu/senpi) | `~/.senpi/agent/sessions/` (override via `SENPI_CODING_AGENT_DIR`) |
+| <img width="48px" src="https://github.com/getkimchi.png" alt="Kimchi" /> | [Kimchi Coding](https://kimchi.dev/) | `~/.config/kimchi/harness/sessions/` (override via `KIMCHI_CODING_AGENT_DIR`) |
+| <img width="48px" src=".github/assets/client-synthetic.png" alt="Reasonix" /> | [Reasonix](https://github.com/esengine/DeepSeek-Reasonix) | `~/.reasonix/stats/*.jsonl` (override via `REASONIX_STATE_HOME` or `REASONIX_HOME`) |
 | <img width="48px" src=".github/assets/client-kimi.png" alt="Kimi" /> | [Kimi CLI](https://github.com/MoonshotAI/kimi-cli) / [Kimi Code](https://github.com/MoonshotAI/kimi-code) | kimi-cli: `~/.kimi/sessions/` kimi-code: `~/.kimi-code/sessions/` (override via `KIMI_CODE_HOME`) |
 | <img width="48px" src=".github/assets/client-qwen.png" alt="Qwen" /> | [Qwen CLI](https://github.com/QwenLM/qwen-cli) | `~/.qwen/projects/` |
 | <img width="48px" src=".github/assets/client-roocode.png" alt="Roo Code" /> | [Roo Code](https://github.com/RooCodeInc/Roo-Code) | `~/.config/Code/User/globalStorage/rooveterinaryinc.roo-cline/tasks/` (+ server: `~/.vscode-server/data/User/globalStorage/rooveterinaryinc.roo-cline/tasks/`) |
@@ -84,7 +86,7 @@
 | <img width="48px" src="https://github.com/xai-org.png" alt="Grok Build" /> | Grok Build | `$GROK_HOME/sessions/*/*/updates.jsonl` (fallback: `~/.grok/sessions/*/*/updates.jsonl`) |
 | <img width="48px" src=".github/assets/client-zed.webp" alt="Zed Agent" /> | [Zed Agent](https://zed.dev/docs/ai/agent-panel) | `~/.local/share/zed/threads/threads.db` (macOS: `~/Library/Application Support/Zed/threads/threads.db`; Windows: `%LOCALAPPDATA%/Zed/threads/threads.db`; hosted Zed models only, not external ACP agents) |
 | <img width="48px" src="https://github.com/kirodotdev.png" alt="Kiro" /> | Kiro | `~/.kiro/sessions/cli/*.json` (+ `*.jsonl`), `~/.local/share/kiro-cli/data.sqlite3` (macOS: `~/Library/Application Support/kiro-cli/data.sqlite3`), and Kiro IDE globalStorage snapshots (`Kiro/User/globalStorage/kiro.kiroagent`; macOS Application Support, Linux `~/.config/Kiro`, Windows `%APPDATA%\Kiro`) |
-| <img width="48px" src="https://github.com/cline.png" alt="Cline" /> | [Cline](https://github.com/cline/cline) | VS Code globalStorage tasks (Linux: `~/.config/Code/...`; macOS: `~/Library/Application Support/Code/...`; Windows: `%APPDATA%\Code\...`; server: `~/.vscode-server/data/User/globalStorage/saoudrizwan.claude-dev/tasks/`) |
+| <img width="48px" src="https://github.com/cline.png" alt="Cline" /> | [Cline](https://github.com/cline/cline) | VS Code globalStorage tasks (Linux: `~/.config/Code/...`; macOS: `~/Library/Application Support/Code/...`; Windows: `%APPDATA%\Code\...`; server: `~/.vscode-server/data/User/globalStorage/saoudrizwan.claude-dev/tasks/`) + Cline CLI sessions (first available root, in order: `$CLINE_SESSION_DATA_DIR`, `$CLINE_DATA_DIR/sessions/`, `$CLINE_DIR/data/sessions/`, fallback `~/.cline/data/sessions/`; blank/whitespace-only environment values are ignored) |
 | <img width="48px" src="https://github.com/user-attachments/assets/7246e920-f3f8-4b6e-847e-030ae04e86c2" alt="Gajae-Code" /> | [gajae-code (gjc)](https://github.com/Yeachan-Heo/gajae-code) | `~/.gjc/agent/sessions/` (override via `GJC_CODING_AGENT_DIR`, `GJC_CONFIG_DIR`, `PI_CONFIG_DIR`; `$XDG_DATA_HOME/gjc/sessions/` on Linux/macOS) |
 | <img width="48px" src=".github/assets/client-jcode.png" alt="Jcode" /> | [Jcode](https://github.com/1jehuang/jcode) | `~/.jcode/sessions/session_*.json` + `session_*.journal.jsonl` sidecars (override via `JCODE_HOME`) |
 | <img width="48px" src="https://github.com/XiaomiMiMo.png" alt="MiMo Code" /> | [MiMo Code](https://github.com/XiaomiMiMo/MiMo-Code) | `~/.local/share/mimocode/mimocode.db` (XDG data dir; SQLite) |
@@ -149,6 +151,7 @@ In the age of AI-assisted development, **tokens are the new energy**. They power
 - [Development](#development)
   - [Prerequisites](#prerequisites-1)
   - [How to Run](#how-to-run)
+  - [Container Setup](#container-setup)
 - [Supported Platforms](#supported-platforms)
   - [Native Module Targets](#native-module-targets)
   - [Windows Support](#windows-support)
@@ -168,7 +171,7 @@ In the age of AI-assisted development, **tokens are the new energy**. They power
   - GitHub-style contribution graph with configurable color themes
   - Real-time filtering and sorting
   - Zero flicker rendering
-- **Multi-platform support** - Track usage across OpenCode, Claude Code, Codex CLI, Copilot CLI, Cursor IDE, Gemini CLI, Amp, Codebuff, Droid, OpenClaw, Hermes Agent, Pi, Kimi CLI, Qwen CLI, Roo Code, Kilo, Mux, Kilo CLI, Crush, Goose, Antigravity, Antigravity CLI, Zed, Kiro, Trae, Warp/Oz, Cline, Gajae-Code, Grok Build, Jcode, MiMo Code, Command Code, Junie, ZCode, OpenCodeReview, CodeBuddy, WorkBuddy, Devin CLI, Devin Desktop, Augment Code, and Synthetic
+- **Multi-platform support** - Track usage across OpenCode, Claude Code, Codex CLI, Copilot CLI, Cursor IDE, Gemini CLI, Amp, Codebuff, Droid, OpenClaw, Hermes Agent, Pi, Kimchi Coding, Reasonix, Kimi CLI, Qwen CLI, Roo Code, Kilo, Mux, Kilo CLI, Crush, Goose, Antigravity, Antigravity CLI, Zed, Kiro, Trae, Warp/Oz, Cline, Gajae-Code, Grok Build, Jcode, MiMo Code, Command Code, Junie, ZCode, OpenCodeReview, CodeBuddy, WorkBuddy, Devin CLI, Devin Desktop, Augment Code, and Synthetic
 - **Real-time pricing** - Fetches current pricing from LiteLLM with 1-hour disk cache; automatic OpenRouter fallback and Cursor model pricing for newly released models
 - **Detailed breakdowns** - Input, output, cache read/write, and reasoning token tracking
 - **Native Rust core** - All parsing and aggregation done in Rust for 10x faster processing
@@ -379,7 +382,7 @@ tokscale --client synthetic
 tokscale --client opencode,claude --week --json
 ```
 
-Possible values: `opencode`, `claude`, `codex`, `copilot`, `gemini`, `cursor`, `amp`, `codebuff`, `droid`, `openclaw`, `hermes`, `pi`, `kimi`, `qwen`, `roocode`, `kilocode`, `kilo`, `mux`, `crush`, `goose`, `antigravity`, `antigravity-cli`, `zed`, `kiro`, `trae`, `warp`, `cline`, `gjc`, `grok`, `jcode`, `micode`, `commandcode`, `junie`, `zcode`, `opencodereview`, `codebuddy`, `augment`, `synthetic`.
+Possible values: `opencode`, `claude`, `codex`, `copilot`, `gemini`, `cursor`, `amp`, `codebuff`, `droid`, `openclaw`, `hermes`, `pi`, `kimchi`, `kimi`, `qwen`, `roocode`, `kilocode`, `kilo`, `mux`, `crush`, `goose`, `antigravity`, `antigravity-cli`, `zed`, `kiro`, `trae`, `warp`, `cline`, `gjc`, `grok`, `jcode`, `micode`, `commandcode`, `junie`, `zcode`, `opencodereview`, `codebuddy`, `augment`, `synthetic`.
 
 > **Breaking change (v4.0.0):** The per-client boolean flags (`--opencode`, `--claude`, `--codex`, etc.) have been removed and now error. Use the canonical `--client`/`-c` flag instead — e.g. `tokscale --client opencode,claude`.
 
@@ -662,6 +665,10 @@ tokscale trae logout --variant solo
 **Cache location**: `~/.config/tokscale/trae-cache/`
 
 **How it works**: tokscale either decrypts the desktop client's `iCubeAuthInfo://*` blob (`globalStorage/storage.json`) to recover a JWT, or accepts one pasted via `--manual`. It then calls `POST /trae/api/v1/pay/query_user_usage_group_by_session` paginated and stores the raw JSON. Run sync before reports if you want the freshest Trae data.
+
+#### Sync-lock recovery during upgrades
+
+Antigravity and Trae syncs use a legacy-compatible `sync.lock` file to avoid overlapping an older tokscale binary during a rolling upgrade. After a crash or forced stop, that file can remain. Tokscale intentionally fails closed instead of replacing it, because an older binary may still be creating or updating the same path. Confirm that no `tokscale antigravity sync` or `tokscale trae sync` process is active, remove the exact quoted `sync.lock` path printed by the command, then retry. Do not remove the lock while a sync may still be running.
 
 > **Note on pricing**: Trae cost figures are **vendor-reported** — tokscale surfaces the `dollar_float` value returned by Trae's own API rather than recomputing cost from token counts through tokscale's pricing engine. Numbers will match what you see on `trae.ai/account-setting#usage`, not what tokscale would otherwise calculate for the same usage.
 
@@ -1193,10 +1200,10 @@ The generated PNG is optimized for sharing on social media. Share your coding jo
 ### Prerequisites
 
 ```bash
-# Bun (required)
+# Bun (required for JS tooling)
 bun --version
 
-# Rust (for native module)
+# Rust (for native CLI binary)
 rustc --version
 cargo --version
 ```
@@ -1215,6 +1222,73 @@ cd packages/cli && bun src/index.ts
 # Or use legacy CLI mode
 cd packages/cli && bun src/index.ts --light
 ```
+
+<details>
+
+<summary>Run with self-hosting</summary>
+
+### Container Setup
+
+The repo ships a `Makefile` and Docker/Podman Compose stack for a **single-host deployment**. No local Rust or Bun install is required. The stack auto-detects `podman` over `docker`.
+
+**First run** — image builds do not connect to a database. Migrations run when the app container starts, after Compose marks Postgres healthy:
+
+```bash
+make docker/build   # build and tag the frontend image (tokscale:latest)
+make up             # start Postgres and the frontend on http://localhost:3333
+```
+
+`make up` uses the pre-built `tokscale:latest` image — it does not trigger a compose rebuild.
+
+**Subsequent runs** — the image is already built; just start the services:
+
+```bash
+make up
+```
+
+**TUI** — runs independently of the web stack, reading session data directly from host filesystem mounts:
+
+```bash
+make tui/build   # build once
+make tui         # launch
+```
+
+`make tui` runs the container with your current host UID and GID, creates only `~/.config/tokscale` and `~/.cache/tokscale` if needed, and mounts those two directories read-write. Session-data mounts stay read-only, so the container cannot create root-owned files in your client directories. If you call Compose directly instead of `make tui`, set `TOKSCALE_UID=$(id -u)` and `TOKSCALE_GID=$(id -g)` and create those two writable directories yourself.
+
+The default TUI profile deliberately does **not** bind client-data directories: rootful Docker creates a missing bind source as root even for read-only mounts. Opt in only to paths that already exist on your machine, for example:
+
+```bash
+TOKSCALE_UID=$(id -u) TOKSCALE_GID=$(id -g) \
+  docker compose --profile tui run --rm \
+  -v "$HOME/.claude:/home/tokscale/.claude:ro" tui
+```
+
+Add equivalent `-v` flags for the clients you use. This keeps the default command from creating arbitrary host client directories.
+
+**Other common targets:**
+
+```bash
+make down         # stop all services
+make logs/app     # tail app logs
+make help         # full target list
+```
+
+**Custom credentials** — set all four variables together before running `make up`. Compose cannot derive `DATABASE_URL` from the `POSTGRES_*` variables automatically. The hostname `db` is valid only for the app container on the Compose network; do not use it from your host shell or as a Docker build argument:
+
+```bash
+export POSTGRES_USER=myuser
+export POSTGRES_PASSWORD=mypass
+export POSTGRES_DB=mydb
+export DATABASE_URL=postgresql://myuser:mypass@db:5432/mydb
+```
+
+The defaults (`tokscale`/`tokscale`/`tokscale`) are for local dev only.
+
+**Public deployments** — this Compose file binds both ports to loopback and is intended to sit behind a reverse proxy that terminates TLS. Set `APP_URL` to the public HTTPS origin before `make up` (for example, `https://tokscale.example.com`) and configure that URL in the proxy; it drives OAuth redirects, CSRF defaults, canonical metadata, sitemap, and robots at runtime. Keep `DATABASE_SSL=false` only for the bundled local Postgres service. For a managed database, put `DATABASE_URL`, `DATABASE_SSL=require`, `APP_URL`, and optional GitHub OAuth credentials in a protected `.env`/secret store, then run `docker compose -f docker-compose.external-db.yml up -d`. That file has no `db` service or local-database dependency. The sample defaults intentionally do not enable OAuth.
+
+Because one reusable image must emit the runtime `APP_URL` in page metadata and social cards, the root layout is request-dynamic. This intentionally trades full-route static/ISR output for correct per-deployment public origins; data fetches still use their existing cache tags and revalidation policies.
+
+</details>
 
 <details>
 <summary>Advanced Development</summary>
@@ -1377,12 +1451,13 @@ AI coding tools store their session data in cross-platform locations. Most tools
 | Cursor | API sync | API sync | Data fetched from Cursor API and cached as `usage*.csv`; desktop auto-login reads auth only from `state.vscdb`; local `~/.cursor` session data is not parsed |
 | Droid | `~/.factory/` | `%USERPROFILE%\.factory\` | Same path on all platforms |
 | Pi | `~/.pi/` and `~/.omp/` | `%USERPROFILE%\.pi\` and `%USERPROFILE%\.omp\` | Same path on all platforms (supports both Pi and [Oh My Pi](https://github.com/can1357/oh-my-pi)) |
+| Kimchi Coding | `~/.config/kimchi/harness/sessions/` | `%USERPROFILE%\.config\kimchi\harness\sessions\` | Configurable via `KIMCHI_CODING_AGENT_DIR` env var; Pi-compatible JSONL sessions |
 | Kimi CLI | `~/.kimi/` | `%USERPROFILE%\.kimi\` | Same path on all platforms |
 | Kimi Code | `~/.kimi-code/` | `%USERPROFILE%\.kimi-code\` | Same path on all platforms |
 | Qwen CLI | `~/.qwen/` | `%USERPROFILE%\.qwen\` | Same path on all platforms |
 | Roo Code | `~/.config/Code/User/globalStorage/rooveterinaryinc.roo-cline/tasks/` | `%USERPROFILE%\.config\Code\User\globalStorage\rooveterinaryinc.roo-cline\tasks\` | VS Code globalStorage task logs |
 | Kilo | `~/.config/Code/User/globalStorage/kilocode.kilo-code/tasks/` | `%USERPROFILE%\.config\Code\User\globalStorage\kilocode.kilo-code\tasks\` | VS Code globalStorage task logs |
-| Cline | Linux: `~/.config/Code/User/globalStorage/saoudrizwan.claude-dev/tasks/`; macOS: `~/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/tasks/`; server: `~/.vscode-server/data/User/globalStorage/saoudrizwan.claude-dev/tasks/` | `%APPDATA%\Code\User\globalStorage\saoudrizwan.claude-dev\tasks\` | VS Code globalStorage task logs |
+| Cline | Linux: `~/.config/Code/User/globalStorage/saoudrizwan.claude-dev/tasks/`; macOS: `~/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/tasks/`; server: `~/.vscode-server/data/User/globalStorage/saoudrizwan.claude-dev/tasks/`; Cline CLI fallback: `~/.cline/data/sessions/` | `%APPDATA%\Code\User\globalStorage\saoudrizwan.claude-dev\tasks\`; Cline CLI fallback: `%USERPROFILE%\.cline\data\sessions\` | VS Code globalStorage task logs; Cline CLI selects the first available root in order `$CLINE_SESSION_DATA_DIR` → `$CLINE_DATA_DIR/sessions/` → `$CLINE_DIR/data/sessions/` → `~/.cline/data/sessions/`; blank/whitespace-only environment values are ignored |
 | Mux | `~/.mux/sessions/` | `%USERPROFILE%\.mux\sessions\` | Same path on all platforms |
 | Codebuff | `~/.config/manicode/projects/` (+ `manicode-dev`, `manicode-staging`) | `%USERPROFILE%\.config\manicode\projects\` | Override via `CODEBUFF_DATA_DIR` env var |
 | Kilo CLI | `~/.local/share/kilo/` | `%USERPROFILE%\.local\share\kilo\` | Uses `xdg-basedir` like OpenCode |
@@ -1776,6 +1851,15 @@ Cline is the upstream project that Roo Code and Kilo forked from, so it uses the
 - count only `say/api_req_started` events from `ui_messages.json`
 - parse `tokensIn`, `tokensOut`, `cacheReads`, `cacheWrites`, `cost`, and `apiProtocol` from `text` JSON
 - enrich model/agent metadata from sibling `api_conversation_history.json` when available
+
+Cline CLI sessions select the first available root in this order: `$CLINE_SESSION_DATA_DIR` → `$CLINE_DATA_DIR/sessions/` → `$CLINE_DIR/data/sessions/` → fallback `~/.cline/data/sessions/`. Blank or whitespace-only environment values are treated as unset. Within the selected root, sessions are read from `{SESSION_ID}/{SESSION_ID}.messages.json`. Tokscale counts assistant messages with persisted `metrics`, including input/output/cache tokens and provider-reported cost, and uses the sibling session manifest for workspace and fallback model metadata. When environment-root discovery is disabled, only the home fallback is used.
+
+### Kimchi Coding
+
+Location:
+- `~/.config/kimchi/harness/sessions/{ENCODED_WORKSPACE}/*.jsonl` (or `$KIMCHI_CODING_AGENT_DIR/sessions/`)
+
+Kimchi uses the Pi-compatible JSONL session format. Tokscale counts assistant messages with persisted input/output/cache usage and keeps Kimchi as a separate client from Pi, even though the session schema is shared.
 
 ### Mux
 
