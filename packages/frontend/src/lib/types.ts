@@ -7,6 +7,7 @@ export const SUPPORTED_CLIENT_TYPES = [
   "cursor",
   "amp",
   "codebuff",
+  "freebuff",
   "droid",
   "openclaw",
   "hermes",
@@ -44,6 +45,7 @@ export const SUPPORTED_CLIENT_TYPES = [
   "augment",
   "kimchi",
   "reasonix",
+  "prime-agent",
 ] as const;
 
 export type CcMirrorClientType = `cc-mirror/${string}`;

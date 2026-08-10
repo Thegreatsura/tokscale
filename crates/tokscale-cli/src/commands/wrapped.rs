@@ -1450,6 +1450,7 @@ fn client_display_name(client: &str) -> Option<&'static str> {
         s if s == ClientId::Cursor.as_str() => Some("Cursor IDE"),
         "amp" => Some("Amp"),
         "codebuff" => Some("Codebuff"),
+        "freebuff" => Some("Freebuff"),
         "droid" => Some("Droid"),
         "openclaw" => Some("OpenClaw"),
         "hermes" => Some("Hermes Agent"),
@@ -1472,6 +1473,7 @@ fn client_display_name(client: &str) -> Option<&'static str> {
         "junie" => Some("Junie"),
         "augment" => Some("Augment Code"),
         "kimchi" => Some("Kimchi"),
+        "prime-agent" => Some("Prime Agent"),
         "synthetic" => Some("Synthetic"),
         _ => None,
     }
@@ -1491,10 +1493,14 @@ fn client_logo_url(client_name: &str) -> Option<&'static str> {
         "Codebuff" => Some(
             "https://raw.githubusercontent.com/junhoyeo/tokscale/main/.github/assets/client-codebuff.png",
         ),
+        "Freebuff" => Some(
+            "https://raw.githubusercontent.com/junhoyeo/tokscale/main/.github/assets/client-freebuff.png",
+        ),
         "Droid" => Some("https://tokscale.ai/assets/logos/droid.png"),
         "OpenClaw" => Some("https://tokscale.ai/assets/logos/openclaw.png"),
         "Hermes Agent" => Some("https://tokscale.ai/assets/logos/hermes.png"),
         "Pi" => Some("https://tokscale.ai/assets/logos/pi.png"),
+        "Prime Agent" => Some("https://github.com/PrimeIntellect-ai.png"),
         "Kimi CLI" => Some("https://tokscale.ai/assets/logos/kimi.png"),
         "Qwen CLI" => Some("https://tokscale.ai/assets/logos/qwen.png"),
         "Roo Code" => Some("https://tokscale.ai/assets/logos/roocode.png"),
@@ -2444,6 +2450,11 @@ mod tests {
     }
 
     #[test]
+    fn test_client_display_name_prime_agent() {
+        assert_eq!(client_display_name("prime-agent"), Some("Prime Agent"));
+    }
+
+    #[test]
     fn test_client_display_name_kilo() {
         assert_eq!(client_display_name("kilo"), Some("Kilo CLI"));
     }
@@ -2598,10 +2609,28 @@ mod tests {
     }
 
     #[test]
+    fn test_client_logo_url_freebuff() {
+        assert_eq!(
+            client_logo_url("Freebuff"),
+            Some(
+                "https://raw.githubusercontent.com/junhoyeo/tokscale/main/.github/assets/client-freebuff.png"
+            )
+        );
+    }
+
+    #[test]
     fn test_client_logo_url_pi() {
         assert_eq!(
             client_logo_url("Pi"),
             Some("https://tokscale.ai/assets/logos/pi.png")
+        );
+    }
+
+    #[test]
+    fn test_client_logo_url_prime_agent() {
+        assert_eq!(
+            client_logo_url("Prime Agent"),
+            Some("https://github.com/PrimeIntellect-ai.png")
         );
     }
 

@@ -1077,6 +1077,9 @@ pub enum ClientFilter {
     Augment,
     Kimchi,
     Reasonix,
+    #[value(name = "prime-agent")]
+    PrimeAgent,
+    Freebuff,
     Synthetic,
 }
 
@@ -1130,6 +1133,8 @@ impl ClientFilter {
             Self::Augment => "augment",
             Self::Kimchi => "kimchi",
             Self::Reasonix => "reasonix",
+            Self::PrimeAgent => "prime-agent",
+            Self::Freebuff => "freebuff",
             Self::Synthetic => "synthetic",
         }
     }
@@ -1186,6 +1191,8 @@ impl ClientFilter {
             Self::Augment => Some(ClientId::Augment),
             Self::Kimchi => Some(ClientId::Kimchi),
             Self::Reasonix => Some(ClientId::Reasonix),
+            Self::PrimeAgent => Some(ClientId::PrimeAgent),
+            Self::Freebuff => Some(ClientId::Freebuff),
             Self::Synthetic => None,
         }
     }
@@ -1238,6 +1245,8 @@ impl ClientFilter {
             ClientId::Augment => Self::Augment,
             ClientId::Kimchi => Self::Kimchi,
             ClientId::Reasonix => Self::Reasonix,
+            ClientId::PrimeAgent => Self::PrimeAgent,
+            ClientId::Freebuff => Self::Freebuff,
         }
     }
 
@@ -3894,6 +3903,7 @@ fn capitalize_client(client: &str) -> String {
         "gemini" => "Gemini".to_string(),
         "amp" => "Amp".to_string(),
         "codebuff" => "Codebuff".to_string(),
+        "freebuff" => "Freebuff".to_string(),
         "droid" => "Droid".to_string(),
         "crush" => "Crush".to_string(),
         "openclaw" => "openclaw".to_string(),
@@ -3915,6 +3925,7 @@ fn capitalize_client(client: &str) -> String {
         "senpi" => "Senpi (OmO Native)".to_string(),
         "augment" => "Augment Code".to_string(),
         "kimchi" => "Kimchi".to_string(),
+        "prime-agent" => "Prime Agent".to_string(),
         other => other.to_string(),
     }
 }
@@ -4026,9 +4037,20 @@ fn run_clients_command(json: bool, home_dir: Option<String>) -> Result<()> {
     let clients: Vec<ClientRow> =
         ClientId::iter()
             .map(|client| {
-                let sessions_path = client
-                    .data()
-                    .resolve_path_with_env_strategy(&home_dir_str, use_env_roots);
+                let prime_agent_roots = (client == ClientId::PrimeAgent).then(|| {
+                    tokscale_core::scanner::prime_agent_session_roots_with_env_strategy(
+                        &home_dir_str,
+                        use_env_roots,
+                    )
+                });
+                let sessions_path = prime_agent_roots
+                    .as_ref()
+                    .map(|roots| roots[0].to_string_lossy().into_owned())
+                    .unwrap_or_else(|| {
+                        client
+                            .data()
+                            .resolve_path_with_env_strategy(&home_dir_str, use_env_roots)
+                    });
                 let sessions_path_exists = Path::new(&sessions_path).exists();
                 let mut additional_paths: Vec<AdditionalPath> = built_in_extra_paths
                     .iter()
@@ -4038,6 +4060,12 @@ fn run_clients_command(json: bool, home_dir: Option<String>) -> Result<()> {
                         exists: path.exists(),
                     })
                     .collect();
+                if let Some(roots) = &prime_agent_roots {
+                    additional_paths.push(AdditionalPath {
+                        path: roots[1].to_string_lossy().into_owned(),
+                        exists: roots[1].exists(),
+                    });
+                }
                 if client == ClientId::Zcode {
                     let path = home_dir.join(".zcode/cli/db/db.sqlite");
                     additional_paths.push(AdditionalPath {

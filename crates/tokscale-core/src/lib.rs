@@ -1184,6 +1184,12 @@ fn parse_all_messages_with_pricing_with_env_strategy(
     let include_synthetic = include_all || clients.iter().any(|c| c == "synthetic");
     let include_devin_cli = include_synthetic || clients.iter().any(|c| c == "devin-cli");
     let include_devin_desktop = include_synthetic || clients.iter().any(|c| c == "devin-desktop");
+    // Freebuff and Codebuff share the manicode scan bucket in the scanner (the
+    // two parsers partition the same file set). Each product parses and counts
+    // only when it was actually requested, so a codebuff-only filter cannot
+    // pick up estimated Freebuff rows and vice versa.
+    let include_codebuff = include_all || clients.iter().any(|c| c == "codebuff");
+    let include_freebuff = include_all || clients.iter().any(|c| c == "freebuff");
 
     // Parse OpenCode: prefer SQLite, collapse forked SQLite history there, then
     // suppress legacy JSON overlap by message identity.
@@ -1588,20 +1594,53 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         }
     }
 
-    let codebuff_outcomes: Vec<CachedParseOutcome> = scan_result
-        .get(ClientId::Codebuff)
-        .par_iter()
-        .map(|path| {
-            load_or_parse_source(
-                message_cache::CacheIdentity::for_client(ClientId::Codebuff),
-                path,
-                &source_cache,
-                pricing,
-                sessions::codebuff::parse_codebuff_file,
-            )
-        })
-        .collect();
+    let codebuff_outcomes: Vec<CachedParseOutcome> = if include_codebuff {
+        scan_result
+            .get(ClientId::Codebuff)
+            .par_iter()
+            .map(|path| {
+                load_or_parse_source(
+                    message_cache::CacheIdentity::for_client(ClientId::Codebuff),
+                    path,
+                    &source_cache,
+                    pricing,
+                    sessions::codebuff::parse_codebuff_file,
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     for outcome in codebuff_outcomes {
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
+    // Freebuff shares Codebuff's ~/.config/manicode scan (same layout, same
+    // directory — a separate product built on the same runtime). The two
+    // parsers partition the shared file set under distinct cache identities:
+    // codebuff emits chats with authoritative usage, freebuff emits estimated
+    // rows for the rest.
+    let freebuff_outcomes: Vec<CachedParseOutcome> = if include_freebuff {
+        scan_result
+            .get(ClientId::Codebuff)
+            .par_iter()
+            .map(|path| {
+                load_or_parse_source(
+                    message_cache::CacheIdentity::for_client(ClientId::Freebuff),
+                    path,
+                    &source_cache,
+                    pricing,
+                    sessions::freebuff::parse_freebuff_file,
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    for outcome in freebuff_outcomes {
         all_messages.extend(outcome.messages);
         if let Some(entry) = outcome.cache_entry {
             source_cache.insert(entry);
@@ -1668,6 +1707,41 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             source_cache.insert(entry);
         }
     }
+
+    let prime_agent_outcomes: Vec<(PathBuf, CachedParseOutcome)> = scan_result
+        .get(ClientId::PrimeAgent)
+        .par_iter()
+        .map(|path| {
+            (
+                path.clone(),
+                load_or_parse_source(
+                    message_cache::CacheIdentity::for_client(ClientId::PrimeAgent),
+                    path,
+                    &source_cache,
+                    pricing,
+                    sessions::prime_agent::parse_prime_agent_file,
+                ),
+            )
+        })
+        .collect();
+    let mut prime_agent_messages = Vec::new();
+    let mut prime_agent_accounting = Vec::new();
+    for (path, outcome) in prime_agent_outcomes {
+        prime_agent_accounting.push(sessions::prime_agent::analyze_prime_agent_accounting(
+            &path,
+            &outcome.messages,
+        ));
+        prime_agent_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+    let mut prime_agent_messages = sessions::prime_agent::reconcile_prime_agent_messages(
+        prime_agent_messages,
+        &prime_agent_accounting,
+    );
+    apply_pricing_to_messages(&mut prime_agent_messages, pricing);
+    all_messages.extend(prime_agent_messages);
 
     let kimchi_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Kimchi)
@@ -3027,10 +3101,25 @@ fn build_graph_from_messages(
     Ok(result)
 }
 
-const GEMINI_DEFAULT_UNPRICED_REASON: &str =
+const ROUTING_LABEL_UNPRICED_REASON: &str =
     "generic routing label has no authoritative model-to-price mapping";
 const MISSING_MODEL_PRICING_REASON: &str = "no authoritative model-to-price mapping";
 const INCOMPLETE_MODEL_PRICING_REASON: &str = "pricing does not cover every populated token bucket";
+
+/// Routing labels name the router that served the request, never the model
+/// that answered it, so they have no authoritative model-to-price mapping.
+/// This defers to `lookup::is_routing_label` (lookup.rs) rather than restating
+/// its `ROUTING_LABELS` list: the reason a row is excluded has to name the same
+/// labels the resolver refuses at its top, and a second copy of the list would
+/// drift the moment a label is added to one side. Trimming matches for the same
+/// reason — the resolver trims, so ` auto ` must not read as a routing label
+/// here while being refused there. The historical `gemini-default` pair is
+/// provider-scoped and lives only in this reason, not in the resolver gate.
+fn is_generic_routing_label(provider_id: &str, model_id: &str) -> bool {
+    (provider_id.eq_ignore_ascii_case("google")
+        && model_id.trim().eq_ignore_ascii_case("gemini-default"))
+        || pricing::lookup::is_routing_label(model_id)
+}
 
 fn has_positive_token_usage(tokens: &TokenBreakdown) -> bool {
     tokens.input > 0
@@ -3062,11 +3151,18 @@ fn exclude_unpriced_submission_messages(
             );
 
         if is_unpriced {
-            let reason = if message.provider_id.eq_ignore_ascii_case("google")
-                && message.model_id.eq_ignore_ascii_case("gemini-default")
-            {
-                GEMINI_DEFAULT_UNPRICED_REASON
-            } else if pricing
+            // Resolution is consulted before the routing-label reason, not
+            // after. `custom-pricing.json` is read first by
+            // `lookup_with_source_and_provider`, and stating a rate for `auto`
+            // there is the user asserting the label does name something for
+            // them — the escape hatch `lookup::ROUTING_LABELS` documents.
+            // Checking the label first told that user their label "has no
+            // authoritative model-to-price mapping" while their own file held
+            // one, hiding the fixable gap (a bucket their entry omits).
+            // Nothing regresses for unpriced labels: the resolver refuses
+            // routing labels outright, so with no custom entry this returns
+            // None and the routing-label reason still applies.
+            let reason = if pricing
                 .lookup_with_source_and_provider(
                     &message.model_id,
                     None,
@@ -3075,6 +3171,8 @@ fn exclude_unpriced_submission_messages(
                 .is_some()
             {
                 INCOMPLETE_MODEL_PRICING_REASON
+            } else if is_generic_routing_label(&message.provider_id, &message.model_id) {
+                ROUTING_LABEL_UNPRICED_REASON
             } else {
                 MISSING_MODEL_PRICING_REASON
             };
@@ -3431,6 +3529,12 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     let include_synthetic = include_all || clients.iter().any(|c| c == "synthetic");
     let include_devin_cli = include_synthetic || clients.iter().any(|c| c == "devin-cli");
     let include_devin_desktop = include_synthetic || clients.iter().any(|c| c == "devin-desktop");
+    // Freebuff and Codebuff share the manicode scan bucket in the scanner (the
+    // two parsers partition the same file set). Each product parses and counts
+    // only when it was actually requested, so a codebuff-only filter cannot
+    // pick up estimated Freebuff rows and vice versa.
+    let include_codebuff = include_all || clients.iter().any(|c| c == "codebuff");
+    let include_freebuff = include_all || clients.iter().any(|c| c == "freebuff");
 
     let scan_result = scanner::scan_all_clients_with_scanner_settings(
         &home_dir,
@@ -3628,19 +3732,43 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     counts.set(ClientId::Amp, amp_count);
     messages.extend(amp_msgs);
 
-    let codebuff_msgs: Vec<ParsedMessage> = scan_result
-        .get(ClientId::Codebuff)
-        .par_iter()
-        .flat_map(|path| {
-            sessions::codebuff::parse_codebuff_file(path)
-                .into_iter()
-                .map(|msg| unified_to_parsed(&msg))
-                .collect::<Vec<_>>()
-        })
-        .collect();
+    let codebuff_msgs: Vec<ParsedMessage> = if include_codebuff {
+        scan_result
+            .get(ClientId::Codebuff)
+            .par_iter()
+            .flat_map(|path| {
+                sessions::codebuff::parse_codebuff_file(path)
+                    .into_iter()
+                    .map(|msg| unified_to_parsed(&msg))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let codebuff_count = codebuff_msgs.len() as i32;
     counts.set(ClientId::Codebuff, codebuff_count);
     messages.extend(codebuff_msgs);
+
+    // Freebuff shares the manicode scan; the estimated parser runs over the
+    // same file set (see the main dispatch block above).
+    let freebuff_msgs: Vec<ParsedMessage> = if include_freebuff {
+        scan_result
+            .get(ClientId::Codebuff)
+            .par_iter()
+            .flat_map(|path| {
+                sessions::freebuff::parse_freebuff_file(path)
+                    .into_iter()
+                    .map(|msg| unified_to_parsed(&msg))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let freebuff_count = freebuff_msgs.len() as i32;
+    counts.set(ClientId::Freebuff, freebuff_count);
+    messages.extend(freebuff_msgs);
 
     let droid_msgs: Vec<ParsedMessage> = scan_result
         .get(ClientId::Droid)
@@ -3683,6 +3811,36 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     let pi_count = pi_msgs.len() as i32;
     counts.set(ClientId::Pi, pi_count);
     messages.extend(pi_msgs);
+
+    let prime_agent_files: Vec<(
+        Vec<UnifiedMessage>,
+        sessions::prime_agent::PrimeFileAccounting,
+    )> = scan_result
+        .get(ClientId::PrimeAgent)
+        .par_iter()
+        .map(|path| {
+            let messages = sessions::prime_agent::parse_prime_agent_file(path);
+            let accounting = sessions::prime_agent::analyze_prime_agent_accounting(path, &messages);
+            (messages, accounting)
+        })
+        .collect();
+    let mut prime_agent_msgs_raw = Vec::new();
+    let mut prime_agent_accounting = Vec::new();
+    for (file_messages, file_accounting) in prime_agent_files {
+        prime_agent_msgs_raw.extend(file_messages);
+        prime_agent_accounting.push(file_accounting);
+    }
+    let prime_agent_msgs: Vec<ParsedMessage> =
+        sessions::prime_agent::reconcile_prime_agent_messages(
+            prime_agent_msgs_raw,
+            &prime_agent_accounting,
+        )
+        .into_iter()
+        .map(|message| unified_to_parsed(&message))
+        .collect();
+    let prime_agent_count = prime_agent_msgs.len() as i32;
+    counts.set(ClientId::PrimeAgent, prime_agent_count);
+    messages.extend(prime_agent_msgs);
 
     let kimchi_msgs_raw: Vec<UnifiedMessage> = scan_result
         .get(ClientId::Kimchi)
@@ -4383,13 +4541,14 @@ mod tests {
     use super::{
         aggregate_model_usage_entries, apply_pricing_if_available, build_graph_from_messages,
         dedupe_latest_trae_messages, filter_messages_for_report,
-        generate_graph_with_loaded_pricing, get_home_dir_string, message_cache,
-        normalize_model_for_grouping, parse_all_messages_with_pricing_with_env_strategy,
-        parse_local_clients, parsed_to_unified, paths, pricing, retain_for_requested_clients,
-        scanner, select_local_parse_pricing, unified_to_parsed, validate_priced_messages, ClientId,
-        GraphPricingRequirement, GroupBy, LocalParseOptions, ReportOptions, TokenBreakdown,
-        UnifiedMessage, UnpricedSubmissionExclusion, GEMINI_DEFAULT_UNPRICED_REASON,
-        INCOMPLETE_MODEL_PRICING_REASON, MISSING_MODEL_PRICING_REASON, UNKNOWN_WORKSPACE_LABEL,
+        generate_graph_with_loaded_pricing, get_home_dir_string, is_generic_routing_label,
+        message_cache, normalize_model_for_grouping,
+        parse_all_messages_with_pricing_with_env_strategy, parse_local_clients, parsed_to_unified,
+        paths, pricing, retain_for_requested_clients, scanner, select_local_parse_pricing,
+        unified_to_parsed, validate_priced_messages, ClientId, GraphPricingRequirement, GroupBy,
+        LocalParseOptions, ReportOptions, TokenBreakdown, UnifiedMessage,
+        UnpricedSubmissionExclusion, INCOMPLETE_MODEL_PRICING_REASON, MISSING_MODEL_PRICING_REASON,
+        ROUTING_LABEL_UNPRICED_REASON, UNKNOWN_WORKSPACE_LABEL,
     };
     use serial_test::serial;
     use std::collections::{HashMap, HashSet};
@@ -6407,6 +6566,96 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn test_parse_local_clients_codebuff_freebuff_filters_stay_isolated() {
+        // Freebuff and Codebuff share the manicode scan bucket (parser
+        // partition the same file set). A single-client filter must not pick
+        // up the other product's rows: codebuff-only must produce clean code
+        // rows/zero freebuff count, and vice versa.
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+
+        let manicode = source_home.path().join(".config").join("manicode");
+        // An authoritative Codebuff chat: assistant message carries usage.
+        let codebuff_chat = manicode
+            .join("projects")
+            .join("proj")
+            .join("chats")
+            .join("2026-08-07T05-21-00.000Z");
+        std::fs::create_dir_all(&codebuff_chat).unwrap();
+        std::fs::write(
+            codebuff_chat.join("chat-messages.json"),
+            r#"[
+                { "variant": "user", "content": "hi", "timestamp": "2026-08-07T05:21:00.000Z" },
+                { "variant": "ai", "timestamp": "2026-08-07T05:22:00.000Z",
+                  "metadata": { "model": "claude-sonnet-4-20250514",
+                                "usage": { "inputTokens": 500, "outputTokens": 200 } } }
+            ]"#,
+        )
+        .unwrap();
+        // A Freebuff chat: marked by its `base2-free*` root agent id, with no
+        // authoritative usage — only estimated text.
+        let freebuff_chat = manicode
+            .join("projects")
+            .join("proj")
+            .join("chats")
+            .join("2026-08-07T13-00-00.000Z");
+        std::fs::create_dir_all(&freebuff_chat).unwrap();
+        std::fs::write(
+            freebuff_chat.join("chat-messages.json"),
+            r#"[
+                { "variant": "user", "content": "hello world", "timestamp": "2026-08-07T13:00:00.000Z" },
+                { "variant": "ai", "timestamp": "2026-08-07T13:01:00.000Z", "blocks": [ { "content": "Hello!" } ],
+                  "metadata": { "runState": { "sessionState": { "mainAgentState": {
+                      "agentType": "base2-free-deepseek-flash" } } } } }
+            ]"#,
+        )
+        .unwrap();
+
+        let options_for = |clients: Vec<String>| LocalParseOptions {
+            home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(clients),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings::default(),
+        };
+
+        // codebuff-only: authoritative Codebuff row, zero estimated Freebuff rows.
+        let codebuff_only = parse_local_clients(options_for(vec!["codebuff".to_string()])).unwrap();
+        assert_eq!(codebuff_only.counts.get(ClientId::Codebuff), 1);
+        assert_eq!(codebuff_only.counts.get(ClientId::Freebuff), 0);
+        assert!(
+            codebuff_only
+                .messages
+                .iter()
+                .all(|m| m.client == "codebuff"),
+            "all reported rows must be codebuff, got {:?}",
+            codebuff_only
+                .messages
+                .iter()
+                .map(|m| &m.client)
+                .collect::<Vec<_>>()
+        );
+
+        // freebuff-only → estimated Freebuff rows, zero Codebuff rows.
+        let free_only = parse_local_clients(options_for(vec!["freebuff".to_string()])).unwrap();
+        assert_eq!(free_only.counts.get(ClientId::Freebuff), 1);
+        assert_eq!(free_only.counts.get(ClientId::Codebuff), 0);
+        assert!(
+            free_only.messages.iter().all(|m| m.client == "freebuff"),
+            "all reported rows must be freebuff, got {:?}",
+            free_only
+                .messages
+                .iter()
+                .map(|m| &m.client)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn test_parse_all_messages_with_pricing_includes_opencodereview() {
         // Regression: opencodereview declares submit_default, and
         // parse_local_clients has always parsed it, so `tokscale report`
@@ -8382,7 +8631,199 @@ mod tests {
                 model_id: "gemini-default".to_string(),
                 message_count: 7,
                 total_tokens: 18,
-                reason: GEMINI_DEFAULT_UNPRICED_REASON,
+                reason: ROUTING_LABEL_UNPRICED_REASON,
+            }
+        );
+    }
+
+    #[test]
+    fn submission_excludes_unpriced_auto_routing_label() {
+        // `auto` is the unknown-model label Kiro emits and the default-model
+        // label Cursor/Copilot record in usage rows. A models.dev `morph/auto`
+        // paid row exists, so before the resolver refused routing labels the
+        // bare label resolved to it and slipped through submission at morph's
+        // rates (#1062). The fixture quotes a cache-read rate precisely so the
+        // pre-fix fallback covers all three populated buckets (7 input, 11
+        // cache-read, 0 output) and submits the row — without it, the row
+        // would fail coverage on the missing cache rate and the test would
+        // pass even with the bug. The label must instead be excluded with the
+        // routing-label reason.
+        let mut models_dev = HashMap::new();
+        models_dev.insert(
+            "morph/auto".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(8.5e-7),
+                output_cost_per_token: Some(1.55e-6),
+                cache_read_input_token_cost: Some(1.6e-7),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new_with_custom_and_models_dev(
+            pricing::custom::CustomPricing::default(),
+            HashMap::new(),
+            HashMap::new(),
+            models_dev,
+        );
+        let mut auto = UnifiedMessage::new(
+            "kiro",
+            "auto",
+            "amazon-bedrock",
+            "generic",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input: 7,
+                cache_read: 11,
+                ..Default::default()
+            },
+            0.0,
+        );
+        auto.message_count = 7;
+
+        let graph = build_graph_from_messages(
+            vec![auto],
+            Some(&pricing),
+            GraphPricingRequirement::Submission,
+            std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
+        )
+        .expect("routing label must not abort submission");
+
+        assert_eq!(graph.summary.total_tokens, 0);
+        assert_eq!(graph.unpriced_submission_exclusions.len(), 1);
+        assert_eq!(
+            graph.unpriced_submission_exclusions[0],
+            UnpricedSubmissionExclusion {
+                provider_id: "amazon-bedrock".to_string(),
+                model_id: "auto".to_string(),
+                message_count: 7,
+                total_tokens: 18,
+                reason: ROUTING_LABEL_UNPRICED_REASON,
+            }
+        );
+    }
+
+    #[test]
+    fn whitespace_padded_routing_label_is_classified_the_same_by_resolver_and_reason() {
+        // `lookup::is_routing_label` trims before comparing, so the resolver
+        // refuses to price ` auto `. The exclusion reason has to agree, or the
+        // row is reported as having no model-to-price mapping while the reason
+        // it is unpriced is that it names a router. Both paths now read the
+        // same list, so a label added to `lookup::ROUTING_LABELS` cannot drift
+        // out of the reason.
+        assert_eq!(
+            crate::pricing::lookup::is_routing_label(" auto "),
+            is_generic_routing_label("amazon-bedrock", " auto "),
+            "resolver and exclusion reason must classify a padded routing label alike"
+        );
+
+        // The models.dev `morph/auto` row is fully priced, so if the resolver
+        // did not refuse the padded label the row would submit at Morph rates
+        // (#1062) instead of reaching the exclusion path at all.
+        let mut models_dev = HashMap::new();
+        models_dev.insert(
+            "morph/auto".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(8.5e-7),
+                output_cost_per_token: Some(1.55e-6),
+                cache_read_input_token_cost: Some(1.6e-7),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new_with_custom_and_models_dev(
+            pricing::custom::CustomPricing::default(),
+            HashMap::new(),
+            HashMap::new(),
+            models_dev,
+        );
+        let mut padded = UnifiedMessage::new(
+            "kiro",
+            " auto ",
+            "amazon-bedrock",
+            "generic",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input: 7,
+                cache_read: 11,
+                ..Default::default()
+            },
+            0.0,
+        );
+        padded.message_count = 7;
+
+        let graph = build_graph_from_messages(
+            vec![padded],
+            Some(&pricing),
+            GraphPricingRequirement::Submission,
+            std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
+        )
+        .expect("routing label must not abort submission");
+
+        assert_eq!(graph.summary.total_tokens, 0);
+        assert_eq!(graph.unpriced_submission_exclusions.len(), 1);
+        assert_eq!(
+            graph.unpriced_submission_exclusions[0].reason, ROUTING_LABEL_UNPRICED_REASON,
+            "padded routing label must report the routing-label reason"
+        );
+    }
+
+    #[test]
+    fn custom_priced_routing_label_reports_incomplete_pricing_not_missing_mapping() {
+        // A `custom-pricing.json` entry for a routing label is the user
+        // stating what their router actually costs them — the escape hatch
+        // `ROUTING_LABELS` documents. Telling that user the label "has no
+        // authoritative model-to-price mapping" contradicts the mapping they
+        // just wrote. Here the custom entry quotes an input rate but no cache
+        // rate, so the row still fails coverage; the reason must name the gap
+        // that is actually fixable (the missing cache-read rate), not deny the
+        // mapping exists.
+        let mut custom_models = HashMap::new();
+        custom_models.insert(
+            "auto".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(3e-6),
+                output_cost_per_token: Some(1.5e-5),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new_with_custom(
+            pricing::custom::CustomPricing::from_models(custom_models),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let mut auto = UnifiedMessage::new(
+            "kiro",
+            "auto",
+            "amazon-bedrock",
+            "generic",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input: 7,
+                cache_read: 11,
+                ..Default::default()
+            },
+            0.0,
+        );
+        auto.message_count = 7;
+
+        let graph = build_graph_from_messages(
+            vec![auto],
+            Some(&pricing),
+            GraphPricingRequirement::Submission,
+            std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
+        )
+        .expect("routing label must not abort submission");
+
+        assert_eq!(graph.unpriced_submission_exclusions.len(), 1);
+        assert_eq!(
+            graph.unpriced_submission_exclusions[0],
+            UnpricedSubmissionExclusion {
+                provider_id: "amazon-bedrock".to_string(),
+                model_id: "auto".to_string(),
+                message_count: 7,
+                total_tokens: 18,
+                reason: INCOMPLETE_MODEL_PRICING_REASON,
             }
         );
     }
@@ -9112,6 +9553,109 @@ mod tests {
 
         let expected = 1.75 + 1.4 + 0.00875;
         assert!((msg.cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_apply_pricing_if_available_prices_minimax_m3_bare_id_via_alias() {
+        // #935: routers report MiniMax M3 as the bare lowercase id `minimax-m3`,
+        // which is not a key in any dataset. When the session record carries no
+        // usable provider hint — parsers emit `unknown` for an absent provider
+        // and `normalize_provider_hint` drops it — nothing pins the lookup to
+        // MiniMax's catalog, so the bare id falls through to model-part/fuzzy
+        // matching over every row whose model part is `minimax-m3`.
+        //
+        // models.dev publishes that model part under dozens of third parties,
+        // several of them at 0.0/0.0 (`kenari/minimax-m3` and
+        // `nvidia/minimaxai/minimax-m3` both do today). Electing one of those
+        // prices real usage at exactly $0 — which is what "pricing missing"
+        // in #935 looks like from the user's side, since a row of explicit
+        // zeros still counts as "priced" downstream. The alias must pin the
+        // canonical first-party `minimax/MiniMax-M3` key instead.
+        let mut litellm = HashMap::new();
+        // Real first-party rates.
+        litellm.insert(
+            "minimax/MiniMax-M3".into(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(3e-7),
+                output_cost_per_token: Some(1.2e-6),
+                ..Default::default()
+            },
+        );
+        // The hosted reseller row that ships alongside it, at a deliberately
+        // far-apart rate so electing it could not be mistaken for the
+        // first-party result.
+        litellm.insert(
+            "fireworks_ai/minimax-m3".into(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(3e-5),
+                output_cost_per_token: Some(1.2e-4),
+                ..Default::default()
+            },
+        );
+        // The zero-cost third-party row that the bare id actually elects
+        // without the alias.
+        let mut models_dev = HashMap::new();
+        models_dev.insert(
+            "kenari/minimax-m3".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.0),
+                output_cost_per_token: Some(0.0),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new_with_custom_and_models_dev(
+            Default::default(),
+            litellm,
+            HashMap::new(),
+            models_dev,
+        );
+
+        // Fixture guards: both competing rows must really be in the dataset and
+        // resolvable, or this test would pass for the wrong reason.
+        let competing_zero = pricing
+            .lookup_with_source_and_provider("kenari/minimax-m3", None, None)
+            .expect("competing zero-cost models.dev row must be present");
+        assert_eq!(competing_zero.matched_key, "kenari/minimax-m3");
+        assert_eq!(competing_zero.pricing.input_cost_per_token, Some(0.0));
+        let competing_hosted = pricing
+            .lookup_with_source_and_provider("minimax-m3", None, Some("fireworks_ai"))
+            .expect("competing fireworks_ai row must resolve under its own hint");
+        assert_eq!(competing_hosted.matched_key, "fireworks_ai/minimax-m3");
+
+        // The behavior the alias exists to guarantee: the bare id resolves to
+        // the canonical first-party key, not to either competitor.
+        let resolved = pricing
+            .lookup_with_source_and_provider("minimax-m3", None, Some("unknown"))
+            .expect("bare `minimax-m3` must resolve");
+        assert_eq!(resolved.matched_key, "minimax/MiniMax-M3");
+        assert_eq!(resolved.source, "LiteLLM");
+
+        let mut msg = UnifiedMessage::new(
+            "ollama",
+            "minimax-m3",
+            "unknown",
+            "session-1",
+            1_776_000_000_000,
+            TokenBreakdown {
+                input: 1_000_000,
+                output: 100_000,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            0.0,
+        );
+
+        apply_pricing_if_available(&mut msg, Some(&pricing));
+
+        // First-party: 1_000_000 * 3e-7 + 100_000 * 1.2e-6 = 0.42.
+        // The zero-cost row would give 0.0; the fireworks row would give 42.0.
+        let expected = 1_000_000.0 * 3e-7 + 100_000.0 * 1.2e-6;
+        assert!(
+            (msg.cost - expected).abs() < 1e-12,
+            "expected first-party minimax/MiniMax-M3 cost {expected}, got {}",
+            msg.cost
+        );
     }
 
     #[test]
@@ -10675,6 +11219,332 @@ mod tests {
         };
         assert!(dates.contains(&local_date(thread_created + 2000)));
         assert!(dates.contains(&local_date(ledger_timestamp)));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_prime_agent_forked_parent_and_rlm_child_are_counted_once() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let sessions = source_home.path().join(".prime/agent/sessions");
+        let child_dir = source_home
+            .path()
+            .join(".prime/agent/session-artifacts/z-original/sub-child");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::create_dir_all(&child_dir).unwrap();
+
+        let original_path = sessions.join("z-original.jsonl");
+        std::fs::write(
+            sessions.join("a-fork.jsonl"),
+            format!(
+                r#"{{"type":"session","version":3,"id":"fork","timestamp":"2026-08-08T00:00:00.000Z","cwd":"/tmp/project","parentSession":{},"rlmDepth":0}}
+{{"type":"message","id":"parent","parentId":null,"timestamp":"2026-08-08T00:00:01.000Z","message":{{"role":"assistant","provider":"anthropic","model":"claude-opus-5","responseId":"parent-response","usage":{{"input":150,"output":70,"cacheRead":20,"cacheWrite":10,"totalTokens":250}}}}}}
+{{"type":"child_usage_attributed","id":"usage-1","parentId":"parent","timestamp":"2026-08-08T00:00:02.000Z","targetId":"parent","childUsage":{{"input":30,"output":10,"cacheRead":0,"cacheWrite":0,"totalTokens":40}},"aggregateUsage":{{"input":130,"output":60,"cacheRead":20,"cacheWrite":10,"totalTokens":220}},"origin":"spawn_task"}}
+{{"type":"child_usage_attributed","id":"usage-2","parentId":"usage-1","timestamp":"2026-08-08T00:00:03.000Z","targetId":"parent","childUsage":{{"input":20,"output":10,"cacheRead":0,"cacheWrite":0,"totalTokens":30}},"aggregateUsage":{{"input":150,"output":70,"cacheRead":20,"cacheWrite":10,"totalTokens":250}},"origin":"spawn_task"}}
+"#,
+                paths::json_path_literal(&original_path)
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &original_path,
+            r#"{"type":"session","version":3,"id":"original","timestamp":"2026-08-08T00:00:00.000Z","cwd":"/tmp/project","rlmDepth":0}
+{"type":"message","id":"parent","parentId":null,"timestamp":"2026-08-08T00:00:01.000Z","message":{"role":"assistant","provider":"anthropic","model":"claude-opus-5","responseId":"parent-response","usage":{"input":100,"output":50,"cacheRead":20,"cacheWrite":10,"totalTokens":180}}}
+{"type":"child_usage_attributed","id":"usage-1","parentId":"parent","timestamp":"2026-08-08T00:00:02.000Z","targetId":"parent","childUsage":{"input":30,"output":10,"cacheRead":0,"cacheWrite":0,"totalTokens":40},"aggregateUsage":{"input":130,"output":60,"cacheRead":20,"cacheWrite":10,"totalTokens":220},"origin":"spawn_task"}
+{"type":"child_usage_attributed","id":"usage-2","parentId":"usage-1","timestamp":"2026-08-08T00:00:03.000Z","targetId":"parent","childUsage":{"input":20,"output":10,"cacheRead":0,"cacheWrite":0,"totalTokens":30},"aggregateUsage":{"input":150,"output":70,"cacheRead":20,"cacheWrite":10,"totalTokens":250},"origin":"spawn_task"}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            child_dir.join("child.jsonl"),
+            format!(
+                r#"{{"type":"session","version":3,"id":"child","timestamp":"2026-08-08T00:00:01.000Z","cwd":"/tmp/project","parentSession":{},"rlmDepth":1}}
+{{"type":"message","id":"child-message-1","parentId":null,"timestamp":"2026-08-08T00:00:02.000Z","message":{{"role":"assistant","provider":"anthropic","model":"claude-opus-5","responseId":"child-response-1","usage":{{"input":30,"output":10,"cacheRead":0,"cacheWrite":0,"totalTokens":40}}}}}}
+{{"type":"message","id":"child-message-2","parentId":"child-message-1","timestamp":"2026-08-08T00:00:03.000Z","message":{{"role":"assistant","provider":"anthropic","model":"claude-opus-5","responseId":"child-response-2","usage":{{"input":20,"output":10,"cacheRead":0,"cacheWrite":0,"totalTokens":30}}}}}}
+"#,
+                paths::json_path_literal(&original_path)
+            ),
+        )
+        .unwrap();
+
+        let clients = ["prime-agent".to_string()];
+        for messages in [
+            parse_all_messages_with_pricing(source_home.path().to_str().unwrap(), &clients, None),
+            // Exercise the warm source-cache lane as well as the initial parse.
+            parse_all_messages_with_pricing(source_home.path().to_str().unwrap(), &clients, None),
+        ] {
+            assert_eq!(messages.len(), 3);
+            assert_eq!(
+                messages
+                    .iter()
+                    .map(|message| message.tokens.input)
+                    .sum::<i64>(),
+                150
+            );
+            assert_eq!(
+                messages
+                    .iter()
+                    .map(|message| message.tokens.output)
+                    .sum::<i64>(),
+                70
+            );
+        }
+
+        let parsed = parse_local_clients(LocalParseOptions {
+            home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(clients.to_vec()),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings::default(),
+        })
+        .unwrap();
+        assert_eq!(parsed.messages.len(), 3);
+        assert_eq!(parsed.counts.get(ClientId::PrimeAgent), 3);
+        assert_eq!(
+            parsed
+                .messages
+                .iter()
+                .map(|message| message.input)
+                .sum::<i64>(),
+            150
+        );
+        assert_eq!(
+            parsed
+                .messages
+                .iter()
+                .map(|message| message.output)
+                .sum::<i64>(),
+            70
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_prime_agent_concurrent_equal_children_are_counted_once() {
+        // Two children of the same parent spent identical tokens and finished in
+        // the same millisecond, so no timestamp separates one child's response
+        // from the other's attribution. Both must still be paired off: keeping
+        // the aggregate parent while also counting both transcripts would report
+        // their usage twice.
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let sessions = source_home.path().join(".prime/agent/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        let root_path = sessions.join("a-root.jsonl");
+        std::fs::write(
+            &root_path,
+            r#"{"type":"session","version":3,"id":"root","timestamp":"2026-08-08T00:00:00.000Z","cwd":"/tmp/project","rlmDepth":0}
+{"type":"message","id":"parent","parentId":null,"timestamp":"2026-08-08T00:00:01.000Z","message":{"role":"assistant","provider":"anthropic","model":"claude-opus-5","responseId":"parent-response","usage":{"input":300,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":300}}}
+{"type":"child_usage_attributed","id":"usage-a","parentId":"parent","timestamp":"2026-08-08T00:00:02.000Z","targetId":"parent","childUsage":{"input":100,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":100},"aggregateUsage":{"input":200,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":200},"origin":"spawn_task"}
+{"type":"child_usage_attributed","id":"usage-b","parentId":"usage-a","timestamp":"2026-08-08T00:00:02.000Z","targetId":"parent","childUsage":{"input":100,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":100},"aggregateUsage":{"input":300,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":300},"origin":"spawn_task"}
+"#,
+        )
+        .unwrap();
+        for child in ["sub-a", "sub-b"] {
+            let child_dir = source_home
+                .path()
+                .join(".prime/agent/session-artifacts/a-root")
+                .join(child);
+            std::fs::create_dir_all(&child_dir).unwrap();
+            std::fs::write(
+                child_dir.join("child.jsonl"),
+                format!(
+                    r#"{{"type":"session","version":3,"id":"{child}","timestamp":"2026-08-08T00:00:01.500Z","cwd":"/tmp/project","parentSession":{},"rlmDepth":1}}
+{{"type":"message","id":"child-message","parentId":null,"timestamp":"2026-08-08T00:00:02.000Z","message":{{"role":"assistant","provider":"anthropic","model":"claude-opus-5","responseId":"{child}-response","usage":{{"input":100,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":100}}}}}}
+"#,
+                    paths::json_path_literal(&root_path)
+                ),
+            )
+            .unwrap();
+        }
+
+        let clients = ["prime-agent".to_string()];
+        for messages in [
+            parse_all_messages_with_pricing(source_home.path().to_str().unwrap(), &clients, None),
+            // Warm source-cache lane must agree with the cold parse exactly.
+            parse_all_messages_with_pricing(source_home.path().to_str().unwrap(), &clients, None),
+        ] {
+            assert_eq!(messages.len(), 3);
+            // 100 own parent usage plus the two 100-token children, each counted
+            // once from its own transcript.
+            assert_eq!(
+                messages
+                    .iter()
+                    .map(|message| message.tokens.input)
+                    .sum::<i64>(),
+                300
+            );
+        }
+
+        let parsed = parse_local_clients(LocalParseOptions {
+            home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(clients.to_vec()),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings::default(),
+        })
+        .unwrap();
+        assert_eq!(parsed.messages.len(), 3);
+        assert_eq!(
+            parsed
+                .messages
+                .iter()
+                .map(|message| message.input)
+                .sum::<i64>(),
+            300
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_prime_agent_colliding_attribution_ids_do_not_cross_lineages() {
+        // Prime mints attribution ids as `randomUUID().slice(0, 8)` and only
+        // checks them against the session it is writing, so two unrelated
+        // sessions can carry the same id. Resolving one lineage's child must
+        // not mark the other lineage's attribution as accounted for.
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let sessions = source_home.path().join(".prime/agent/sessions");
+        let child_dir = source_home
+            .path()
+            .join(".prime/agent/session-artifacts/a-lineage/sub-a");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::create_dir_all(&child_dir).unwrap();
+
+        let lineage_a = sessions.join("a-lineage.jsonl");
+        std::fs::write(
+            &lineage_a,
+            r#"{"type":"session","version":3,"id":"parent-a","timestamp":"2026-08-08T00:00:00.000Z","cwd":"/tmp/project","rlmDepth":0}
+{"type":"message","id":"parent","parentId":null,"timestamp":"2026-08-08T00:00:01.000Z","message":{"role":"assistant","provider":"anthropic","model":"claude-opus-5","responseId":"parent-a-response","usage":{"input":120,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":120}}}
+{"type":"child_usage_attributed","id":"deadbeef","parentId":"parent","timestamp":"2026-08-08T00:00:02.000Z","targetId":"parent","childUsage":{"input":20,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":20},"aggregateUsage":{"input":120,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":120},"origin":"spawn_task"}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            child_dir.join("child.jsonl"),
+            format!(
+                r#"{{"type":"session","version":3,"id":"child-a","timestamp":"2026-08-08T00:00:01.500Z","cwd":"/tmp/project","parentSession":{},"rlmDepth":1}}
+{{"type":"message","id":"child-message","parentId":null,"timestamp":"2026-08-08T00:00:02.001Z","message":{{"role":"assistant","provider":"anthropic","model":"claude-opus-5","responseId":"child-a-response","usage":{{"input":20,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":20}}}}}}
+"#,
+                paths::json_path_literal(&lineage_a)
+            ),
+        )
+        .unwrap();
+        // Same 8-hex id, unrelated session, and its child transcript is gone.
+        std::fs::write(
+            sessions.join("b-lineage.jsonl"),
+            r#"{"type":"session","version":3,"id":"parent-b","timestamp":"2026-08-09T00:00:00.000Z","cwd":"/tmp/project","rlmDepth":0}
+{"type":"message","id":"parent","parentId":null,"timestamp":"2026-08-09T00:00:01.000Z","message":{"role":"assistant","provider":"anthropic","model":"claude-opus-5","responseId":"parent-b-response","usage":{"input":130,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":130}}}
+{"type":"child_usage_attributed","id":"deadbeef","parentId":"parent","timestamp":"2026-08-09T00:00:02.000Z","targetId":"parent","childUsage":{"input":30,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":30},"aggregateUsage":{"input":130,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":130},"origin":"spawn_task"}
+"#,
+        )
+        .unwrap();
+
+        let clients = ["prime-agent".to_string()];
+        for messages in [
+            parse_all_messages_with_pricing(source_home.path().to_str().unwrap(), &clients, None),
+            // Warm source-cache lane must agree with the cold parse exactly.
+            parse_all_messages_with_pricing(source_home.path().to_str().unwrap(), &clients, None),
+        ] {
+            assert_eq!(messages.len(), 3);
+            // 100 reconciled parent + 20 parsed child + 130 aggregate parent
+            // whose own child was pruned.
+            assert_eq!(
+                messages
+                    .iter()
+                    .map(|message| message.tokens.input)
+                    .sum::<i64>(),
+                250
+            );
+        }
+
+        let parsed = parse_local_clients(LocalParseOptions {
+            home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(clients.to_vec()),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings::default(),
+        })
+        .unwrap();
+        assert_eq!(parsed.messages.len(), 3);
+        assert_eq!(
+            parsed
+                .messages
+                .iter()
+                .map(|message| message.input)
+                .sum::<i64>(),
+            250
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_prime_agent_contested_child_is_attributed_to_the_nearest_model() {
+        // Two parent responses on different models each persist an aggregate that
+        // contains one 50-token child, and only the second parent's child
+        // transcript survives. Both attributions are inside the tolerance window,
+        // so a maximum-cardinality match could reduce either aggregate and leave
+        // the global total intact -- but pricing is applied per model after
+        // reconciliation, so the wrong choice moves cost between models.
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let sessions = source_home.path().join(".prime/agent/sessions");
+        let child_dir = source_home
+            .path()
+            .join(".prime/agent/session-artifacts/parent/sub-child");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::create_dir_all(&child_dir).unwrap();
+
+        let parent_path = sessions.join("parent.jsonl");
+        std::fs::write(
+            &parent_path,
+            r#"{"type":"session","version":3,"id":"parent","timestamp":"2026-08-08T00:00:00.000Z","cwd":"/tmp/project","rlmDepth":0}
+{"type":"message","id":"parent-a","parentId":null,"timestamp":"2026-08-08T00:00:01.000Z","message":{"role":"assistant","provider":"anthropic","model":"model-a","responseId":"parent-response-a","usage":{"input":150,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":150}}}
+{"type":"child_usage_attributed","id":"00000000","parentId":"parent-a","timestamp":"2026-08-08T00:00:02.000Z","targetId":"parent-a","childUsage":{"input":50,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":50},"aggregateUsage":{"input":150,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":150},"origin":"spawn_task"}
+{"type":"message","id":"parent-b","parentId":"00000000","timestamp":"2026-08-08T00:00:01.500Z","message":{"role":"assistant","provider":"anthropic","model":"model-b","responseId":"parent-response-b","usage":{"input":150,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":150}}}
+{"type":"child_usage_attributed","id":"ffffffff","parentId":"parent-b","timestamp":"2026-08-08T00:00:02.002Z","targetId":"parent-b","childUsage":{"input":50,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":50},"aggregateUsage":{"input":150,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":150},"origin":"spawn_task"}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            child_dir.join("child.jsonl"),
+            format!(
+                r#"{{"type":"session","version":3,"id":"child","timestamp":"2026-08-08T00:00:01.600Z","cwd":"/tmp/project","parentSession":{},"rlmDepth":1}}
+{{"type":"message","id":"child-message","parentId":null,"timestamp":"2026-08-08T00:00:02.002Z","message":{{"role":"assistant","provider":"anthropic","model":"child-model","responseId":"child-response","usage":{{"input":50,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":50}}}}}}
+"#,
+                paths::json_path_literal(&parent_path)
+            ),
+        )
+        .unwrap();
+
+        let clients = ["prime-agent".to_string()];
+        for messages in [
+            parse_all_messages_with_pricing(source_home.path().to_str().unwrap(), &clients, None),
+            // The warm source-cache lane must produce the same per-model rows,
+            // not just the same total.
+            parse_all_messages_with_pricing(source_home.path().to_str().unwrap(), &clients, None),
+        ] {
+            let mut per_model: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::new();
+            for message in &messages {
+                *per_model.entry(message.model_id.clone()).or_default() += message.tokens.input;
+            }
+            assert_eq!(per_model.get("model-a").copied(), Some(150));
+            assert_eq!(per_model.get("model-b").copied(), Some(100));
+            assert_eq!(per_model.get("child-model").copied(), Some(50));
+            assert_eq!(per_model.values().sum::<i64>(), 300);
+        }
     }
 
     #[test]

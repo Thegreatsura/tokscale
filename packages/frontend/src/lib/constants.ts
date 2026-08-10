@@ -35,6 +35,7 @@ export const SOURCE_DISPLAY_NAMES: Record<ClientType, string> = {
   cursor: "Cursor",
   amp: "Amp",
   codebuff: "Codebuff",
+  freebuff: "Freebuff",
   droid: "Droid",
   openclaw: "OpenClaw",
   hermes: "Hermes Agent",
@@ -72,6 +73,7 @@ export const SOURCE_DISPLAY_NAMES: Record<ClientType, string> = {
   augment: "Augment Code",
   kimchi: "Kimchi",
   reasonix: "Reasonix",
+  "prime-agent": "Prime Agent",
 };
 
 // Client logos from GitHub CDN (public repo)
@@ -85,6 +87,7 @@ export const SOURCE_LOGOS: Record<ClientType, string> = {
   cursor: `${GITHUB_CDN_BASE}/client-cursor.jpg`,
   amp: `${GITHUB_CDN_BASE}/client-amp.png`,
   codebuff: `${GITHUB_CDN_BASE}/client-codebuff.png`,
+  freebuff: `${GITHUB_CDN_BASE}/client-freebuff.png`,
   droid: `${GITHUB_CDN_BASE}/client-droid.png`,
   openclaw: `${GITHUB_CDN_BASE}/client-openclaw.jpg`,
   hermes: `${GITHUB_CDN_BASE}/client-hermes.png`,
@@ -127,6 +130,7 @@ export const SOURCE_LOGOS: Record<ClientType, string> = {
   augment: "https://github.com/augmentcode.png",
   kimchi: "https://github.com/getkimchi.png",
   reasonix: `${GITHUB_CDN_BASE}/client-synthetic.png`,
+  "prime-agent": "https://github.com/PrimeIntellect-ai.png",
 };
 
 export const SOURCE_COLORS: Record<ClientType, string> = {
@@ -138,6 +142,7 @@ export const SOURCE_COLORS: Record<ClientType, string> = {
   cursor: "#22c55e",
   amp: "#EC4899",
   codebuff: "#7C3AED",
+  freebuff: "#38BDF8",
   droid: "#1F1D1C",
   openclaw: "#EF4444",
   hermes: "#FFD700",
@@ -175,6 +180,7 @@ export const SOURCE_COLORS: Record<ClientType, string> = {
   augment: "#9333EA",
   kimchi: "#14B8A6",
   reasonix: "#6366F1",
+  "prime-agent": "#6C63FF",
 };
 
 // Derived values

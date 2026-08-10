@@ -1130,7 +1130,7 @@ fn provider_summary_line(
         Span::styled(
             format!("  {}", truncate_string(group.provider, 18)),
             Style::default()
-                .fg(get_provider_shade(group.provider, 0))
+                .fg(app.theme.color(get_provider_shade(group.provider, 0)))
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!("  {summary}"), app.theme.subtle_text_style()),
@@ -1189,29 +1189,14 @@ fn render_selected_account(
         );
     }
     if lines.len() < detail_limit {
-        if let Some(account) = &selected.account {
-            push_kv_styled(
-                &mut lines,
-                app,
-                "Credential",
-                if account.is_active {
-                    "saved store, current Codex login"
-                } else {
-                    "saved store"
-                },
-                app.theme.secondary_text_style(),
-                inner.width as usize,
-            );
-        } else {
-            push_kv_styled(
-                &mut lines,
-                app,
-                "Credential",
-                "managed externally",
-                app.theme.secondary_text_style(),
-                inner.width as usize,
-            );
-        }
+        push_kv_styled(
+            &mut lines,
+            app,
+            "Credential",
+            &credential_detail(selected),
+            app.theme.secondary_text_style(),
+            inner.width as usize,
+        );
     }
     if lines.len() < detail_limit {
         if let Some(label) = credits_status_line(selected) {
@@ -1526,6 +1511,28 @@ fn selected_status_line(output: &UsageOutput) -> String {
     )
 }
 
+/// Name of the external tool that owns the credential, when the credential did
+/// not come from the saved store. Both the `Credential` detail row and the
+/// account actions row derive their wording from this so a single credential is
+/// never described two different ways.
+fn external_credential_manager(output: &UsageOutput) -> Option<&'static str> {
+    match output.credential_source.as_deref() {
+        Some("opencode") => Some("OpenCode"),
+        _ => None,
+    }
+}
+
+fn credential_detail(output: &UsageOutput) -> String {
+    match &output.account {
+        Some(account) if account.is_active => "saved store, current Codex login".to_string(),
+        Some(_) => "saved store".to_string(),
+        None => match external_credential_manager(output) {
+            Some(manager) => format!("managed by {manager}"),
+            None => "managed externally".to_string(),
+        },
+    }
+}
+
 fn selected_account_actions_line(
     app: &mut App,
     selected: &UsageOutput,
@@ -1558,10 +1565,11 @@ fn selected_account_actions_line(
         return Line::from(spans);
     }
 
-    Line::from(Span::styled(
-        "  Managed externally",
-        app.theme.subtle_text_style(),
-    ))
+    let label = match external_credential_manager(selected) {
+        Some(manager) => format!("  Managed by {manager}"),
+        None => "  Managed externally".to_string(),
+    };
+    Line::from(Span::styled(label, app.theme.subtle_text_style()))
 }
 
 fn account_plan_label(account: &str, plan: Option<&str>) -> String {
@@ -2013,7 +2021,7 @@ fn account_table_row(app: &App, output: &UsageOutput, index: usize) -> Row<'stat
         table_text_cell(
             output.provider.clone(),
             Style::default()
-                .fg(get_provider_shade(&output.provider, 0))
+                .fg(app.theme.color(get_provider_shade(&output.provider, 0)))
                 .add_modifier(Modifier::BOLD),
         ),
         table_text_cell(row.account, app.theme.secondary_text_style()),
@@ -2501,6 +2509,7 @@ mod tests {
     };
     use crate::tui::app::{Tab, TuiConfig};
     use crate::tui::data::UsageData;
+    use crate::tui::themes::{TerminalColorMode, Theme, ThemeName};
     use chrono::{Duration, Utc};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{backend::TestBackend, Terminal};
@@ -2509,6 +2518,7 @@ mod tests {
         UsageOutput {
             provider: provider.to_string(),
             account,
+            credential_source: None,
             plan: Some("Pro".to_string()),
             email: Some("user@example.com".to_string()),
             metrics: vec![UsageMetric {
@@ -2625,6 +2635,30 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Renders the usage view and returns every distinct `Color::Rgb` present
+    /// in the frame's cell foregrounds/backgrounds.
+    fn render_rgb_colors(app: &mut App, width: u16, height: u16) -> Vec<Color> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, app, Rect::new(0, 0, width, height)))
+            .unwrap();
+        let mut rgb: Vec<Color> = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .flat_map(|cell| [cell.fg, cell.bg])
+            .filter(|color| matches!(color, Color::Rgb(..)))
+            .collect();
+        rgb.sort_by_key(|color| match color {
+            Color::Rgb(r, g, b) => (*r, *g, *b),
+            _ => (0, 0, 0),
+        });
+        rgb.dedup();
+        rgb
     }
 
     fn line_text(line: &Line<'_>) -> String {
@@ -2819,6 +2853,50 @@ mod tests {
         assert_eq!(groups[1].outputs.len(), 1);
     }
 
+    /// In `Compatible` mode the theme palette is collapsed to named colors so
+    /// terminals without truecolor support never receive 24-bit SGR. The
+    /// provider summary and the account table color provider labels from the
+    /// vendor shade ramps, which are RGB regardless of theme, so they have to
+    /// be routed through `Theme::color` too — otherwise those cells still emit
+    /// raw RGB and render as garbled blocks (#559, #1060).
+    #[test]
+    fn compatible_color_mode_emits_no_rgb_in_usage_view() {
+        let mut app = make_app();
+        app.theme =
+            Theme::from_name_with_color_mode(ThemeName::Blue, TerminalColorMode::Compatible);
+        app.selected_index = 0;
+        app.subscription_usage = vec![
+            output(
+                "Anthropic",
+                Some(UsageAccount {
+                    id: "acct_work".to_string(),
+                    label: Some("work".to_string()),
+                    is_active: true,
+                }),
+            ),
+            output(
+                "OpenAI",
+                Some(UsageAccount {
+                    id: "acct_personal".to_string(),
+                    label: Some("personal".to_string()),
+                    is_active: false,
+                }),
+            ),
+        ];
+
+        // Sanity: the provider summary and account table actually rendered.
+        let body = render_body(&mut app, 150, 32);
+        assert!(body.contains("Anthropic"), "{body}");
+        assert!(body.contains("OpenAI"), "{body}");
+        assert!(body.contains("Accounts"), "{body}");
+
+        let rgb = render_rgb_colors(&mut app, 150, 32);
+        assert!(
+            rgb.is_empty(),
+            "Compatible mode must not emit any Color::Rgb, found: {rgb:?}"
+        );
+    }
+
     #[test]
     fn renders_usage_workspace_sections_and_codex_actions() {
         let mut app = make_app();
@@ -2998,6 +3076,47 @@ mod tests {
         assert!(body.contains("Codex (personal)"), "{body}");
         assert!(body.contains("Use Account"), "{body}");
         assert!(body.contains("saved store"), "{body}");
+    }
+
+    #[test]
+    fn selected_opencode_fallback_names_its_external_credential_manager() {
+        let mut app = make_app();
+        let mut managed = output("Codex", None);
+        managed.credential_source = Some("opencode".to_string());
+        app.subscription_usage = vec![managed];
+
+        let body = render_body(&mut app, 150, 28);
+
+        assert!(body.contains("managed by OpenCode"), "{body}");
+        assert!(body.contains("Managed by OpenCode"), "{body}");
+        assert!(!body.contains("Managed externally"), "{body}");
+    }
+
+    #[test]
+    fn selected_account_actions_appear_only_for_saved_accounts() {
+        let mut app = make_app();
+        app.subscription_usage = vec![output(
+            "Codex",
+            Some(UsageAccount {
+                id: "acct_personal".to_string(),
+                label: Some("personal".to_string()),
+                is_active: false,
+            }),
+        )];
+
+        let saved = render_body(&mut app, 150, 28);
+
+        assert!(saved.contains("Use Account"), "{saved}");
+        assert!(saved.contains("Remove"), "{saved}");
+
+        let mut managed = output("Codex", None);
+        managed.credential_source = Some("opencode".to_string());
+        app.subscription_usage = vec![managed];
+
+        let external = render_body(&mut app, 150, 28);
+
+        assert!(!external.contains("Use Account"), "{external}");
+        assert!(!external.contains("Remove"), "{external}");
     }
 
     #[test]
@@ -3745,6 +3864,7 @@ mod tests {
                 label: None,
                 is_active: true,
             }),
+            credential_source: None,
             plan: Some("Pro".to_string()),
             email: Some("secret@example.com".to_string()),
             metrics: vec![UsageMetric {
