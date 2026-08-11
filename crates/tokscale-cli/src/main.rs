@@ -2811,7 +2811,7 @@ fn run_monthly_report(
 ) -> Result<()> {
     use std::time::Instant;
     use tokio::runtime::Runtime;
-    use tokscale_core::{get_monthly_report, GroupBy, ReportOptions};
+    use tokscale_core::{get_monthly_report_v2, GroupBy, ReportOptions};
 
     let (since, until) = build_date_filter(date, &home_dir);
     let year = normalize_year_filter(date);
@@ -2831,7 +2831,7 @@ fn run_monthly_report(
     let rt = Runtime::new()?;
     let report = rt
         .block_on(async {
-            get_monthly_report(ReportOptions {
+            get_monthly_report_v2(ReportOptions {
                 home_dir: home_dir.clone(),
                 use_env_roots,
                 clients,
@@ -2852,6 +2852,7 @@ fn run_monthly_report(
                 || e.output != 0
                 || e.cache_read != 0
                 || e.cache_write != 0
+                || e.reasoning != 0
                 || e.cost != 0.0
         });
     }
@@ -2878,6 +2879,7 @@ fn run_monthly_report(
             output: i64,
             cache_read: i64,
             cache_write: i64,
+            reasoning: i64,
             message_count: i32,
             cost: f64,
         }
@@ -2903,6 +2905,7 @@ fn run_monthly_report(
                     output: e.output,
                     cache_read: e.cache_read,
                     cache_write: e.cache_write,
+                    reasoning: e.reasoning,
                     message_count: e.message_count,
                     cost: e.cost,
                 })
@@ -2964,7 +2967,8 @@ fn run_monthly_report(
                     entry.output,
                     entry.cache_read,
                     entry.cache_write,
-                );
+                )
+                .saturating_add(entry.reasoning);
 
                 table.add_row(vec![
                     Cell::new(entry.month.clone()),
@@ -2979,14 +2983,15 @@ fn run_monthly_report(
                 ]);
             }
 
-            let (total_input, total_output, total_cache_read, total_cache_write) =
+            let (total_input, total_output, total_cache_read, total_cache_write, total_reasoning) =
                 monthly_token_field_totals(&report.entries);
             let total_tokens = saturating_token_total(
                 total_input,
                 total_output,
                 total_cache_read,
                 total_cache_write,
-            );
+            )
+            .saturating_add(total_reasoning);
             table.add_row(vec![
                 Cell::new("Total")
                     .fg(Color::Yellow)
@@ -3013,6 +3018,7 @@ fn run_monthly_report(
                 Cell::new("Output").fg(Color::Cyan),
                 Cell::new("Cache Write").fg(Color::Cyan),
                 Cell::new("Cache Read").fg(Color::Cyan),
+                Cell::new("Reasoning").fg(Color::Cyan),
                 Cell::new("Total").fg(Color::Cyan),
                 Cell::new("Cost").fg(Color::Cyan),
                 Cell::new("Cost/1M").fg(Color::Cyan),
@@ -3041,7 +3047,8 @@ fn run_monthly_report(
                     entry.output,
                     entry.cache_read,
                     entry.cache_write,
-                );
+                )
+                .saturating_add(entry.reasoning);
 
                 table.add_row(vec![
                     Cell::new(entry.month.clone()),
@@ -3054,6 +3061,8 @@ fn run_monthly_report(
                         .set_alignment(CellAlignment::Right),
                     Cell::new(format_tokens_with_commas(entry.cache_read))
                         .set_alignment(CellAlignment::Right),
+                    Cell::new(format_tokens_with_commas(entry.reasoning))
+                        .set_alignment(CellAlignment::Right),
                     Cell::new(format_tokens_with_commas(total)).set_alignment(CellAlignment::Right),
                     Cell::new(format_currency(entry.cost)).set_alignment(CellAlignment::Right),
                     Cell::new(format_cost_per_million(entry.cost, total))
@@ -3061,14 +3070,15 @@ fn run_monthly_report(
                 ]);
             }
 
-            let (total_input, total_output, total_cache_read, total_cache_write) =
+            let (total_input, total_output, total_cache_read, total_cache_write, total_reasoning) =
                 monthly_token_field_totals(&report.entries);
             let total_all = saturating_token_total(
                 total_input,
                 total_output,
                 total_cache_read,
                 total_cache_write,
-            );
+            )
+            .saturating_add(total_reasoning);
 
             table.add_row(vec![
                 Cell::new("Total")
@@ -3085,6 +3095,9 @@ fn run_monthly_report(
                     .fg(Color::Yellow)
                     .set_alignment(CellAlignment::Right),
                 Cell::new(format_tokens_with_commas(total_cache_read))
+                    .fg(Color::Yellow)
+                    .set_alignment(CellAlignment::Right),
+                Cell::new(format_tokens_with_commas(total_reasoning))
                     .fg(Color::Yellow)
                     .set_alignment(CellAlignment::Right),
                 Cell::new(format_tokens_with_commas(total_all))
@@ -3787,20 +3800,23 @@ fn saturating_token_total(input: i64, output: i64, cache_read: i64, cache_write:
         .saturating_add(cache_write)
 }
 
-/// Sum the (input, output, cache_read, cache_write) token fields across
-/// monthly usage entries with saturating_add. `MonthlyReport` (unlike
-/// `ModelReport`) doesn't carry precomputed grand totals, so the display
+/// Sum every monthly token field (input, output, cache read, cache write, and
+/// reasoning) across usage entries with saturating_add. `MonthlyReportV2`
+/// (unlike `ModelReport`) doesn't carry precomputed grand totals, so the display
 /// layer aggregates `report.entries` itself; a saturating fold keeps that
 /// aggregation safe against clamped (i64::MAX) entry buckets.
-fn monthly_token_field_totals(entries: &[tokscale_core::MonthlyUsage]) -> (i64, i64, i64, i64) {
+fn monthly_token_field_totals(
+    entries: &[tokscale_core::MonthlyUsageV2],
+) -> (i64, i64, i64, i64, i64) {
     entries.iter().fold(
-        (0, 0, 0, 0),
-        |(input, output, cache_read, cache_write), entry| {
+        (0, 0, 0, 0, 0),
+        |(input, output, cache_read, cache_write, reasoning), entry| {
             (
                 input.saturating_add(entry.input),
                 output.saturating_add(entry.output),
                 cache_read.saturating_add(entry.cache_read),
                 cache_write.saturating_add(entry.cache_write),
+                reasoning.saturating_add(entry.reasoning),
             )
         },
     )
@@ -3895,39 +3911,15 @@ fn format_model_name(model: &str) -> String {
 }
 
 fn capitalize_client(client: &str) -> String {
-    match client {
-        "opencode" => "OpenCode".to_string(),
-        "claude" => "Claude".to_string(),
-        "codex" => "Codex".to_string(),
-        "cursor" => "Cursor".to_string(),
-        "gemini" => "Gemini".to_string(),
-        "amp" => "Amp".to_string(),
-        "codebuff" => "Codebuff".to_string(),
-        "freebuff" => "Freebuff".to_string(),
-        "droid" => "Droid".to_string(),
-        "crush" => "Crush".to_string(),
-        "openclaw" => "openclaw".to_string(),
-        "hermes" => "Hermes Agent".to_string(),
-        "goose" => "Goose".to_string(),
-        "warp" => "Warp".to_string(),
-        "grok" => "Grok Build".to_string(),
-        "9router" => "9Router".to_string(),
-        "pi" => "Pi".to_string(),
-        "gjc" => "Gajae-Code".to_string(),
-        "jcode" => "Jcode".to_string(),
-        "commandcode" => "Command Code".to_string(),
-        "junie" => "Junie".to_string(),
-        "zcode" => "ZCode".to_string(),
-        "codebuddy" => "CodeBuddy".to_string(),
-        "workbuddy" => "WorkBuddy".to_string(),
-        "devin-cli" => "Devin CLI".to_string(),
-        "devin-desktop" => "Devin Desktop".to_string(),
-        "senpi" => "Senpi (OmO Native)".to_string(),
-        "augment" => "Augment Code".to_string(),
-        "kimchi" => "Kimchi".to_string(),
-        "prime-agent" => "Prime Agent".to_string(),
-        other => other.to_string(),
-    }
+    tokscale_core::ClientId::from_str(client)
+        .map(|client_id| client_id.display_name().to_string())
+        .unwrap_or_else(|| match client {
+            // 9Router is a gjc-compatible source alias, not a separately
+            // scannable client, so it intentionally remains outside ClientDef.
+            "9router" => "9Router".to_string(),
+            "synthetic" => "Synthetic".to_string(),
+            other => other.to_string(),
+        })
 }
 
 fn run_clients_command(json: bool, home_dir: Option<String>) -> Result<()> {
@@ -4474,12 +4466,24 @@ struct TsTimeMetrics {
     session_count: u32,
 }
 
+const SUBMISSION_PARSER_VERSION: u32 = 1;
+const COPILOT_SUBMISSION_PARSER_VERSION: u32 = 2;
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TsScanScope {
+    parser_versions: std::collections::BTreeMap<String, u32>,
+    full_history: bool,
+}
+
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TsTokenContributionData {
     meta: TsExportMeta,
     #[serde(skip_serializing_if = "Option::is_none")]
     device: Option<TsSubmitDevice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scan_scope: Option<TsScanScope>,
     summary: TsDataSummary,
     years: Vec<TsYearSummary>,
     contributions: Vec<TsDailyContribution>,
@@ -4492,6 +4496,7 @@ struct TsTokenContributionData {
 fn to_ts_token_contribution_data(
     graph: &tokscale_core::GraphResult,
     device: Option<&device::SubmitDevice>,
+    scan_scope: Option<TsScanScope>,
 ) -> TsTokenContributionData {
     TsTokenContributionData {
         meta: TsExportMeta {
@@ -4506,6 +4511,7 @@ fn to_ts_token_contribution_data(
             id: d.id.clone(),
             name: d.name.clone(),
         }),
+        scan_scope,
         summary: TsDataSummary {
             total_tokens: graph.summary.total_tokens,
             total_cost: graph.summary.total_cost,
@@ -4587,6 +4593,27 @@ fn to_ts_token_contribution_data(
             }
         },
     }
+}
+
+/// Parser identity is declared for every scanned client, even for a partial
+/// date range. `full_history` is a separate capability bit: only an unbounded
+/// scan can establish or advance a cumulative rollout high-water.
+fn submit_scan_scope(clients: Option<&[String]>, full_history: bool) -> Option<TsScanScope> {
+    let parser_versions = clients?
+        .iter()
+        .map(|client| {
+            let version = if client == "copilot" {
+                COPILOT_SUBMISSION_PARSER_VERSION
+            } else {
+                SUBMISSION_PARSER_VERSION
+            };
+            (client.clone(), version)
+        })
+        .collect();
+    Some(TsScanScope {
+        parser_versions,
+        full_history,
+    })
 }
 
 fn run_login_command(token: Option<String>) -> Result<()> {
@@ -5077,7 +5104,7 @@ fn run_graph_command(
     emit_cursor_setup_warnings(&cursor_setup_warnings);
 
     let processing_time_ms = start.elapsed().as_millis() as u32;
-    let output_data = to_ts_token_contribution_data(&graph_result, None);
+    let output_data = to_ts_token_contribution_data(&graph_result, None, None);
     let json_output = serde_json::to_string_pretty(&output_data)?;
 
     if let Some(output_path) = output {
@@ -5307,7 +5334,7 @@ fn run_import_command(
         return Ok(());
     }
 
-    let mut payload = to_ts_token_contribution_data(graph, None);
+    let mut payload = to_ts_token_contribution_data(graph, None, None);
     // The imported data has no MCP provenance of its own — it's derived
     // purely from a third-party clawdboard export. Reusing the graph/submit
     // converter would otherwise embed the *local* machine's configured MCP
@@ -5645,6 +5672,10 @@ fn run_submit_command(
     let explicit_cursor_filter = client_filter_explicitly_requests_cursor(&clients);
     let explicit_warp_filter = client_filter_explicitly_requests_warp(&clients);
     let clients = clients.or_else(|| Some(default_submit_clients()));
+    let scan_scope = submit_scan_scope(
+        clients.as_deref(),
+        since.is_none() && until.is_none() && year.is_none(),
+    );
 
     let include_cursor = clients
         .as_ref()
@@ -5760,7 +5791,8 @@ fn run_submit_command(
     let api_url = auth::get_api_base_url();
 
     let submit_device = device::resolve_submit_device()?;
-    let submit_payload = to_ts_token_contribution_data(&graph_result, Some(&submit_device));
+    let submit_payload =
+        to_ts_token_contribution_data(&graph_result, Some(&submit_device), scan_scope);
 
     let response = rt.block_on(async {
         reqwest::Client::new()
@@ -6497,26 +6529,28 @@ mod tests {
 
     #[test]
     fn monthly_token_field_totals_saturate_across_entries() {
-        // MonthlyReport has no precomputed grand totals, so the display layer
+        // MonthlyReportV2 has no precomputed grand totals, so the display layer
         // aggregates report.entries itself. Two entries each carrying a
         // clamped (i64::MAX) input bucket must not overflow that aggregation.
-        let make = |input: i64| tokscale_core::MonthlyUsage {
+        let make = |input: i64, reasoning: i64| tokscale_core::MonthlyUsageV2 {
             month: "2026-07".to_string(),
             models: vec![],
             input,
             output: 0,
             cache_read: 0,
             cache_write: 0,
+            reasoning,
             message_count: 1,
             cost: 0.0,
         };
-        let entries = vec![make(i64::MAX), make(i64::MAX)];
-        let (total_input, total_output, total_cache_read, total_cache_write) =
+        let entries = vec![make(i64::MAX, 100), make(i64::MAX, 23)];
+        let (total_input, total_output, total_cache_read, total_cache_write, total_reasoning) =
             monthly_token_field_totals(&entries);
         assert_eq!(total_input, i64::MAX);
         assert_eq!(total_output, 0);
         assert_eq!(total_cache_read, 0);
         assert_eq!(total_cache_write, 0);
+        assert_eq!(total_reasoning, 123);
     }
 
     #[test]
@@ -7618,22 +7652,22 @@ mod tests {
 
     #[test]
     fn test_capitalize_client_claude() {
-        assert_eq!(capitalize_client("claude"), "Claude");
+        assert_eq!(capitalize_client("claude"), "Claude Code");
     }
 
     #[test]
     fn test_capitalize_client_codex() {
-        assert_eq!(capitalize_client("codex"), "Codex");
+        assert_eq!(capitalize_client("codex"), "Codex CLI");
     }
 
     #[test]
     fn test_capitalize_client_cursor() {
-        assert_eq!(capitalize_client("cursor"), "Cursor");
+        assert_eq!(capitalize_client("cursor"), "Cursor IDE");
     }
 
     #[test]
     fn test_capitalize_client_gemini() {
-        assert_eq!(capitalize_client("gemini"), "Gemini");
+        assert_eq!(capitalize_client("gemini"), "Gemini CLI");
     }
 
     #[test]
@@ -7653,7 +7687,7 @@ mod tests {
 
     #[test]
     fn test_capitalize_client_openclaw() {
-        assert_eq!(capitalize_client("openclaw"), "openclaw");
+        assert_eq!(capitalize_client("openclaw"), "OpenClaw");
     }
 
     #[test]
@@ -7674,6 +7708,13 @@ mod tests {
     #[test]
     fn test_capitalize_client_jcode() {
         assert_eq!(capitalize_client("jcode"), "Jcode");
+    }
+
+    #[test]
+    fn test_capitalize_client_covers_every_registered_client() {
+        for client in tokscale_core::ClientId::iter() {
+            assert_eq!(capitalize_client(client.as_str()), client.display_name());
+        }
     }
 
     #[test]
@@ -8000,12 +8041,40 @@ mod tests {
             name: Some("Test device".to_string()),
         };
 
-        let payload = to_ts_token_contribution_data(&graph, Some(&device));
+        let payload = to_ts_token_contribution_data(&graph, Some(&device), None);
 
         assert_eq!(payload.device.as_ref().unwrap().id, "dev_test");
         assert_eq!(
             payload.device.as_ref().unwrap().name.as_deref(),
             Some("Test device")
+        );
+    }
+
+    #[test]
+    fn submit_scan_scope_separates_parser_identity_from_full_history() {
+        let clients = vec!["codex".to_string(), "copilot".to_string()];
+        let full = submit_scan_scope(Some(&clients), true).expect("full scope");
+        let partial = submit_scan_scope(Some(&clients), false).expect("partial scope");
+
+        assert!(full.full_history);
+        assert!(!partial.full_history);
+        assert_eq!(full.parser_versions, partial.parser_versions);
+        assert_eq!(full.parser_versions.len(), 2);
+        assert_eq!(
+            full.parser_versions.get("copilot"),
+            Some(&COPILOT_SUBMISSION_PARSER_VERSION)
+        );
+        assert!(!full.parser_versions.contains_key("claude"));
+    }
+
+    #[test]
+    fn submit_scan_scope_keeps_a_partial_client_filter_narrow() {
+        let clients = vec!["codex".to_string()];
+        let scope = submit_scan_scope(Some(&clients), true).expect("codex scope");
+
+        assert_eq!(
+            scope.parser_versions,
+            std::collections::BTreeMap::from([("codex".to_string(), SUBMISSION_PARSER_VERSION)])
         );
     }
 
