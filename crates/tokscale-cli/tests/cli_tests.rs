@@ -1187,6 +1187,73 @@ fn write_codex_token_session(dir: &Path, name: &str, model: &str, input: i64, ou
     .unwrap();
 }
 
+/// The V1 Cherry Studio transcript root under a sandboxed home, spelled the
+/// way `PathRoot::AppData` resolves it per platform.
+///
+/// Built component-by-component rather than from a single `/`-joined literal:
+/// `Path::join` only normalizes the junction, so a `"AppData/Roaming/..."`
+/// literal keeps its own forward slashes on Windows and the fixture would not
+/// exercise the real `AppData\Roaming\CherryStudio\.claude\projects`
+/// layout the scanner walks (#1048).
+fn cherrystudio_projects_root(base: &Path) -> std::path::PathBuf {
+    #[cfg(target_os = "windows")]
+    let relative = "AppData/Roaming/CherryStudio/.claude/projects";
+    #[cfg(target_os = "macos")]
+    let relative = "Library/Application Support/CherryStudio/.claude/projects";
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let relative = ".config/CherryStudio/.claude/projects";
+
+    let mut path = base.to_path_buf();
+    for component in relative.split('/') {
+        path.push(component);
+    }
+    path
+}
+
+/// Four snapshots of one streamed Cherry Studio API call. The final snapshot
+/// connects the UUID-only, message-only, and request-only partial records and
+/// carries the final streamed output count.
+fn write_cherrystudio_connected_alias_transcript(base: &Path) {
+    let path = cherrystudio_projects_root(base)
+        .join("workspace")
+        .join("session.jsonl");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        path,
+        concat!(
+            r#"{"type":"assistant","uuid":"u","message":{"model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"id":"m","model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+            "\n",
+            r#"{"type":"assistant","requestId":"r","message":{"model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+            "\n",
+            r#"{"type":"assistant","uuid":"u","requestId":"r","message":{"id":"m","model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":300}}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// A historical Cherry Studio call followed by a timestamp-less streamed
+/// replay. The replay grows output usage but must not take the transcript mtime
+/// as the call timestamp when its component has a valid event timestamp.
+fn write_cherrystudio_historical_replay_without_timestamp(base: &Path) {
+    let path = cherrystudio_projects_root(base)
+        .join("workspace")
+        .join("historical.jsonl");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        path,
+        concat!(
+            r#"{"type":"assistant","requestId":"historical-request","timestamp":"2024-01-02T03:04:05.000Z","message":{"id":"historical-message","model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+            "\n",
+            r#"{"type":"assistant","requestId":"historical-request","message":{"id":"historical-message","model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":300}}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+}
+
 fn write_jcode_session(base: &Path) {
     let sessions_dir = base.join(".jcode/sessions");
     fs::create_dir_all(&sessions_dir).unwrap();
@@ -1942,6 +2009,123 @@ fn test_models_with_client_filter_jcode() {
     assert_eq!(entry["cacheWrite"].as_i64().unwrap(), 50);
     assert_eq!(entry["output"].as_i64().unwrap(), 250);
     assert_eq!(entry["reasoning"].as_i64().unwrap(), 25);
+}
+
+/// The Windows regression guard for the two tests below.
+///
+/// Both of them assert on parsed totals, so when discovery silently reads the
+/// wrong root they fail as `Some(0)` vs `Some(1)` with nothing pointing at the
+/// path. `PathRoot::AppData` used to resolve to the `FOLDERID_RoamingAppData`
+/// known folder under env roots, which no environment variable can redirect,
+/// so on Windows the scan walked the live profile instead of this sandbox and
+/// the fixture was never seen. Assert the emitted scan root directly.
+#[test]
+fn test_clients_json_cherrystudio_scan_root_stays_inside_the_sandboxed_home() {
+    let tmp = create_empty_fixture_dir();
+    write_cherrystudio_connected_alias_transcript(tmp.path());
+
+    let output = cmd_with_home(tmp.path())
+        .args(["clients", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let cherry = json["clients"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["client"] == "cherrystudio")
+        .expect("cherrystudio must appear in `clients --json`");
+
+    assert_eq!(
+        cherry["sessionsPath"],
+        serde_json::json!(cherrystudio_projects_root(tmp.path()).to_string_lossy()),
+        "Cherry Studio's scan root must follow the sandboxed home, not the machine's app-data folder"
+    );
+}
+
+#[test]
+fn test_cherrystudio_connected_aliases_count_once_cold_and_warm_cache() {
+    let tmp = create_empty_fixture_dir();
+    write_cherrystudio_connected_alias_transcript(tmp.path());
+
+    // The first invocation parses the transcript and writes the source cache;
+    // the second reads that cache. Both must retain the parser's one-call
+    // contribution rather than reviving the three partial snapshots.
+    for pass in ["cold", "warm"] {
+        let output = cmd_with_home(tmp.path())
+            .args([
+                "models",
+                "--json",
+                "--client",
+                "cherrystudio",
+                "--no-spinner",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{pass} cache pass failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["totalMessages"].as_i64(), Some(1), "{pass} cache pass");
+        assert_eq!(json["totalInput"].as_i64(), Some(100), "{pass} cache pass");
+        assert_eq!(json["totalOutput"].as_i64(), Some(300), "{pass} cache pass");
+    }
+}
+
+#[test]
+fn test_cherrystudio_historical_timestamp_survives_timestampless_replay_cold_and_warm() {
+    let tmp = create_empty_fixture_dir();
+    write_cherrystudio_historical_replay_without_timestamp(tmp.path());
+
+    // The first pass parses the source; the second reads its cache. Neither
+    // may promote the historical call into today because a later replay lacks
+    // an event timestamp. The replay's cumulative output still contributes.
+    for pass in ["cold", "warm"] {
+        let output = cmd_with_home(tmp.path())
+            .args([
+                "models",
+                "--json",
+                "--today",
+                "--client",
+                "cherrystudio",
+                "--no-spinner",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{pass} cache pass failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["totalMessages"].as_i64(), Some(0), "{pass} cache pass");
+        assert_eq!(json["totalInput"].as_i64(), Some(0), "{pass} cache pass");
+        assert_eq!(json["totalOutput"].as_i64(), Some(0), "{pass} cache pass");
+    }
+
+    let output = cmd_with_home(tmp.path())
+        .args([
+            "models",
+            "--json",
+            "--client",
+            "cherrystudio",
+            "--no-spinner",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "totals report failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["totalMessages"].as_i64(), Some(1));
+    assert_eq!(json["totalInput"].as_i64(), Some(100));
+    assert_eq!(json["totalOutput"].as_i64(), Some(300));
 }
 
 fn assert_cursor_setup_warning(json: &serde_json::Value) {
