@@ -103,6 +103,7 @@
 | <img width="48px" src=".github/assets/client-devin.jpg" alt="Devin Desktop" /> | [Devin Desktop](https://devin.ai/) | ACP events: macOS `~/Library/Application Support/Devin/User/acp-events/`; Linux `~/.config/Devin/User/acp-events/`; Windows `%APPDATA%\Devin\User\acp-events\` |
 | <img width="48px" src="https://github.com/augmentcode.png" alt="Augment Code" /> | [Augment Code](https://www.augmentcode.com/) (Auggie CLI) | `~/.augment/sessions/*.json` |
 | <img width="48px" src=".github/assets/client-synthetic.png" alt="Synthetic" /> | [Synthetic](https://synthetic.new/) | Re-attributed from other sources via `hf:` model prefix or `synthetic` provider (+ [Octofriend](https://github.com/synthetic-lab/octofriend): `~/.local/share/octofriend/sqlite.db`) |
+| <img width="48px" src="https://github.com/deepseek-ai.png" alt="DeepSeek Harness" /> | [DeepSeek Harness](https://github.com/deepseek-ai/DeepSeek-Harness) | `~/.dsh/sessions/**/session.jsonl.zstd` (or `session.jsonl` when written uncompressed; override via `DSH_HOME`) |
 
 Get real-time pricing calculations using [🚅 LiteLLM's pricing data](https://github.com/BerriAI/litellm), with support for tiered pricing models and cache token discounts.
 
@@ -308,7 +309,7 @@ Press `g` in the TUI or use `--group-by` in `--light`/`--json` mode to control h
 | **Model** | `--group-by model` | ✅ | One row per model — merges all clients and providers |
 | **Client + Model** | `--group-by client,model` | | One row per client-model pair |
 | **Client + Provider + Model** | `--group-by client,provider,model` | | Most granular — no merging |
-| **Workspace + Model** | `--group-by workspace,model` | | Group local usage by workspace key, then model |
+| **Workspace + Model** | `--group-by workspace,model` | | Group local usage by workspace key, then model — add [`--merge-worktrees`](#per-workspace-cost) to fold git worktrees into their repo |
 | **Session + Model** | `--group-by session,model` | | One row per `session_id` and model — attribute cost to a specific agent-CLI session |
 | **Client + Session + Model** | `--group-by client,session,model` | | One row per client, session, and model — useful for multi-agent runners that join on `session_id` |
 
@@ -360,6 +361,30 @@ Press `g` in the TUI or use `--group-by` in `--light`/`--json` mode to control h
 ```
 
 Use `--group-by client,session,model` when you also need the client name on every row (one spawn across all 20+ supported CLIs at once).
+
+#### Per-workspace cost
+
+`--group-by workspace,model` attributes usage to the directory an agent ran in, so you can see what a given project cost:
+
+```bash
+# One row per (workspace, model)
+tokscale models --light --group-by workspace,model --month
+
+# Fold every git worktree into its parent repository — one row per repo
+tokscale models --light --group-by workspace,model --merge-worktrees --month
+
+# JSON carries workspaceKey (grouping identity) and workspaceLabel (display name)
+tokscale models --json --group-by workspace,model --merge-worktrees
+```
+
+In the TUI, press `g` → **Workspace + Model**, then `w` to toggle worktree rollup (the footer shows `[w:worktrees]` or `[w:repos]`).
+
+Workspace rows are labeled `repo` or `repo ⑃ worktree`. Clients disagree about how they record a workspace — Claude Code stores a dash-mangled directory slug (`-Users-me-devpro-app`) while Codex and OpenCode store real paths — so tokscale resolves slugs back to their true path against the filesystem. Four consequences worth knowing:
+
+- **Without `--merge-worktrees`, each git worktree is its own row.** Agent CLIs that isolate every task into a worktree will therefore spread one repository across many rows; `--merge-worktrees` re-unites them (and also merges a repo recorded by different clients under different key formats).
+- **`--merge-worktrees` finds worktrees kept inside the repo and beside it.** `<repo>/.claude/worktrees/<name>` (what agent CLIs create) and `<repo>/.git/worktrees/<name>` are recognized from the path alone; a worktree checked out elsewhere (`git worktree add ../feature-x`) is recognized by reading its `.git` pointer file back to the repository. A repo reached through two different path spellings (a symlink and its target) still stays two rows, because a workspace identity is compared as a string. Totals are unaffected either way — usage is split across rows, never lost or double counted.
+- **Rows that would show the same name are qualified with their parent directory.** A label is the directory's own name, so `~/work/api` and `~/oss/api` would both read `api`; colliding labels gain as many leading path segments as it takes to tell them apart (`work/api`, `oss/api`), and when no path segment can — the same directory recorded by two clients under different key formats — the row is qualified with its workspace key instead. Grouping is unaffected — this only changes the displayed text.
+- **Clients that never record a workspace roll up into a single `Unknown workspace` row.** Roughly half the supported clients (including gemini, cursor, amp, droid, roocode, kilocode, goose, and Copilot's OTEL path) do not write one, so their usage cannot be attributed to a directory.
 
 ### Filtering by Platform
 
@@ -788,7 +813,7 @@ In the TUI, navigate to the **Usage** tab to see subscription data. Use `[Refres
 
 | Provider | Auth Method | Metrics | Setup |
 |----------|-------------|---------|-------|
-| **Claude** | OAuth (credentials file or macOS Keychain) | Session (5hr), Weekly, Opus quotas | Run `claude` to log in |
+| **Claude** | OAuth (credentials file or macOS Keychain) | Session (5hr), Weekly, model-scoped quotas | Run `claude` to log in |
 | **Codex** (OpenAI) | OAuth (Codex auth, saved Tokscale accounts, or OpenCode's `$XDG_DATA_HOME/opencode/auth.json`) | Session, Weekly quotas | Use `[Add Codex]`, run `codex`, import with `tokscale codex import --name work`, or connect OpenAI with ChatGPT Plus/Pro in OpenCode |
 | **Z.ai** | API key (env var) | Token limits, Web Searches | Set `ZAI_API_KEY` or `GLM_API_KEY` |
 | **Amp** | API key (`~/.local/share/amp/secrets.json`) | Free tier balance, Credits | Run `amp` to log in |
