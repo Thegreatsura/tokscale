@@ -483,7 +483,7 @@ define_clients!(
     OpenClaw = 7 => {
         id: "openclaw",
         display: "OpenClaw",
-        logo: Some("https://tokscale.ai/assets/logos/openclaw.png"),root: PathRoot::Home,
+        logo: Some("https://github.com/openclaw.png"),root: PathRoot::Home,
         relative: ".openclaw/agents",
         pattern: "*.jsonl*",
         headless: false,
@@ -954,6 +954,22 @@ define_clients!(
         headless: false,
         parse_local: true,
         submit_default: true
+    },
+    // MiniMax Code exposes authoritative per-call usage through
+    // `mcode exec --output-format stream-json`. Tokscale captures those
+    // streams under its own headless root instead of scanning MiniMax Code's
+    // shared Desktop/Runtime session store, where the originating surface is
+    // not distinguishable.
+    Mcode = 47 => {
+        id: "mcode",
+        display: "MiniMax Code",
+        logo: Some("https://github.com/MiniMax-AI.png"),
+        root: PathRoot::Config,
+        relative: "headless/mcode",
+        pattern: "*.jsonl",
+        headless: true,
+        parse_local: true,
+        submit_default: true
     }
 );
 
@@ -1069,7 +1085,17 @@ mod tests {
 
     #[test]
     fn test_client_id_count() {
-        assert_eq!(ClientId::COUNT, 47);
+        assert_eq!(ClientId::COUNT, 48);
+    }
+
+    #[test]
+    fn test_mcode_registered_as_headless_local_source() {
+        let client = ClientId::from_str("mcode").expect("mcode client should be registered");
+        assert_eq!(client.data().relative_path, "headless/mcode");
+        assert_eq!(client.data().pattern, "*.jsonl");
+        assert!(client.data().headless);
+        assert!(client.data().parse_local);
+        assert!(client.data().submit_default);
     }
 
     #[test]
@@ -2068,5 +2094,40 @@ mod tests {
         assert!(ClientId::Kiro.parse_local());
         assert!(ClientId::Kiro.submit_default());
         assert!(!ClientId::Kiro.supports_headless());
+    }
+
+    /// Every `tokscale.ai/assets/logos/<file>` logo must be backed by a file
+    /// that is actually committed under the frontend's public assets, because
+    /// that directory is what gets deployed to the domain.
+    ///
+    /// This catches the failure this test was added for: the OpenClaw entry
+    /// pointed at `openclaw.png` while the committed asset is `openclaw.jpg`,
+    /// so the URL 404ed and `wrapped` silently rendered no OpenClaw logo. The
+    /// fetch is deliberately fault-tolerant, and the unit test that covered the
+    /// URL asserted the broken string verbatim, so nothing failed.
+    #[test]
+    fn test_hosted_logo_urls_have_a_committed_asset() {
+        const HOSTED_PREFIX: &str = "https://tokscale.ai/assets/logos/";
+
+        let logos_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/frontend/public/assets/logos");
+        // Published crates and pruned checkouts do not carry the frontend.
+        if !logos_dir.is_dir() {
+            return;
+        }
+
+        let missing: Vec<String> = ClientId::iter()
+            .filter_map(|client| Some((client, client.logo_url()?)))
+            .filter_map(|(client, url)| Some((client, url.strip_prefix(HOSTED_PREFIX)?)))
+            .filter(|(_, file)| !logos_dir.join(file).exists())
+            .map(|(client, file)| format!("{} -> {}", client.as_str(), file))
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "logo URLs with no committed asset in {}: {:?}",
+            logos_dir.display(),
+            missing
+        );
     }
 }
