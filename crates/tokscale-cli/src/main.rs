@@ -887,7 +887,7 @@ fn main() -> Result<()> {
         }
         Some(Commands::Usage { json, light }) => {
             reject_unsupported_home_override(&cli.home, "usage")?;
-            commands::usage::run(json, light)
+            commands::usage::run(json, light, cli.debug)
         }
         Some(Commands::Codex { subcommand }) => {
             reject_unsupported_home_override(&cli.home, "codex")?;
@@ -1094,6 +1094,7 @@ pub enum ClientFilter {
     Dsh,
     Mcode,
     Fx,
+    Omp,
     Synthetic,
 }
 
@@ -1153,6 +1154,7 @@ impl ClientFilter {
             Self::Dsh => "dsh",
             Self::Mcode => "mcode",
             Self::Fx => "fx",
+            Self::Omp => "omp",
             Self::Synthetic => "synthetic",
         }
     }
@@ -1215,6 +1217,7 @@ impl ClientFilter {
             Self::Dsh => Some(ClientId::Dsh),
             Self::Mcode => Some(ClientId::Mcode),
             Self::Fx => Some(ClientId::Fx),
+            Self::Omp => Some(ClientId::Omp),
             Self::Synthetic => None,
         }
     }
@@ -1273,6 +1276,7 @@ impl ClientFilter {
             ClientId::Dsh => Self::Dsh,
             ClientId::Mcode => Self::Mcode,
             ClientId::Fx => Self::Fx,
+            ClientId::Omp => Self::Omp,
         }
     }
 
@@ -1612,7 +1616,7 @@ where
     F: FnOnce() -> std::io::Result<tokio::runtime::Runtime>,
 {
     match build_runtime() {
-        Ok(rt) => rt.block_on(async { cursor::sync_cursor_cache().await }),
+        Ok(rt) => rt.block_on(async { cursor::sync_cursor_cache(false).await }),
         Err(error) => cursor::SyncCursorResult {
             synced: false,
             rows: 0,
@@ -5354,6 +5358,17 @@ fn run_import_command(
         "{}",
         format!("    Models: {}", graph.summary.models.len()).bright_black()
     );
+    if outcome.agent_attributed_rows > 0 {
+        eprintln!(
+            "{}",
+            format!(
+                "    Client attribution: exact, from the export's per-agent breakdowns \
+                 ({} row(s))",
+                outcome.agent_attributed_rows
+            )
+            .bright_black()
+        );
+    }
 
     if !outcome.unknown_clients.is_empty() {
         eprintln!(
@@ -5820,7 +5835,7 @@ fn run_submit_command(
     if include_cursor && cursor::is_cursor_logged_in() {
         println!("{}", "  Syncing Cursor usage data...".bright_black());
         let rt_sync = Runtime::new()?;
-        let sync_result = rt_sync.block_on(async { cursor::sync_cursor_cache().await });
+        let sync_result = rt_sync.block_on(async { cursor::sync_cursor_cache(false).await });
         if sync_result.synced {
             println!(
                 "{}",

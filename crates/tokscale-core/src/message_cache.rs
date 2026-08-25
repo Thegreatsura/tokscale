@@ -1038,7 +1038,10 @@ fn parser_version(client: ClientId) -> u32 {
         // shared identity, and a valid span_id alone (no trace_id) is now a
         // stable dedup key instead of falling through to the line-index key.
         // v7->v8: stabilize duplicate agent attribution and partial timing boundaries.
-        ClientId::Copilot => 8,
+        // v8->v9: chatSessions v3 kind-1 incremental updates are now applied
+        // when reconstructing VS Code Copilot Chat requests; v8 aggregates
+        // carry those sessions as zero-token.
+        ClientId::Copilot => 9,
         // Pi subagent sessions now derive agent attribution from session_info
         // names; version-1 caches carry those messages without agent metadata.
         ClientId::Pi => 2,
@@ -1201,6 +1204,11 @@ fn parser_version(client: ClientId) -> u32 {
         // are versioned from the start so later parser changes have an
         // obvious local counter to bump, like every other client here.
         ClientId::Fx => 1,
+        // omp delegates to the shared pi-format parser, so any pi.rs parse
+        // change that bumps ClientId::Pi must be evaluated for Omp (and Senpi)
+        // too — the shared code path changes what byte-identical omp files
+        // parse to even though omp's own module did not change.
+        ClientId::Omp => 1,
         _ => 1,
     }
 }
@@ -3089,8 +3097,8 @@ mod tests {
     }
 
     #[test]
-    fn test_copilot_duplicate_metadata_parser_version_invalidates_v7_entries() {
-        assert_eq!(parser_version(ClientId::Copilot), 8);
+    fn test_copilot_kind1_update_parser_version_invalidates_v8_entries() {
+        assert_eq!(parser_version(ClientId::Copilot), 9);
     }
 
     #[test]
