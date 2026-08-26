@@ -329,6 +329,26 @@ impl SourceFingerprint {
         Self::from_path_with_related(path, related_paths)
     }
 
+    /// Fingerprint for an fx usage snapshot together with the sibling
+    /// `session.json` its parse reads for the workspace root and the
+    /// authoritative timestamps, so a sidecar-only rewrite (the snapshot
+    /// untouched) cannot serve stale workspace attribution or stale day
+    /// placement.
+    ///
+    /// The shared `sessions/index.json` is deliberately absent: one file backs
+    /// every fx session, so folding it in would make each newly appended
+    /// session invalidate every other session's entry. The title it carries is
+    /// resolved after the cache instead — see
+    /// `crate::sessions::fx::apply_session_titles`.
+    #[cfg(test)]
+    pub(crate) fn from_fx_path(path: &Path) -> Option<Self> {
+        Self::from_path_with_related_mode(
+            path,
+            fx_related_paths(path),
+            ContentHashMode::SamplesOnly,
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn from_kimi_path(path: &Path) -> Option<Self> {
         if crate::sessions::kimi::is_kimi_code_path(path) {
@@ -581,6 +601,20 @@ impl SourceFingerprint {
         Self::check_kimi_path_with_mode(path, cached, ContentHashMode::SamplesOnly)
     }
 
+    /// See [`SourceFingerprint::from_fx_path`] for why only the per-session
+    /// `session.json` participates and the shared index does not.
+    pub(crate) fn check_fx_path_samples_only(
+        path: &Path,
+        cached: Option<&Self>,
+    ) -> Option<FingerprintStatus> {
+        Self::check_path_with_related_mode(
+            path,
+            fx_related_paths(path),
+            cached,
+            ContentHashMode::SamplesOnly,
+        )
+    }
+
     /// Stats are append-only JSONL; use bounded samples to avoid hashing a
     /// growing daily log on every warm scan.
     pub(crate) fn check_reasonix_path_samples_only(
@@ -720,6 +754,17 @@ impl RelatedFileFingerprint {
             Err(_) => None,
         }
     }
+}
+
+/// The one related file an fx snapshot's cache identity carries. Kept as a
+/// single helper so the checked set and the built set can never drift: a
+/// mismatch in count alone is enough to make `related_fingerprint_metadata_matches`
+/// report a miss on every scan.
+fn fx_related_paths(path: &Path) -> Vec<(String, PathBuf)> {
+    vec![(
+        "session.json".to_string(),
+        crate::sessions::fx::fx_session_meta_path(path),
+    )]
 }
 
 fn cached_claude_parent_paths(cached: &SourceFingerprint) -> Vec<(String, PathBuf)> {
@@ -1203,12 +1248,22 @@ fn parser_version(client: ClientId) -> u32 {
         // First version of the fx (vercel-labs) usage-v2.json parser. Entries
         // are versioned from the start so later parser changes have an
         // obvious local counter to bump, like every other client here.
-        ClientId::Fx => 1,
+        // v1->v2: `total_cost` is optional at both the per-model and the
+        // snapshot level, and its absence is no longer defaulted to an
+        // authoritative $0.00. A snapshot that never carried a cost is
+        // byte-identical before and after, so only this bump discards the v1
+        // rows still holding a provider-reported zero.
+        ClientId::Fx => 2,
         // omp delegates to the shared pi-format parser, so any pi.rs parse
         // change that bumps ClientId::Pi must be evaluated for Omp (and Senpi)
         // too — the shared code path changes what byte-identical omp files
         // parse to even though omp's own module did not change.
         ClientId::Omp => 1,
+        // v1 -> v2: the OpenCode parser now prefers `session_v2` metadata over
+        // the legacy `session` join for workspace and title. A database that
+        // carries both tables is byte-identical before and after, so only the
+        // version bump discards entries still holding the old attribution.
+        ClientId::OpenCode => 2,
         _ => 1,
     }
 }
@@ -3236,6 +3291,14 @@ mod tests {
     }
 
     #[test]
+    fn test_opencode_session_v2_metadata_parser_version_invalidates_v1_entries() {
+        // A database holding both `session` and `session_v2` does not change on
+        // disk when the parser starts preferring the newer table, so the
+        // fingerprint keeps matching and only this bump forces the reparse.
+        assert_eq!(parser_version(ClientId::OpenCode), 2);
+    }
+
+    #[test]
     fn test_droid_usage_anchor_parser_version_invalidates_v1_entries() {
         // A finished Droid session's settings.json is never rewritten again, so
         // its fingerprint keeps matching and only the version bump discards the
@@ -3501,6 +3564,206 @@ mod tests {
         std::fs::write(&would_be_config, br#"{"model":"unrelated"}"#).unwrap();
         let code_with_config = SourceFingerprint::from_kimi_path(&code_path).unwrap();
         assert_eq!(code_base, code_with_config);
+    }
+
+    #[test]
+    fn test_fx_fingerprint_tracks_session_sidecar_and_ignores_the_shared_index() {
+        let dir = TempDir::new().unwrap();
+        let sessions_dir = dir.path().join("sessions");
+        let session_dir = sessions_dir.join("sess-1");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let usage_path = session_dir.join("usage-v2.json");
+        std::fs::write(
+            &usage_path,
+            br#"{"schema_version":1,"session_id":"sess-1","snapshot":{"models":[{"model":"zai/glm-5.2","input_tokens":10,"output_tokens":5}]}}"#,
+        )
+        .unwrap();
+
+        // A session whose `session.json` has not been written yet records the
+        // absence, so its later creation invalidates without the snapshot ever
+        // being rewritten.
+        let base = SourceFingerprint::from_fx_path(&usage_path).unwrap();
+        assert!(base
+            .related_files
+            .iter()
+            .any(|related| related.suffix == "session.json" && !related.exists));
+
+        let meta_path = session_dir.join("session.json");
+        std::fs::write(
+            &meta_path,
+            br#"{"workspace_root":"/repo/one","updated_at_ms":1787196905040}"#,
+        )
+        .unwrap();
+        let with_meta = SourceFingerprint::from_fx_path(&usage_path).unwrap();
+        assert_ne!(base, with_meta);
+        assert!(matches!(
+            SourceFingerprint::check_fx_path_samples_only(&usage_path, Some(&base)),
+            Some(FingerprintStatus::Changed(_))
+        ));
+
+        // A sidecar-only rewrite carries the workspace root and the
+        // authoritative timestamps, so it must miss the cache even though
+        // usage-v2.json is untouched.
+        std::fs::write(
+            &meta_path,
+            br#"{"workspace_root":"/repo/two","updated_at_ms":1787456105040}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            SourceFingerprint::check_fx_path_samples_only(&usage_path, Some(&with_meta)),
+            Some(FingerprintStatus::Changed(_))
+        ));
+        let moved = SourceFingerprint::from_fx_path(&usage_path).unwrap();
+
+        // The shared index is deliberately outside the identity: it backs every
+        // fx session, so appending one would otherwise evict all the others.
+        std::fs::write(
+            sessions_dir.join("index.json"),
+            br#"{"sessions":[{"id":"sess-1","title":"One"},{"id":"sess-2","title":"Two"}]}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                SourceFingerprint::check_fx_path_samples_only(&usage_path, Some(&moved)),
+                Some(FingerprintStatus::Unchanged)
+            ),
+            "a new session in the shared index must not invalidate an existing session's entry"
+        );
+
+        // Entries written before the sidecar joined the identity carry no
+        // related files at all, and the count mismatch alone retires them on
+        // the first scan. That is why widening the identity needs no
+        // parser_version bump: nothing byte-identical parses differently, and
+        // every pre-existing entry is already rebuilt exactly once. The counter
+        // below reads 2 for an unrelated reason -- the cost-provenance change
+        // in `test_fx_parser_version_invalidates_rows_without_cost_provenance`.
+        let legacy = SourceFingerprint {
+            related_files: Vec::new(),
+            ..moved
+        };
+        assert!(matches!(
+            SourceFingerprint::check_fx_path_samples_only(&usage_path, Some(&legacy)),
+            Some(FingerprintStatus::Changed(_))
+        ));
+        assert_eq!(parser_version(ClientId::Fx), 2);
+    }
+
+    #[test]
+    fn test_fx_parser_version_invalidates_rows_without_cost_provenance() {
+        // A `usage-v2.json` that never carried `total_cost` is byte-identical
+        // before and after the parser stopped stamping its absence as a
+        // provider-reported $0.00, so the fingerprint keeps matching and only
+        // this bump discards the v1 rows still holding the authoritative zero.
+        assert_eq!(parser_version(ClientId::Fx), 2);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_fx_sidecar_edit_is_reflected_while_an_index_title_edit_stays_warm() {
+        let temp_home = TempDir::new().unwrap();
+        let _cache_env = sandbox_cache_env(temp_home.path());
+        let source_home = TempDir::new().unwrap();
+        let sessions_dir = PathBuf::from(
+            ClientId::Fx
+                .data()
+                .resolve_path_with_env_strategy(&source_home.path().to_string_lossy(), false),
+        );
+        let session_dir = sessions_dir.join("sess-1");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let usage_path = session_dir.join("usage-v2.json");
+        std::fs::write(
+            &usage_path,
+            br#"{"schema_version":1,"session_id":"sess-1","snapshot":{"total_cost":0.01,"request_count":1,"models":[{"model":"zai/glm-5.2","total_cost":0.01,"input_tokens":10,"output_tokens":5,"request_count":1}]}}"#,
+        )
+        .unwrap();
+        let meta_path = session_dir.join("session.json");
+        std::fs::write(
+            &meta_path,
+            br#"{"workspace_root":"/repo/one","updated_at_ms":1787196905040}"#,
+        )
+        .unwrap();
+        let index_path = sessions_dir.join("index.json");
+        std::fs::write(
+            &index_path,
+            br#"{"schema_version":3,"sessions":[{"id":"sess-1","title":"First title"}]}"#,
+        )
+        .unwrap();
+
+        let scan = |home: &std::path::Path| {
+            crate::parse_all_messages_with_pricing_with_env_strategy(
+                home.to_str().unwrap(),
+                &["fx".to_string()],
+                None,
+                false,
+                &crate::scanner::ScannerSettings::default(),
+            )
+        };
+        let identity = CacheIdentity::for_client(ClientId::Fx);
+        let assert_warm = |context: &str| {
+            let cache = SourceMessageCache::load();
+            let entry = cache
+                .get(identity, &usage_path)
+                .unwrap_or_else(|| panic!("{context}: the fx entry should have been persisted"));
+            assert!(
+                matches!(
+                    SourceFingerprint::check_fx_path_samples_only(
+                        &usage_path,
+                        Some(&entry.fingerprint)
+                    ),
+                    Some(FingerprintStatus::Unchanged)
+                ),
+                "{context}: the session should still hit the cache warm"
+            );
+        };
+
+        let first = scan(source_home.path());
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].workspace_key.as_deref(), Some("/repo/one"));
+        assert_eq!(first[0].timestamp, 1787196905040);
+        assert_eq!(first[0].session_title.as_deref(), Some("First title"));
+        assert_warm("an untouched session");
+
+        // Title-only edit in the shared index: reflected on the next scan, and
+        // it must cost nothing -- no entry is invalidated.
+        std::fs::write(
+            &index_path,
+            br#"{"schema_version":3,"sessions":[{"id":"sess-1","title":"Renamed in the index"}]}"#,
+        )
+        .unwrap();
+        let second = scan(source_home.path());
+        assert_eq!(second.len(), 1);
+        assert_eq!(
+            second[0].session_title.as_deref(),
+            Some("Renamed in the index")
+        );
+        assert_eq!(second[0].workspace_key.as_deref(), Some("/repo/one"));
+        assert_warm("a title-only index edit");
+
+        // Sidecar-only edit: usage-v2.json is untouched, but session.json now
+        // names a different workspace and a different day.
+        std::fs::write(
+            &meta_path,
+            br#"{"workspace_root":"/repo/two","updated_at_ms":1787456105040}"#,
+        )
+        .unwrap();
+        let third = scan(source_home.path());
+        assert_eq!(third.len(), 1);
+        assert_eq!(
+            third[0].workspace_key.as_deref(),
+            Some("/repo/two"),
+            "a session.json rewrite must not be served from the cached parse"
+        );
+        assert_eq!(third[0].timestamp, 1787456105040);
+        assert_ne!(
+            third[0].date, first[0].date,
+            "the authoritative timestamp lives in the sidecar, so a stale parse misplaces the day"
+        );
+        assert_eq!(
+            third[0].session_title.as_deref(),
+            Some("Renamed in the index")
+        );
+        assert_eq!(third[0].tokens, first[0].tokens);
+        assert_warm("a re-parsed session");
     }
 
     #[test]

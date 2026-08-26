@@ -10,11 +10,19 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_RPC_BODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_IDENTITY_PROBE_BYTES: usize = 4096;
 const ANTIGRAVITY_MANIFEST_VERSION: i32 = 1;
+
+/// Wall clock one `sync` may waste on failed trajectory-enrichment RPCs before
+/// it stops attempting them at all. See [`TrajectoryEnrichmentBudget`].
+const TRAJECTORY_ENRICHMENT_BUDGET: Duration = Duration::from_secs(60);
+
+/// Consecutive enrichment failures on one connection before that connection is
+/// written off for the rest of the sync. See [`TrajectoryEnrichmentBudget`].
+const TRAJECTORY_ENRICHMENT_FAILURE_THRESHOLD: u32 = 2;
 
 #[cfg(not(target_os = "windows"))]
 static HTTPS_RPC_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -226,9 +234,14 @@ pub fn run_antigravity_sync() -> Result<()> {
         sessions: Vec::new(),
     };
 
+    // One budget for the whole sync: the enrichment RPCs it bounds all run
+    // under the exclusive cache lock acquired above.
+    let mut enrichment = TrajectoryEnrichmentBudget::new();
+
     for candidate in &export_candidates {
         if let Some(summary) = find_summary_for_candidate(&summaries, &candidate.session_id) {
-            if let Some(artifact) = fetch_session_artifact(summary, &connections)? {
+            if let Some(artifact) = fetch_session_artifact(summary, &connections, &mut enrichment)?
+            {
                 let path = write_session_artifact(&summary.session_id, &artifact.contents)?;
                 let relative_path = to_relative_artifact_path(&path)?;
 
@@ -244,9 +257,12 @@ pub fn run_antigravity_sync() -> Result<()> {
             }
         }
 
-        if let Some(entry) =
-            fetch_historical_session_artifact(&candidate.session_id, &connections, candidate)?
-        {
+        if let Some(entry) = fetch_historical_session_artifact(
+            &candidate.session_id,
+            &connections,
+            candidate,
+            &mut enrichment,
+        )? {
             next_manifest.sessions.push(entry);
             continue;
         }
@@ -1890,6 +1906,7 @@ fn fetch_historical_session_artifact(
     session_id: &str,
     connections: &[AntigravityConnection],
     candidate: &SessionCandidate,
+    budget: &mut TrajectoryEnrichmentBudget,
 ) -> Result<Option<ManifestSessionEntry>> {
     let fallback_summary = TrajectorySummary {
         session_id: session_id.to_string(),
@@ -1901,7 +1918,7 @@ fn fetch_historical_session_artifact(
             .unwrap_or_default(),
     };
 
-    if let Some(artifact) = fetch_session_artifact(&fallback_summary, connections)? {
+    if let Some(artifact) = fetch_session_artifact(&fallback_summary, connections, budget)? {
         let path = write_session_artifact(session_id, &artifact.contents)?;
         return Ok(Some(ManifestSessionEntry {
             session_id: session_id.to_string(),
@@ -1943,6 +1960,84 @@ fn rpc_request(connection: &AntigravityConnection, method: &str, body: &Value) -
     }
 }
 
+/// Argument vector for the Windows `curl.exe` RPC fallback.
+///
+/// Split out of the `cfg(windows)` caller so the two ordering rules it has to
+/// satisfy are covered by the test suite on every host instead of only by the
+/// Windows CI job.
+///
+/// `-q` has to be the first argument: curl applies `%USERPROFILE%\_curlrc`
+/// (`~/.curlrc`) before it parses anything that comes later, so `-q` anywhere
+/// else no longer suppresses it. An explicit `-K` is still honored after `-q`,
+/// which is what keeps the CSRF header and the body on stdin.
+///
+/// `--noproxy "*"` bypasses proxy resolution for every host, including the
+/// `HTTPS_PROXY` / `ALL_PROXY` environment variables curl would otherwise
+/// obey. Without it a request aimed at the DesktopAgent on loopback can be
+/// handed to a configured remote proxy together with the CSRF token and the
+/// RPC body. The non-Windows path gets the same guarantee from `reqwest`'s
+/// `.no_proxy()`.
+#[cfg(any(target_os = "windows", test))]
+fn windows_curl_rpc_args(url: &str) -> Vec<&str> {
+    vec![
+        // Must stay first, see above.
+        "-q",
+        "--noproxy",
+        "*",
+        "-k",
+        "-sS",
+        "--http1.1",
+        "--max-time",
+        "10",
+        "-X",
+        "POST",
+        url,
+        "-H",
+        "Content-Type: application/json",
+        "-H",
+        "Connect-Protocol-Version: 1",
+        "-K",
+        "-",
+        "--write-out",
+        "\\n%{http_code}",
+    ]
+}
+
+/// Read at most `max_bytes + 1` bytes out of `reader`.
+///
+/// The ceiling is applied while the bytes are being read rather than to the
+/// finished buffer, so a writer that keeps producing can never make this
+/// allocate past the cap. The one byte of headroom is what separates a
+/// response that exactly fills the cap from one that runs past it: the caller
+/// rejects anything longer than `max_bytes`.
+#[cfg(any(target_os = "windows", test))]
+fn read_curl_stdout_with_cap<R: Read>(reader: R, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    reader.take(max_bytes as u64 + 1).read_to_end(&mut body)?;
+    Ok(body)
+}
+
+/// Keep the first `max_bytes` of `reader`, then read the remainder to EOF and
+/// throw it away.
+///
+/// Both halves are load-bearing. The buffer is bounded because this text only
+/// ever reaches a diagnostic message, so a child that talks forever must not
+/// be able to grow it. The drain is unconditional because a pipe nobody reads
+/// fills up and blocks its writer: with the caller reading the child's stdout
+/// to EOF, a child parked on a full stderr buffer would leave both pipes stuck
+/// for good. Read errors are swallowed on purpose — whatever was captured
+/// before the error is still the most useful thing to report.
+#[cfg(any(target_os = "windows", test))]
+fn drain_curl_stderr_with_cap<R: Read>(mut reader: R, max_bytes: usize) -> Vec<u8> {
+    let mut kept = Vec::new();
+    let _ = reader
+        .by_ref()
+        .take(max_bytes as u64)
+        .read_to_end(&mut kept);
+    let _ = std::io::copy(&mut reader, &mut std::io::sink());
+    kept
+}
+
 fn https_rpc_request(
     connection: &AntigravityConnection,
     method: &str,
@@ -1977,37 +2072,54 @@ fn https_rpc_request(
         );
         let body_str = serde_json::to_string(body)?;
 
-        // Resolve curl.exe by absolute path: a PATH lookup can be shadowed by
-        // a user-writable directory, handing the CSRF token to an impostor.
+        // curl.exe is invoked by absolute path so a PATH lookup cannot be
+        // shadowed by a user-writable directory earlier in the search order.
+        // That is the whole of what the absolute path buys. The root still
+        // comes from the inherited `SystemRoot`, so a parent process that
+        // controls this process' environment can still point
+        // `System32\curl.exe` at a binary of its choosing, which then
+        // receives the CSRF token and the RPC body on stdin. Dropping that
+        // assumption means resolving the system directory through
+        // `GetSystemDirectoryW`, which needs a Win32 binding this workspace
+        // does not depend on; until then the environment tokscale is launched
+        // with is trusted.
         let system32_curl = std::env::var_os("SystemRoot")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| std::path::PathBuf::from("C:\\Windows"))
             .join("System32\\curl.exe");
 
+        // curl.exe stderr only ever carries a short diagnostic (`-sS` drops the
+        // progress meter but keeps errors), so this is already generous.
+        const MAX_CURL_STDERR_BYTES: usize = 64 * 1024;
+
         let mut child = std::process::Command::new(&system32_curl)
-            .args([
-                "-k",
-                "-sS",
-                "--http1.1",
-                "--max-time",
-                "10",
-                "-X",
-                "POST",
-                &url,
-                "-H",
-                "Content-Type: application/json",
-                "-H",
-                "Connect-Protocol-Version: 1",
-                "-K",
-                "-",
-                "--write-out",
-                "\\n%{http_code}",
-            ])
+            .args(windows_curl_rpc_args(&url))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .with_context(|| "Failed to execute curl.exe for Windows RPC fallback")?;
+
+        let child_stdout = child
+            .stdout
+            .take()
+            .context("curl.exe stdout unavailable for Windows RPC fallback")?;
+        let child_stderr = child
+            .stderr
+            .take()
+            .context("curl.exe stderr unavailable for Windows RPC fallback")?;
+
+        // stderr gets its own thread, started before anything is written to
+        // stdin, and that thread reads it to EOF. Reading one pipe to EOF on
+        // this thread while the child sits blocked on a full buffer in the
+        // other is the classic two-pipe deadlock, so neither pipe is ever left
+        // unattended: stdout is read here, stderr is read there, and both keep
+        // moving no matter what the child does with the other one. Only the
+        // first MAX_CURL_STDERR_BYTES are retained; the rest is discarded as
+        // it arrives instead of being buffered.
+        let stderr_drain = std::thread::spawn(move || {
+            drain_curl_stderr_with_cap(child_stderr, MAX_CURL_STDERR_BYTES)
+        });
 
         // The CSRF token and body ride stdin (`-K -`) rather than argv, which
         // any same-user process can read.
@@ -2023,30 +2135,49 @@ fn https_rpc_request(
             .write_all(config.as_bytes())
             .context("Failed to write curl.exe config for Windows RPC fallback")?;
 
-        let output = child
-            .wait_with_output()
-            .with_context(|| "Failed to execute curl.exe for Windows RPC fallback")?;
+        // The cap is enforced while curl is still transferring, not once the
+        // whole response is already in memory: at most MAX_RPC_BODY_BYTES + 1
+        // bytes are ever held. Loopback is fast and `--max-time` leaves a 10s
+        // window, so a DesktopAgent that streams far more than the cap would
+        // otherwise be allowed to allocate all of it and only then be
+        // rejected. Here it is cut off at the ceiling instead.
+        let stdout_bytes = match read_curl_stdout_with_cap(child_stdout, MAX_RPC_BODY_BYTES) {
+            Ok(bytes) if bytes.len() <= MAX_RPC_BODY_BYTES => bytes,
+            outcome => {
+                // Either the ceiling was blown or the pipe read failed. Both
+                // end the transfer: kill curl so it stops streaming into a
+                // pipe nobody is reading, reap it, and only then join the
+                // drain thread, which ends as soon as the child's stderr
+                // handle is gone.
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stderr_drain.join();
+                let bytes =
+                    outcome.context("Failed to read curl.exe response for Windows RPC fallback")?;
+                anyhow::bail!(
+                    "Antigravity RPC body of {} bytes exceeds {MAX_RPC_BODY_BYTES} cap",
+                    bytes.len()
+                );
+            }
+        };
 
-        if !output.status.success() {
+        let status = child
+            .wait()
+            .with_context(|| "Failed to execute curl.exe for Windows RPC fallback")?;
+        let stderr_bytes = stderr_drain.join().unwrap_or_default();
+
+        if !status.success() {
             anyhow::bail!(
                 "Windows curl.exe RPC fallback failed (exit code {}): {}",
-                output
-                    .status
+                status
                     .code()
                     .map(|c| c.to_string())
                     .unwrap_or_else(|| "unknown".into()),
-                String::from_utf8_lossy(&output.stderr)
+                String::from_utf8_lossy(&stderr_bytes)
             );
         }
 
-        if output.stdout.len() > MAX_RPC_BODY_BYTES {
-            anyhow::bail!(
-                "Antigravity RPC body of {} bytes exceeds {MAX_RPC_BODY_BYTES} cap",
-                output.stdout.len()
-            );
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
         let (response_body, status_line) = stdout.rsplit_once('\n').with_context(|| {
             format!("curl.exe returned no HTTP status for Antigravity RPC {method}")
         })?;
@@ -2366,6 +2497,7 @@ fn normalize_trajectory_summaries(response: &Value, fingerprint: &str) -> Vec<Tr
 fn fetch_session_artifact(
     summary: &TrajectorySummary,
     connections: &[AntigravityConnection],
+    budget: &mut TrajectoryEnrichmentBudget,
 ) -> Result<Option<SessionArtifact>> {
     let preferred = connections
         .iter()
@@ -2382,7 +2514,7 @@ fn fetch_session_artifact(
     );
 
     for connection in ordered {
-        if let Some(artifact) = try_fetch_session_artifact(summary, connection)? {
+        if let Some(artifact) = try_fetch_session_artifact(summary, connection, budget)? {
             return Ok(Some(artifact));
         }
     }
@@ -2390,9 +2522,128 @@ fn fetch_session_artifact(
     Ok(None)
 }
 
+/// Budget and per-connection circuit breaker for the OPTIONAL
+/// `GetCascadeTrajectory` enrichment.
+///
+/// `sync` holds its exclusive cache lock while it walks every session, and each
+/// session whose metadata carries usage without timestamps costs one extra
+/// synchronous RPC. That call is best-effort: when it fails the session simply
+/// keeps its metadata-derived timestamp, which is what
+/// [`try_fetch_session_artifact`] has always done per session. But "fails"
+/// means the full 10s transport timeout when the endpoint stalls rather than
+/// refuses, and only after that timeout is the error discarded. With metadata
+/// still answering, a few hundred affected sessions therefore turn a sync into
+/// tens of minutes while the held lock blocks every other sync and purge.
+///
+/// Two limits bound that, and both only ever count *wasted* time. A healthy
+/// enrichment over loopback finishes in milliseconds and is never charged, so a
+/// large well-behaved history keeps all of its timestamps no matter how many
+/// sessions it has — degrading enrichment must never be the normal outcome, and
+/// must never fail the sync.
+///
+/// - Per connection, [`TRAJECTORY_ENRICHMENT_FAILURE_THRESHOLD`] consecutive
+///   failures write that connection off for the remainder of the sync. One
+///   failure is indistinguishable from a session whose trajectory genuinely is
+///   not available, so tripping on the first would give up enrichment for an
+///   entire history because of one bad session. Two in a row on the same
+///   connection means the endpoint is the problem, not the session; the extra
+///   attempt costs at most one more transport timeout per connection.
+/// - Across the whole sync, [`TRAJECTORY_ENRICHMENT_BUDGET`] of accumulated
+///   failure time stops enrichment outright. At the 10s transport timeout that
+///   is six stalled requests for the entire run, so the worst case this
+///   optional work can add to a sync is about a minute regardless of how many
+///   sessions or connections are involved. It is the backstop for what the
+///   per-connection breaker cannot bound on its own: many connections, or one
+///   that alternates between answering and stalling so its consecutive-failure
+///   count keeps resetting.
+#[derive(Debug)]
+struct TrajectoryEnrichmentBudget {
+    budget: Duration,
+    failure_threshold: u32,
+    wasted: Duration,
+    consecutive_failures: HashMap<String, u32>,
+}
+
+impl TrajectoryEnrichmentBudget {
+    fn new() -> Self {
+        Self::with_limits(
+            TRAJECTORY_ENRICHMENT_BUDGET,
+            TRAJECTORY_ENRICHMENT_FAILURE_THRESHOLD,
+        )
+    }
+
+    /// Split out so the budget decision is exercisable without spending real
+    /// wall clock on stalled sockets.
+    fn with_limits(budget: Duration, failure_threshold: u32) -> Self {
+        Self {
+            budget,
+            failure_threshold,
+            wasted: Duration::ZERO,
+            consecutive_failures: HashMap::new(),
+        }
+    }
+
+    fn should_attempt(&self, fingerprint: &str) -> bool {
+        if self.wasted >= self.budget {
+            return false;
+        }
+        self.consecutive_failures
+            .get(fingerprint)
+            .copied()
+            .unwrap_or(0)
+            < self.failure_threshold
+    }
+
+    /// A connection that answers is given its full allowance back: a single
+    /// blip must not accumulate across an otherwise healthy sync.
+    fn record_success(&mut self, fingerprint: &str) {
+        self.consecutive_failures.remove(fingerprint);
+    }
+
+    fn record_failure(&mut self, fingerprint: &str, elapsed: Duration) {
+        self.wasted = self.wasted.saturating_add(elapsed);
+        *self
+            .consecutive_failures
+            .entry(fingerprint.to_string())
+            .or_insert(0) += 1;
+    }
+}
+
+/// Best-effort timestamps for sessions whose metadata does not carry its own.
+///
+/// Every failure mode ends in an empty map rather than an error: the caller
+/// falls back to the metadata-derived timestamp, which is the same outcome a
+/// failed RPC produced before this was bounded.
+fn fetch_usage_timestamps(
+    summary: &TrajectorySummary,
+    connection: &AntigravityConnection,
+    budget: &mut TrajectoryEnrichmentBudget,
+) -> HashMap<String, i64> {
+    if !budget.should_attempt(&connection.fingerprint) {
+        return HashMap::new();
+    }
+
+    let started = Instant::now();
+    match rpc_request(
+        connection,
+        "GetCascadeTrajectory",
+        &serde_json::json!({ "cascadeId": summary.session_id }),
+    ) {
+        Ok(trajectory) => {
+            budget.record_success(&connection.fingerprint);
+            usage_timestamps_from_trajectory(&trajectory)
+        }
+        Err(_) => {
+            budget.record_failure(&connection.fingerprint, started.elapsed());
+            HashMap::new()
+        }
+    }
+}
+
 fn try_fetch_session_artifact(
     summary: &TrajectorySummary,
     connection: &AntigravityConnection,
+    budget: &mut TrajectoryEnrichmentBudget,
 ) -> Result<Option<SessionArtifact>> {
     let response = match rpc_request(
         connection,
@@ -2413,13 +2664,7 @@ fn try_fetch_session_artifact(
     }
 
     let usage_timestamps = if session_metadata_needs_trajectory_timestamps(&metadata) {
-        rpc_request(
-            connection,
-            "GetCascadeTrajectory",
-            &serde_json::json!({ "cascadeId": summary.session_id }),
-        )
-        .map(|trajectory| usage_timestamps_from_trajectory(&trajectory))
-        .unwrap_or_default()
+        fetch_usage_timestamps(summary, connection, budget)
     } else {
         HashMap::new()
     };
@@ -3783,6 +4028,258 @@ mod tests {
         );
     }
 
+    /// Local Antigravity RPC listener whose answer per method a test controls.
+    ///
+    /// The handler receives the RPC method name and returns the JSON body to
+    /// send, or `None` to close without answering — which is how a broken
+    /// endpoint reaches `rpc_request` as an error without a test having to
+    /// spend the 10s transport timeout to get there. Connections that do not
+    /// open with a plaintext POST are the HTTPS fallback leg probing the same
+    /// port; dropping them makes that leg fail immediately too.
+    fn serve_rpc_methods<F>(handler: F) -> (u16, Arc<Mutex<Vec<String>>>)
+    where
+        F: Fn(&str) -> Option<String> + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let methods = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&methods);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                let mut buf = [0_u8; 4096];
+                let Ok(read) = std::io::Read::read(&mut stream, &mut buf) else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&buf[..read]).to_string();
+                if !request.starts_with("POST ") {
+                    continue;
+                }
+                let method = request
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|path| path.rsplit('/').next())
+                    .unwrap_or_default()
+                    .to_string();
+                if let Ok(mut log) = seen.lock() {
+                    log.push(method.clone());
+                }
+                let Some(body) = handler(&method) else {
+                    continue;
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (port, methods)
+    }
+
+    /// Metadata carrying usage with no timestamp anywhere, which is the only
+    /// shape that asks for the optional trajectory enrichment.
+    fn metadata_needing_enrichment() -> String {
+        serde_json::json!({
+            "generatorMetadata": [{
+                "chatModel": {
+                    "responseModel": "gemini-3.7-flash",
+                    "retryInfos": [{
+                        "usage": {
+                            "inputTokens": 10,
+                            "outputTokens": 5,
+                            "responseId": "response-1",
+                            "messageId": "message-1"
+                        }
+                    }]
+                }
+            }]
+        })
+        .to_string()
+    }
+
+    fn enrichment_test_connection(port: u16) -> AntigravityConnection {
+        AntigravityConnection {
+            pid: 1,
+            port,
+            csrf_token: "abcdef0123456789abcdef0123456789".to_string(),
+            fingerprint: format!("pid:1:port:{port}"),
+        }
+    }
+
+    #[test]
+    fn trajectory_enrichment_stops_after_a_connection_keeps_failing() {
+        // The regression this guards: `sync` walks every session under its
+        // exclusive cache lock, and each session whose metadata lacks usage
+        // timestamps used to issue a `GetCascadeTrajectory` whose error was
+        // only discarded after it returned. With metadata still answering and
+        // the trajectory endpoint stalling, that is one full transport timeout
+        // per session with the lock held.
+        let metadata = metadata_needing_enrichment();
+        let (port, seen) = serve_rpc_methods(move |method| match method {
+            "GetCascadeTrajectoryGeneratorMetadata" => Some(metadata.clone()),
+            _ => None,
+        });
+        // The transport cache is keyed by port and outlives individual tests,
+        // so pin it rather than depend on which leg a recycled port last used.
+        remember_rpc_transport(port, RpcTransport::PlainHttp);
+        let connection = enrichment_test_connection(port);
+        let mut budget = TrajectoryEnrichmentBudget::new();
+
+        const SESSIONS: usize = 5;
+        for index in 0..SESSIONS {
+            let summary = TrajectorySummary {
+                session_id: format!("session-{index}"),
+                last_modified_ms: Some(1),
+                step_count: Some(1),
+                connection_fingerprint: connection.fingerprint.clone(),
+            };
+            let artifact = try_fetch_session_artifact(&summary, &connection, &mut budget)
+                .expect("a failed enrichment must never fail the sync")
+                .expect("the session must still be written from its metadata");
+            assert!(
+                artifact.contents.contains(&format!("session-{index}")),
+                "the metadata-derived artifact is the documented fallback: {}",
+                artifact.contents
+            );
+        }
+
+        let methods = seen.lock().unwrap();
+        let metadata_calls = methods
+            .iter()
+            .filter(|method| *method == "GetCascadeTrajectoryGeneratorMetadata")
+            .count();
+        let trajectory_calls = methods
+            .iter()
+            .filter(|method| *method == "GetCascadeTrajectory")
+            .count();
+
+        assert_eq!(
+            metadata_calls, SESSIONS,
+            "metadata is not the optional part and must still be fetched per session"
+        );
+        assert_eq!(
+            trajectory_calls, TRAJECTORY_ENRICHMENT_FAILURE_THRESHOLD as usize,
+            "the breaker must write the connection off after \
+             {TRAJECTORY_ENRICHMENT_FAILURE_THRESHOLD} consecutive failures instead of paying \
+             for every one of the {SESSIONS} sessions"
+        );
+    }
+
+    #[test]
+    fn trajectory_enrichment_keeps_running_while_the_endpoint_answers() {
+        // The breaker must not cost a healthy history its timestamps.
+        let metadata = metadata_needing_enrichment();
+        let trajectory = serde_json::json!({
+            "trajectory": {
+                "steps": [{
+                    "metadata": {
+                        "createdAt": "2026-08-19T06:34:26.163405500Z",
+                        "modelUsage": { "responseId": "response-1", "messageId": "message-1" }
+                    }
+                }]
+            }
+        })
+        .to_string();
+        let (port, seen) = serve_rpc_methods(move |method| match method {
+            "GetCascadeTrajectoryGeneratorMetadata" => Some(metadata.clone()),
+            "GetCascadeTrajectory" => Some(trajectory.clone()),
+            _ => None,
+        });
+        remember_rpc_transport(port, RpcTransport::PlainHttp);
+        let connection = enrichment_test_connection(port);
+        let mut budget = TrajectoryEnrichmentBudget::new();
+
+        const SESSIONS: usize = 5;
+        for index in 0..SESSIONS {
+            let summary = TrajectorySummary {
+                session_id: format!("session-{index}"),
+                last_modified_ms: Some(1),
+                step_count: Some(1),
+                connection_fingerprint: connection.fingerprint.clone(),
+            };
+            let artifact = try_fetch_session_artifact(&summary, &connection, &mut budget)
+                .unwrap()
+                .expect("the session must be written");
+            let usage: Value = artifact
+                .contents
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find(|value| value.get("type").and_then(Value::as_str) == Some("usage"))
+                .expect("the artifact must carry a usage line");
+            assert_eq!(
+                usage.get("timestamp").and_then(Value::as_i64),
+                parse_timestamp_value(&serde_json::json!("2026-08-19T06:34:26.163405500Z")),
+                "an answering endpoint must keep enriching every session"
+            );
+        }
+
+        let trajectory_calls = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|method| *method == "GetCascadeTrajectory")
+            .count();
+        assert_eq!(
+            trajectory_calls, SESSIONS,
+            "a working endpoint must not be rate limited by the breaker"
+        );
+    }
+
+    #[test]
+    fn enrichment_budget_trips_only_on_consecutive_failures() {
+        let mut budget = TrajectoryEnrichmentBudget::with_limits(Duration::from_secs(60), 2);
+
+        assert!(budget.should_attempt("a"));
+        budget.record_failure("a", Duration::from_millis(1));
+        assert!(
+            budget.should_attempt("a"),
+            "one failure is indistinguishable from a session with no trajectory"
+        );
+
+        budget.record_success("a");
+        budget.record_failure("a", Duration::from_millis(1));
+        assert!(
+            budget.should_attempt("a"),
+            "an answering connection gets its full allowance back"
+        );
+
+        budget.record_failure("a", Duration::from_millis(1));
+        assert!(
+            !budget.should_attempt("a"),
+            "two failures in a row mean the endpoint, not the session, is broken"
+        );
+        assert!(
+            budget.should_attempt("b"),
+            "the breaker is per connection, not global"
+        );
+    }
+
+    #[test]
+    fn enrichment_budget_stops_every_connection_once_it_is_spent() {
+        // Simulated elapsed time: the real path charges what a stalled RPC
+        // actually took, and no test should spend a transport timeout to prove
+        // the arithmetic.
+        let mut budget = TrajectoryEnrichmentBudget::with_limits(Duration::from_secs(60), 2);
+
+        for index in 0..6 {
+            let fingerprint = format!("connection-{index}");
+            assert!(
+                budget.should_attempt(&fingerprint),
+                "a fresh connection is attempted while budget remains"
+            );
+            budget.record_failure(&fingerprint, Duration::from_secs(10));
+        }
+
+        assert!(
+            !budget.should_attempt("connection-6"),
+            "six stalled requests at the 10s transport timeout spend the whole sync budget, \
+             so a seventh connection must not be attempted either"
+        );
+    }
+
     #[test]
     fn rpc_request_rejects_oversized_content_length_body() {
         let port = serve_once(
@@ -4244,5 +4741,101 @@ mod tests {
         );
         assert!(cache_dir.join("manifest.json").exists());
         assert!(cache_dir.join("sync.lock").exists());
+    }
+
+    /// The Windows fallback is compiled out on this host, but the argument
+    /// vector is not: `windows_curl_rpc_args` is built on every target under
+    /// `cfg(test)` so the two rules that make it safe are actually checked.
+    #[test]
+    fn windows_curl_rpc_args_ignore_curlrc_and_every_proxy() {
+        let url = "https://127.0.0.1:4321/exa.language_server_pb.LanguageServerService/GetUsage";
+        let args = windows_curl_rpc_args(url);
+
+        // curl only honors `-q` in the first position; anywhere later and the
+        // user's curlrc has already been applied by the time it is parsed.
+        assert_eq!(
+            args.first().copied(),
+            Some("-q"),
+            "-q must be the first argument, got: {args:?}"
+        );
+
+        // The loopback RPC carries the CSRF token, so it must never be routed
+        // through HTTPS_PROXY / ALL_PROXY / a curlrc proxy directive.
+        let noproxy = args
+            .iter()
+            .position(|arg| *arg == "--noproxy")
+            .expect("--noproxy is missing from the curl.exe fallback arguments");
+        assert_eq!(
+            args.get(noproxy + 1).copied(),
+            Some("*"),
+            "--noproxy must bypass every host, got: {args:?}"
+        );
+
+        // The hardening must not have displaced the rest of the invocation:
+        // the config (and with it the CSRF header and the body) still arrives
+        // on stdin, the timeout is still set, and the status code is still
+        // appended to the response.
+        let config = args
+            .iter()
+            .position(|arg| *arg == "-K")
+            .expect("-K is missing from the curl.exe fallback arguments");
+        assert_eq!(args.get(config + 1).copied(), Some("-"));
+        let max_time = args
+            .iter()
+            .position(|arg| *arg == "--max-time")
+            .expect("--max-time is missing from the curl.exe fallback arguments");
+        assert_eq!(args.get(max_time + 1).copied(), Some("10"));
+        assert!(args.contains(&"\\n%{http_code}"), "{args:?}");
+        assert!(args.contains(&url), "{args:?}");
+    }
+
+    /// The Windows fallback itself is compiled out on this host, but the two
+    /// readers that give it its memory bound are not: both are built on every
+    /// target under `cfg(test)`, so the properties that matter are checked
+    /// here instead of only by the Windows CI job.
+    #[test]
+    fn curl_stdout_cap_stops_the_read_instead_of_measuring_the_result() {
+        // `io::repeat` never ends. Anything that buffered the response first
+        // and compared its length afterwards would run until it exhausted
+        // memory; stopping at the ceiling is the only way this returns at all.
+        let body = read_curl_stdout_with_cap(std::io::repeat(b'x'), 64).unwrap();
+        assert_eq!(
+            body.len(),
+            65,
+            "the read must stop one byte past the cap, not at whatever the writer sends"
+        );
+        assert!(
+            body.len() > 64,
+            "that extra byte is what the caller tests to reject an over-cap response"
+        );
+    }
+
+    #[test]
+    fn curl_stdout_exactly_at_the_cap_survives_intact() {
+        // The headroom byte must not turn a response that merely fills the cap
+        // into a rejected one.
+        let source = vec![b'x'; 64];
+        let body = read_curl_stdout_with_cap(source.as_slice(), 64).unwrap();
+        assert_eq!(
+            body, source,
+            "a response at the cap is passed through whole"
+        );
+        assert!(body.len() <= 64, "and is not seen as over the cap");
+    }
+
+    #[test]
+    fn curl_stderr_keeps_a_prefix_but_still_consumes_everything() {
+        let mut source = std::io::Cursor::new(vec![b'e'; 4096]);
+        let kept = drain_curl_stderr_with_cap(&mut source, 128);
+        assert_eq!(
+            kept.len(),
+            128,
+            "only the prefix is buffered for diagnostics"
+        );
+        assert_eq!(
+            source.position(),
+            4096,
+            "the remainder is still consumed; bytes left in the pipe are what block the child"
+        );
     }
 }
