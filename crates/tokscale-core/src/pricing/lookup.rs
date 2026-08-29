@@ -600,12 +600,15 @@ impl PricingLookup {
         // so for pricing lookup we resolve to the base model regardless of tier.
         // Mirrors the dash-suffix path (e.g. `-xhigh`), which is handled by
         // `try_strip_unknown_suffix` below.
-        let normalized_owned = strip_parenthesized_reasoning_tier(&lower).map(str::to_owned);
+        let tier_normalized_owned = strip_parenthesized_reasoning_tier(&lower).map(str::to_owned);
 
         // A tier suffix does not turn a router into a model: `auto(high)`
         // normalizes to `auto` below and would otherwise reach the model-part
         // fallback and elect an unrelated vendor, exactly as the bare form did.
-        if normalized_owned.as_deref().is_some_and(is_routing_label) {
+        if tier_normalized_owned
+            .as_deref()
+            .is_some_and(is_routing_label)
+        {
             return None;
         }
 
@@ -615,7 +618,7 @@ impl PricingLookup {
         // `-` and could match a shorter, unrelated model id by peeling the
         // parenthesized fragment off (e.g. `gpt-5.2-codex(invalid)` would
         // strip `-codex(invalid)` and resolve to `gpt-5.2`).
-        if normalized_owned.is_none()
+        if tier_normalized_owned.is_none()
             && lower
                 .strip_suffix(')')
                 .and_then(|inner| inner.rsplit_once('('))
@@ -624,7 +627,12 @@ impl PricingLookup {
             return None;
         }
 
-        let lower_ref: &str = normalized_owned.as_deref().unwrap_or(&lower);
+        let tier_normalized_ref = tier_normalized_owned.as_deref().unwrap_or(&lower);
+        let fast_normalized_owned = normalize_openai_fast_mode(tier_normalized_ref, provider_id);
+        let lower_ref = fast_normalized_owned
+            .as_deref()
+            .unwrap_or(tier_normalized_ref);
+        let normalized = tier_normalized_owned.is_some() || fast_normalized_owned.is_some();
 
         if alias_applied && force_source.is_none() && aliases::uses_cursor_pricing(model_id) {
             if let Some(result) = self.exact_match_cursor(lower_ref) {
@@ -659,7 +667,7 @@ impl PricingLookup {
             if alias_applied {
                 result = result.with_alias();
             }
-            if normalized_owned.is_some() {
+            if normalized {
                 result = result.with_normalization();
             }
             if matches_inferred_model_provider(lower_ref, provider_id)
@@ -676,7 +684,7 @@ impl PricingLookup {
         };
 
         // 1. Try direct lookup
-        if let Some(result) = do_lookup(lower_ref).map(&annotate_direct) {
+        if let Some(result) = do_lookup(lower_ref).map(annotate_direct) {
             if unsafe_claude_resolution(&result) {
                 return None;
             }
@@ -689,7 +697,7 @@ impl PricingLookup {
 
         let guarded_lookup = |candidate: &str| {
             do_lookup(candidate)
-                .map(&annotate_direct)
+                .map(annotate_direct)
                 .map(LookupResult::with_stripping)
                 .filter(|result| !unsafe_claude_resolution(result))
         };
@@ -1715,20 +1723,20 @@ fn should_prefer_openai_tiered_litellm(
 // silently dropping it. cache_read is now required present+valid like
 // input/output, symmetric with them, for this preference decision only.
 fn has_complete_openai_272k_pricing(pricing: &ModelPricing) -> bool {
-    let valid_pair = |base: Option<f64>, above: Option<f64>| {
-        base.is_some_and(is_valid_price_value) && above.is_some_and(is_valid_price_value)
-    };
-
-    valid_pair(
+    has_valid_rate_pair(
         pricing.input_cost_per_token,
         pricing.input_cost_per_token_above_272k_tokens,
-    ) && valid_pair(
+    ) && has_valid_rate_pair(
         pricing.output_cost_per_token,
         pricing.output_cost_per_token_above_272k_tokens,
-    ) && valid_pair(
+    ) && has_valid_rate_pair(
         pricing.cache_read_input_token_cost,
         pricing.cache_read_input_token_cost_above_272k_tokens,
     )
+}
+
+fn has_valid_rate_pair(base: Option<f64>, above: Option<f64>) -> bool {
+    base.is_some_and(is_valid_price_value) && above.is_some_and(is_valid_price_value)
 }
 
 fn uses_openai_full_request_272k_pricing(result: &LookupResult, provider_id: Option<&str>) -> bool {
@@ -1749,6 +1757,112 @@ fn uses_openai_full_request_272k_pricing(result: &LookupResult, provider_id: Opt
     is_openai_full_request_272k_model(&key)
 }
 
+/// Whether this is a direct xAI Grok row with the complete 200k tariff that
+/// xAI documents as request-wide.
+///
+/// Keep this deliberately narrower than "anything with an above-200k field":
+/// Google and other vendors use different boundary operators and progressive
+/// tiers, OpenRouter is a separate billing endpoint, and LiteLLM also carries
+/// xAI rows with unverified 128k tiers. The direct xAI 200k rows publish base
+/// and high rates for input, output, and cache reads, matching the vendor's
+/// pricing table: https://docs.x.ai/developers/pricing.
+fn uses_xai_full_request_200k_pricing(result: &LookupResult, provider_id: Option<&str>) -> bool {
+    let provider_id = normalize_provider_hint(provider_id);
+    let hinted_xai = provider_id.is_some_and(|provider| {
+        provider_identity::canonical_provider(provider).as_deref() == Some("xai")
+    });
+    if provider_id.is_some() && !hinted_xai {
+        return false;
+    }
+
+    let key = result.matched_key.trim().to_ascii_lowercase();
+    let mut parts = key.split('/');
+    let identifies_xai_grok = match (parts.next(), parts.next(), parts.next()) {
+        // `xai/grok-*` from the upstream catalog.
+        (Some(provider), Some(model), None) => {
+            result.source == "LiteLLM"
+                && provider_identity::canonical_provider(provider).as_deref() == Some("xai")
+                && model.starts_with("grok-")
+        }
+        // A bare `grok-*` from the built-in Cursor table, which is how that
+        // table keys it. Those rows are transcribed from xAI's own published
+        // tariff -- the same numbers, including the >200K tier -- so billing
+        // them progressively while the upstream row bills request-wide made the
+        // identical request cost half as much depending on which dataset
+        // resolved it. The xAI hint is required, because a bare `grok-*` says
+        // nothing about who billed it.
+        (Some(model), None, None) => {
+            result.source == "Cursor" && hinted_xai && model.starts_with("grok-")
+        }
+        _ => false,
+    };
+    if !identifies_xai_grok {
+        return false;
+    }
+
+    let pricing = &result.pricing;
+    let has_complete_200k_tier = has_valid_rate_pair(
+        pricing.input_cost_per_token,
+        pricing.input_cost_per_token_above_200k_tokens,
+    ) && has_valid_rate_pair(
+        pricing.output_cost_per_token,
+        pricing.output_cost_per_token_above_200k_tokens,
+    ) && has_valid_rate_pair(
+        pricing.cache_read_input_token_cost,
+        pricing.cache_read_input_token_cost_above_200k_tokens,
+    );
+    let has_other_context_tier = [
+        pricing.input_cost_per_token_above_128k_tokens,
+        pricing.input_cost_per_token_above_256k_tokens,
+        pricing.input_cost_per_token_above_272k_tokens,
+        pricing.output_cost_per_token_above_128k_tokens,
+        pricing.output_cost_per_token_above_256k_tokens,
+        pricing.output_cost_per_token_above_272k_tokens,
+        pricing.cache_read_input_token_cost_above_272k_tokens,
+    ]
+    .into_iter()
+    .any(|rate| rate.is_some_and(is_valid_price_value));
+    let has_cache_write_pricing = [
+        pricing.cache_creation_input_token_cost,
+        pricing.cache_creation_input_token_cost_above_200k_tokens,
+    ]
+    .into_iter()
+    .any(|rate| rate.is_some_and(is_valid_price_value));
+
+    has_complete_200k_tier && !has_other_context_tier && !has_cache_write_pricing
+}
+
+fn compute_xai_full_request_200k_cost(result: &LookupResult, usage: &TokenBreakdown) -> f64 {
+    let mut pricing = result.pricing.clone();
+    let prompt_tokens = usage.input.max(0).saturating_add(usage.cache_read.max(0));
+
+    // xAI's boundary is inclusive: a prompt that reaches 200k selects the
+    // high rates for the entire request. Its public usage schema and current
+    // LiteLLM rows publish no separate cache-write bucket, so an unpriced
+    // cache-write value deliberately cannot flip every priced bucket.
+    if prompt_tokens >= TIERED_PRICING_THRESHOLD_200K_TOKENS as i64 {
+        pricing.input_cost_per_token = pricing.input_cost_per_token_above_200k_tokens;
+        pricing.output_cost_per_token = pricing.output_cost_per_token_above_200k_tokens;
+        pricing.cache_read_input_token_cost = pricing.cache_read_input_token_cost_above_200k_tokens;
+    }
+
+    // Tier selection has already happened from the request prompt. Clearing
+    // these prevents `compute_cost` from independently tiering a large input,
+    // output, or cache bucket and from charging only the marginal remainder.
+    pricing.input_cost_per_token_above_200k_tokens = None;
+    pricing.output_cost_per_token_above_200k_tokens = None;
+    pricing.cache_read_input_token_cost_above_200k_tokens = None;
+
+    compute_cost(
+        &pricing,
+        usage.input,
+        usage.output,
+        usage.cache_read,
+        usage.cache_write,
+        usage.reasoning,
+    )
+}
+
 fn compute_cost_for_lookup(
     result: &LookupResult,
     provider_id: Option<&str>,
@@ -1764,6 +1878,10 @@ fn compute_cost_for_lookup(
             usage.reasoning,
         )
     };
+    if uses_xai_full_request_200k_pricing(result, provider_id) {
+        return compute_xai_full_request_200k_cost(result, usage);
+    }
+
     let total_input = usage
         .input
         .max(0)
@@ -2780,14 +2898,6 @@ fn select_best_match(
         return None;
     }
 
-    let candidate_count = all_usable_matches.len();
-    let first_pricing = dataset.get(all_usable_matches[0].as_str())?;
-    let price_consensus = all_usable_matches.iter().skip(1).all(|key| {
-        dataset
-            .get(key.as_str())
-            .is_some_and(|pricing| pricing_rows_equal(first_pricing, pricing))
-    });
-
     let hint_tags: Vec<String> = provider_id
         .map(provider_identity::provider_tags)
         .unwrap_or_default();
@@ -2897,6 +3007,40 @@ fn select_best_match(
                 .or_else(|| candidates.first())
         };
         key.and_then(|k| {
+            // A provider's own top-level row is authoritative for that
+            // endpoint. Nested occurrences of the same provider name are
+            // gateway/reseller offers, not peer answers to the hinted billing
+            // identity. Keep the broader candidate set for every weaker
+            // selection so reseller-only and alias-only ambiguity remains
+            // submission-unsafe. Zero-priced subscription namespaces are also
+            // kept in evidence: their canonical provider alias is what makes
+            // the paid row reachable, but it does not prove that usage was
+            // billed outside the subscription.
+            let evidence_matches: Vec<&String> = if provider_id
+                .is_some_and(|hint| key_root_matches_provider_hint(k, hint))
+                && !all_usable_matches
+                    .iter()
+                    .any(|candidate| key_root_is_zero_priced_subscription_namespace(candidate))
+            {
+                all_usable_matches
+                    .iter()
+                    .copied()
+                    .filter(|candidate| {
+                        provider_id
+                            .is_some_and(|hint| key_root_matches_provider_hint(candidate, hint))
+                    })
+                    .collect()
+            } else {
+                all_usable_matches.clone()
+            };
+            let candidate_count = evidence_matches.len();
+            let first_pricing = dataset.get(evidence_matches.first()?.as_str())?;
+            let price_consensus = evidence_matches.iter().skip(1).all(|candidate| {
+                dataset
+                    .get(candidate.as_str())
+                    .is_some_and(|pricing| pricing_rows_equal(first_pricing, pricing))
+            });
+
             dataset.get(k.as_str()).map(|pricing| LookupResult {
                 pricing: pricing.clone(),
                 source: source.into(),
@@ -2995,6 +3139,39 @@ fn normalize_provider_hint(provider_id: Option<&str>) -> Option<&str> {
     provider_id
         .map(str::trim)
         .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("unknown"))
+}
+
+/// Strip OpenAI's request-speed mode from the model identity.
+///
+/// Codex records `-fast` on GPT ids when the request used OpenAI's fast mode,
+/// but the mode does not identify a separately priced model. Catalogs can
+/// still contain reseller rows whose literal id ends in `-fast`; applying this
+/// normalization only under an OpenAI provider hint prevents those rows from
+/// displacing OpenAI's base tariff while preserving literal lookups for every
+/// other provider.
+fn normalize_openai_fast_mode(model_id: &str, provider_id: Option<&str>) -> Option<String> {
+    if provider_id
+        .and_then(provider_identity::canonical_provider)
+        .as_deref()
+        != Some("openai")
+    {
+        return None;
+    }
+
+    let (prefix, terminal) = model_id
+        .rsplit_once('/')
+        .map_or((None, model_id), |(prefix, terminal)| {
+            (Some(prefix), terminal)
+        });
+    let base = terminal.strip_suffix("-fast")?;
+    if !base.starts_with("gpt-") || base.len() == "gpt-".len() {
+        return None;
+    }
+
+    Some(match prefix {
+        Some(prefix) => format!("{prefix}/{base}"),
+        None => base.to_string(),
+    })
 }
 
 fn matches_inferred_model_provider(model_id: &str, provider_id: Option<&str>) -> bool {
@@ -5651,6 +5828,144 @@ mod tests {
         assert_eq!(unhinted.pricing.input_cost_per_token, Some(30e-6));
     }
 
+    /// Regression (#1211): a provider hint can match both the provider's own
+    /// row and gateway rows that merely contain the provider in a nested path.
+    /// Those gateways publish their own markups; they are not conflicting
+    /// answers for the provider's first-party endpoint.
+    #[test]
+    fn provider_root_price_is_not_tainted_by_nested_reseller_rows() {
+        let models_dev = HashMap::from([
+            (
+                "anthropic/claude-opus-4-8".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(5e-6),
+                    output_cost_per_token: Some(25e-6),
+                    ..Default::default()
+                },
+            ),
+            (
+                "gateway-a/anthropic/claude-opus-4-8".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(7e-6),
+                    output_cost_per_token: Some(35e-6),
+                    ..Default::default()
+                },
+            ),
+            (
+                "gateway-b/anthropic/claude-opus-4-8".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(8e-6),
+                    output_cost_per_token: Some(40e-6),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let lookup = PricingLookup::new_with_models_dev(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            models_dev,
+        );
+
+        let result = lookup
+            .lookup_with_provider("claude-opus-4-8", Some("anthropic"))
+            .expect("the first-party Anthropic row should resolve");
+
+        assert_eq!(result.matched_key, "anthropic/claude-opus-4-8");
+        assert_eq!(result.evidence.kind, ResolutionKind::ProviderScoped);
+        assert_eq!(result.evidence.candidate_count, 1);
+        assert!(result.evidence.price_consensus);
+        assert!(result.evidence.is_submission_safe());
+    }
+
+    /// When no first-party root row exists, a provider name embedded in
+    /// multiple reseller paths still cannot establish which tariff applied.
+    #[test]
+    fn nested_reseller_disagreement_remains_submission_unsafe() {
+        let models_dev = HashMap::from([
+            (
+                "gateway-a/anthropic/claude-opus-4-8".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(7e-6),
+                    output_cost_per_token: Some(35e-6),
+                    ..Default::default()
+                },
+            ),
+            (
+                "gateway-b/anthropic/claude-opus-4-8".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(8e-6),
+                    output_cost_per_token: Some(40e-6),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let lookup = PricingLookup::new_with_models_dev(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            models_dev,
+        );
+
+        let result = lookup
+            .lookup_with_provider("claude-opus-4-8", Some("anthropic"))
+            .expect("reporting should retain the best available estimate");
+
+        assert_eq!(result.evidence.kind, ResolutionKind::ModelPart);
+        assert_eq!(result.evidence.candidate_count, 2);
+        assert!(!result.evidence.price_consensus);
+        assert!(!result.evidence.is_submission_safe());
+    }
+
+    /// Regression (#1211): Codex's OpenAI `-fast` suffix describes request
+    /// service mode, not a separate model. An OpenAI hint must therefore use
+    /// the base model tariff instead of a reseller's literal `-fast` row.
+    #[test]
+    fn openai_fast_mode_normalizes_to_the_base_model() {
+        let litellm = HashMap::from([(
+            "openai/gpt-5.5".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(5e-6),
+                output_cost_per_token: Some(30e-6),
+                ..Default::default()
+            },
+        )]);
+        let models_dev = HashMap::from([(
+            "vercel/openai/gpt-5.5-fast".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(9e-6),
+                output_cost_per_token: Some(54e-6),
+                ..Default::default()
+            },
+        )]);
+        let lookup = PricingLookup::new_with_models_dev(
+            litellm,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            models_dev,
+        );
+
+        for model_id in ["gpt-5.5-fast", "openai/gpt-5.5-fast"] {
+            let result = lookup
+                .lookup_with_provider(model_id, Some("openai"))
+                .expect("OpenAI fast mode should resolve through the base id");
+            assert_eq!(result.matched_key, "openai/gpt-5.5");
+            assert_eq!(result.pricing.input_cost_per_token, Some(5e-6));
+            assert!(result.evidence.normalized);
+            assert!(result.evidence.is_submission_safe());
+        }
+
+        let reseller = lookup
+            .lookup_with_provider("gpt-5.5-fast", Some("vercel"))
+            .expect("non-OpenAI providers keep literal model identities");
+        assert_eq!(reseller.matched_key, "vercel/openai/gpt-5.5-fast");
+        assert_eq!(reseller.pricing.input_cost_per_token, Some(9e-6));
+        assert!(!reseller.evidence.normalized);
+    }
+
     /// Regression (#1004 follow-up): a reseller provider hint must select the
     /// reseller-scoped models.dev row instead of a direct upstream catalog row
     /// with the same terminal model id.
@@ -6441,6 +6756,151 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    fn xai_200k_result(key: &str, source: &str) -> LookupResult {
+        LookupResult {
+            matched_key: key.into(),
+            source: source.into(),
+            evidence: ResolutionEvidence::deterministic(ResolutionKind::Exact),
+            pricing: ModelPricing {
+                input_cost_per_token: Some(0.000002),
+                input_cost_per_token_above_200k_tokens: Some(0.000004),
+                output_cost_per_token: Some(0.000006),
+                output_cost_per_token_above_200k_tokens: Some(0.000012),
+                cache_read_input_token_cost: Some(0.0000005),
+                cache_read_input_token_cost_above_200k_tokens: Some(0.000001),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn xai_200k_full_request_pricing_is_inclusive_and_prompt_wide() {
+        let result = xai_200k_result("xai/grok-4.6", "LiteLLM");
+
+        let at_boundary = TokenBreakdown {
+            input: 150_000,
+            output: 10_000,
+            cache_read: 50_000,
+            reasoning: 5_000,
+            ..Default::default()
+        };
+        let cost = compute_cost_for_lookup(&result, Some("x-ai"), &at_boundary);
+        let expected = 150_000.0 * 0.000004 + (10_000.0 + 5_000.0) * 0.000012 + 50_000.0 * 0.000001;
+        assert!((cost - expected).abs() < 1e-12);
+
+        let below_boundary = TokenBreakdown {
+            input: 149_999,
+            ..at_boundary.clone()
+        };
+        let cost = compute_cost_for_lookup(&result, Some("xai"), &below_boundary);
+        let expected =
+            149_999.0 * 0.000002 + (10_000.0 + 5_000.0) * 0.000006 + 50_000.0 * 0.0000005;
+        assert!((cost - expected).abs() < 1e-12);
+
+        // Output volume never selects the tier by itself. With a short prompt,
+        // even an output bucket above 200k remains entirely at the base rate.
+        let output_only = TokenBreakdown {
+            input: 1,
+            output: 250_000,
+            ..Default::default()
+        };
+        let cost = compute_cost_for_lookup(&result, None, &output_only);
+        let expected = 0.000002 + 250_000.0 * 0.000006;
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn xai_200k_prompt_threshold_does_not_use_unpriced_cache_write() {
+        let result = xai_200k_result("xai/grok-build-0.1", "LiteLLM");
+        let usage = TokenBreakdown {
+            input: 149_999,
+            output: 1,
+            cache_read: 50_000,
+            cache_write: 1,
+            ..Default::default()
+        };
+
+        let cost = compute_cost_for_lookup(&result, Some("xai"), &usage);
+        let expected = 149_999.0 * 0.000002 + 0.000006 + 50_000.0 * 0.0000005;
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn xai_200k_full_request_pricing_scope_is_first_party_and_complete() {
+        for (key, provider) in [
+            ("xai/grok-4.6", None),
+            ("xai/grok-4.6", Some("xai")),
+            ("x-ai/grok-4.6", Some("x-ai")),
+            ("xai/grok-4.6", Some("unknown")),
+        ] {
+            assert!(
+                uses_xai_full_request_200k_pricing(&xai_200k_result(key, "LiteLLM"), provider),
+                "expected direct xAI request-wide pricing for {key} with {provider:?}"
+            );
+        }
+
+        for (key, source, provider) in [
+            ("xai/grok-4.6", "OpenRouter", None),
+            ("xai/grok-4.6", "Models.dev", None),
+            ("xai/grok-4.6", "Cursor", Some("xai")),
+            ("azure_ai/xai/grok-4.6", "LiteLLM", Some("xai")),
+            ("xai/not-grok", "LiteLLM", Some("xai")),
+            ("xai/grok-4.6", "LiteLLM", Some("openrouter")),
+        ] {
+            assert!(
+                !uses_xai_full_request_200k_pricing(&xai_200k_result(key, source), provider),
+                "expected generic pricing for {source}:{key} with {provider:?}"
+            );
+        }
+
+        let mut incomplete = xai_200k_result("xai/grok-4.6", "LiteLLM");
+        incomplete
+            .pricing
+            .cache_read_input_token_cost_above_200k_tokens = None;
+        assert!(!uses_xai_full_request_200k_pricing(
+            &incomplete,
+            Some("xai")
+        ));
+
+        let mut ambiguous = xai_200k_result("xai/grok-4.6", "LiteLLM");
+        ambiguous.pricing.input_cost_per_token_above_128k_tokens = Some(0.000003);
+        assert!(!uses_xai_full_request_200k_pricing(&ambiguous, Some("xai")));
+
+        let mut unverified_cache_write = xai_200k_result("xai/grok-4.6", "LiteLLM");
+        unverified_cache_write
+            .pricing
+            .cache_creation_input_token_cost = Some(0.000002);
+        assert!(!uses_xai_full_request_200k_pricing(
+            &unverified_cache_write,
+            Some("xai")
+        ));
+    }
+
+    #[test]
+    fn xai_128k_only_row_keeps_generic_progressive_pricing() {
+        let result = LookupResult {
+            matched_key: "xai/grok-4-fast".into(),
+            source: "LiteLLM".into(),
+            evidence: ResolutionEvidence::deterministic(ResolutionKind::Exact),
+            pricing: ModelPricing {
+                input_cost_per_token: Some(0.000001),
+                input_cost_per_token_above_128k_tokens: Some(0.000002),
+                output_cost_per_token: Some(0.000003),
+                output_cost_per_token_above_128k_tokens: Some(0.000004),
+                ..Default::default()
+            },
+        };
+        let usage = TokenBreakdown {
+            input: 128_001,
+            output: 1,
+            ..Default::default()
+        };
+
+        let cost = compute_cost_for_lookup(&result, Some("xai"), &usage);
+        let expected = 128_000.0 * 0.000001 + 0.000002 + 0.000003;
+        assert!((cost - expected).abs() < 1e-12);
     }
 
     #[test]

@@ -780,6 +780,88 @@ fn opencode_json_superseded_by_sqlite(path: &Path, sqlite_keys: &HashSet<String>
         .is_some_and(|stem| sqlite_keys.contains(stem))
 }
 
+/// Receives fully-transformed messages as each client lane finishes, so the
+/// parse never has to hold every lane's messages at once.
+///
+/// The parse used to accumulate ~1M `UnifiedMessage` into one `Vec` and hand it
+/// back whole, which made peak memory the *sum* of every client lane (#1209).
+/// Draining into a sink between lanes makes it the *largest* lane instead.
+/// Callers that genuinely want the whole vector still get one: `Vec` is a sink.
+trait MessageSink {
+    fn accept(&mut self, message: UnifiedMessage);
+}
+
+impl MessageSink for Vec<UnifiedMessage> {
+    fn accept(&mut self, message: UnifiedMessage) {
+        self.push(message);
+    }
+}
+
+/// Inputs for the three whole-set passes that used to run once at the end of
+/// the parse. Each is stateless per message, so applying them at flush time is
+/// equivalent to applying them to the finished vector -- and it lets messages
+/// be released a lane at a time.
+struct FlushContext<'a> {
+    include_all: bool,
+    requested: HashSet<&'a str>,
+    include_synthetic: bool,
+    /// Re-keys every message onto the device's pinned bucketing timezone.
+    ///
+    /// The parsers derive `date` from `chrono::Local`, read afresh on every
+    /// scan, so which day a message lands in moves when the machine's zone
+    /// does. Fixing the day key here is what a rescan cannot then move.
+    ///
+    /// `Some` only when a zone is pinned: an unpinned device must report
+    /// exactly what it reported before, so the pass is skipped rather than
+    /// re-derived through `Local`.
+    ///
+    /// This used to be a whole-corpus `rebucket_days` pass that deliberately
+    /// ran *after* `save_if_dirty`. Flushing per lane necessarily re-keys most
+    /// messages before that write, which stays correct because a
+    /// `CachedSourceEntry` owns its own payload -- re-keying a drained message
+    /// cannot reach one -- and because `refresh_derived_fields` re-derives
+    /// `date` on every cache load, so no cached entry can carry a stale day
+    /// key regardless of when it was written.
+    timezone: Option<bucket_tz::BucketTimezone>,
+}
+
+/// Drain `buffer` into `sink`, applying the tail passes to each message.
+///
+/// The order is load-bearing and matches the original tail: filter BEFORE
+/// normalization, so `retain_for_requested_clients` still sees the original
+/// model/provider prefixes that `is_synthetic_gateway` relies on.
+fn flush_lane<S: MessageSink>(
+    buffer: &mut Vec<UnifiedMessage>,
+    context: &FlushContext<'_>,
+    sink: &mut S,
+) {
+    for mut message in buffer.drain(..) {
+        if !context.include_all
+            && !retain_for_requested_clients(
+                &message.client,
+                &message.model_id,
+                &message.provider_id,
+                &context.requested,
+            )
+        {
+            continue;
+        }
+
+        if context.include_synthetic {
+            sessions::synthetic::normalize_synthetic_gateway_fields(
+                &mut message.model_id,
+                &mut message.provider_id,
+            );
+        }
+
+        if let Some(timezone) = &context.timezone {
+            message.rebucket_date(timezone);
+        }
+
+        sink.accept(message);
+    }
+}
+
 fn parse_all_messages_with_pricing_with_cache_policy(
     home_dir: &str,
     clients: &[String],
@@ -788,6 +870,28 @@ fn parse_all_messages_with_pricing_with_cache_policy(
     scanner_settings: &scanner::ScannerSettings,
     cache_policy: SourceCachePolicy,
 ) -> Vec<UnifiedMessage> {
+    let mut messages: Vec<UnifiedMessage> = Vec::new();
+    parse_all_messages_streaming(
+        home_dir,
+        clients,
+        pricing,
+        use_env_roots,
+        scanner_settings,
+        cache_policy,
+        &mut messages,
+    );
+    messages
+}
+
+fn parse_all_messages_streaming<S: MessageSink>(
+    home_dir: &str,
+    clients: &[String],
+    pricing: Option<&pricing::PricingService>,
+    use_env_roots: bool,
+    scanner_settings: &scanner::ScannerSettings,
+    cache_policy: SourceCachePolicy,
+    sink: &mut S,
+) {
     #[derive(Debug)]
     struct CachedParseOutcome {
         messages: Vec<UnifiedMessage>,
@@ -1267,24 +1371,14 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         }
     }
 
-    /// Same as [`parse_cached_lane`], for a client whose transcripts can repeat
-    /// one another's rows verbatim.
+    /// Same as [`parse_cached_lane`], for a client whose source files can repeat
+    /// the same event.
     ///
-    /// A DSH fork seeds the child transcript with the parent's completed prefix
-    /// — same `message.id`, time and usage, under a different session id — so
-    /// the per-source cache alone cannot collapse the copy. Dedup keys survive
-    /// a warm cache hit, so the pass behaves identically cold and warm.
-    ///
-    /// Ownership, and what this pass does not decide: when the child header
-    /// carries `seedLength` the parser drops the seeded rows at the source, so
-    /// the parent's copy survives whatever order the scan hands the files over
-    /// in. This pass is the fallback for a header that lost the field, which
-    /// DSH's own readers treat as an unseeded log (`header.seedLength ?? 0` in
-    /// `core/agent/src/inbox.ts` and `schedule/src/invariant.ts`) — nothing in
-    /// the transcript then marks the prefix as inherited. It degrades to
-    /// first-wins in scan-path order: totals and per-model rollups stay
-    /// correct, and only the session label on the surviving row depends on
-    /// which transcript sorts first.
+    /// Parsers using this lane must provide globally stable dedup keys. Those
+    /// keys survive a warm cache hit, so duplicate handling behaves identically
+    /// on cold and warm scans. The pass is first-wins in scan-path order: usage
+    /// totals remain deterministic even if only the surviving session label can
+    /// vary between equivalent copies.
     fn parse_cached_lane_deduped<F>(
         scan_result: &scanner::ScanResult,
         source_cache: &mut message_cache::SourceMessageCache,
@@ -1508,6 +1602,120 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         )
     }
 
+    /// OpenCode's SQLite lane, where a warm scan reads only the rows that
+    /// changed since the last one.
+    ///
+    /// Bespoke rather than routed through `load_or_parse_sqlite_source`: the
+    /// incremental scan needs the cached *messages* to merge into, which the
+    /// generic parse closure never sees, plus the mark the previous scan left
+    /// on the entry. Codex has its own loader for the same reason.
+    fn load_or_parse_opencode_sqlite_source(
+        path: &Path,
+        source_cache: &message_cache::SourceMessageCache,
+        pricing: Option<&pricing::PricingService>,
+    ) -> CachedParseOutcome {
+        let identity = message_cache::CacheIdentity::for_client(ClientId::OpenCode);
+
+        fn finish(
+            identity: message_cache::CacheIdentity,
+            path: &Path,
+            fingerprint: Option<message_cache::SourceFingerprint>,
+            scan: sessions::opencode_schema::OpenCodeSchemaScan,
+            pricing: Option<&pricing::PricingService>,
+        ) -> CachedParseOutcome {
+            let mut messages = scan.messages;
+            let cache_entry = match fingerprint {
+                Some(fingerprint) if !messages.is_empty() => Some(
+                    message_cache::CachedSourceEntry::new(
+                        identity,
+                        path,
+                        fingerprint,
+                        messages.clone(),
+                        Vec::new(),
+                        None,
+                    )
+                    .with_opencode_incremental(scan.incremental),
+                ),
+                _ => None,
+            };
+            apply_pricing_to_messages(&mut messages, pricing);
+            CachedParseOutcome {
+                messages,
+                retained_message_keys: HashSet::new(),
+                cache_entry,
+                invalidate_cache: false,
+            }
+        }
+
+        let mut cached = source_cache.take(identity, path);
+        let Some(fingerprint_status) = message_cache::SourceFingerprint::check_sqlite_path(
+            path,
+            cached.as_ref().map(|entry| &entry.fingerprint),
+        ) else {
+            return finish(
+                identity,
+                path,
+                None,
+                sessions::opencode::scan_opencode_sqlite(path),
+                pricing,
+            );
+        };
+
+        let fingerprint = match fingerprint_status {
+            message_cache::FingerprintStatus::Unchanged => {
+                let Some(entry) = cached.take() else {
+                    unreachable!("an uncached source always builds a complete fingerprint")
+                };
+                if !entry.messages.is_empty() {
+                    return CachedParseOutcome {
+                        messages: cached_messages(entry, pricing),
+                        retained_message_keys: HashSet::new(),
+                        cache_entry: None,
+                        invalidate_cache: false,
+                    };
+                }
+                let fingerprint = entry.fingerprint.clone();
+                cached = Some(entry);
+                fingerprint
+            }
+            message_cache::FingerprintStatus::Changed(fingerprint) => fingerprint,
+        };
+
+        if let Some(entry) = cached {
+            if entry.fingerprint == fingerprint && !entry.messages.is_empty() {
+                return CachedParseOutcome {
+                    messages: cached_messages(entry, pricing),
+                    retained_message_keys: HashSet::new(),
+                    cache_entry: None,
+                    invalidate_cache: false,
+                };
+            }
+
+            // The database changed under an entry that recorded how far the
+            // last scan got. Read just the delta; the rescan itself decides
+            // whether that is still sound and says so by returning `None`.
+            if let (Some(state), false) = (
+                entry.opencode_incremental.as_ref(),
+                entry.messages.is_empty(),
+            ) {
+                let state = state.clone();
+                if let Some(scan) =
+                    sessions::opencode::rescan_opencode_sqlite(path, &state, entry.messages)
+                {
+                    return finish(identity, path, Some(fingerprint), scan, pricing);
+                }
+            }
+        }
+
+        finish(
+            identity,
+            path,
+            Some(fingerprint),
+            sessions::opencode::scan_opencode_sqlite(path),
+            pricing,
+        )
+    }
+
     fn load_or_parse_codex_source(
         path: &Path,
         source_cache: &message_cache::SourceMessageCache,
@@ -1637,6 +1845,15 @@ fn parse_all_messages_with_pricing_with_cache_policy(
     let mut all_messages: Vec<UnifiedMessage> = Vec::new();
     let include_all = clients.is_empty();
     let include_synthetic = include_all || clients.iter().any(|c| c == "synthetic");
+    let flush_context = {
+        let timezone = bucket_tz::BucketTimezone::from_scanner_settings(scanner_settings);
+        FlushContext {
+            include_all,
+            requested: clients.iter().map(String::as_str).collect(),
+            include_synthetic,
+            timezone: timezone.is_pinned().then_some(timezone),
+        }
+    };
     let include_devin_cli = include_synthetic || clients.iter().any(|c| c == "devin-cli");
     let include_devin_desktop = include_synthetic || clients.iter().any(|c| c == "devin-desktop");
     // Freebuff and Codebuff share the manicode scan bucket in the scanner (the
@@ -1655,13 +1872,7 @@ fn parse_all_messages_with_pricing_with_cache_policy(
             messages,
             cache_entry,
             ..
-        } = load_or_parse_sqlite_source(
-            message_cache::CacheIdentity::for_client(ClientId::OpenCode),
-            db_path,
-            &source_cache,
-            pricing,
-            sessions::opencode::parse_opencode_sqlite,
-        );
+        } = load_or_parse_opencode_sqlite_source(db_path, &source_cache, pricing);
 
         // Dedup across channel-suffixed dbs: the same session can end up in
         // both `opencode.db` and `opencode-<channel>.db` if the user
@@ -1710,6 +1921,11 @@ fn parse_all_messages_with_pricing_with_cache_policy(
     }
 
     // Parse MiMo Code: SQLite database(s)
+    // OpenCode is the largest lane; release it before MiMo Code starts.
+    // `micode_indices` below stores indices into `all_messages`, so this must
+    // happen before the first one is recorded -- never inside that loop.
+    flush_lane(&mut all_messages, &flush_context, sink);
+
     let mut micode_indices: HashMap<String, usize> = HashMap::new();
 
     for db_path in &scan_result.micode_dbs {
@@ -1752,6 +1968,9 @@ fn parse_all_messages_with_pricing_with_cache_policy(
             source_cache.insert(entry);
         }
     }
+
+    // MiMo Code is done indexing into `all_messages`; release it.
+    flush_lane(&mut all_messages, &flush_context, sink);
 
     let claude_home = PathBuf::from(home_dir);
     let claude_outcomes: Vec<CachedParseOutcome> = scan_result
@@ -1816,6 +2035,7 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         }
     }
     all_messages.extend(claude_messages.into_iter().map(|(_, message)| message));
+    flush_lane(&mut all_messages, &flush_context, sink);
 
     let codex_outcomes: Vec<(PathBuf, CachedParseOutcome)> = scan_result
         .get(ClientId::Codex)
@@ -1844,6 +2064,12 @@ fn parse_all_messages_with_pricing_with_cache_policy(
             );
         }
     }
+
+    // Release Codex before Copilot. This has to sit ahead of the Copilot
+    // lane rather than after it: the desktop/vscode blocks below scan
+    // `all_messages` for `client == "copilot"` to dedup against OTEL rows, so
+    // copilot's own messages must still be buffered when they run.
+    flush_lane(&mut all_messages, &flush_context, sink);
 
     parse_cached_lane(
         &scan_result,
@@ -2141,6 +2367,7 @@ fn parse_all_messages_with_pricing_with_cache_policy(
     );
     apply_pricing_to_messages(&mut prime_agent_messages, pricing);
     all_messages.extend(prime_agent_messages);
+    flush_lane(&mut all_messages, &flush_context, sink);
 
     let kimchi_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Kimchi)
@@ -2365,6 +2592,19 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         &mut all_messages,
         ClientId::Dsh,
         sessions::dsh::parse_dsh_file,
+    );
+
+    // LM Studio local-server logs can retain or repeat the same final response
+    // across files. Response IDs provide a stable cross-file dedup key, while
+    // the parser marks local inference as an authoritative zero-dollar cost so
+    // the generic cache cannot apply cloud model pricing.
+    parse_cached_lane_deduped(
+        &scan_result,
+        &mut source_cache,
+        pricing,
+        &mut all_messages,
+        ClientId::LmStudio,
+        sessions::lmstudio::parse_lmstudio_file,
     );
 
     // ZCode (Z.ai GLM-5.2 ADE) JSONL sessions. Token usage may be embedded
@@ -2883,58 +3123,14 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         }
     }
 
-    // Filter BEFORE normalization so retain_for_requested_clients can see
-    // original model/provider prefixes (e.g. "accounts/fireworks/models/…")
-    // that is_synthetic_gateway relies on for gateway detection.
-    if !include_all {
-        let requested: HashSet<&str> = clients.iter().map(String::as_str).collect();
-        all_messages.retain(|msg| {
-            retain_for_requested_clients(&msg.client, &msg.model_id, &msg.provider_id, &requested)
-        });
-    }
-
-    if include_synthetic {
-        for msg in &mut all_messages {
-            sessions::synthetic::normalize_synthetic_gateway_fields(
-                &mut msg.model_id,
-                &mut msg.provider_id,
-            );
-        }
-    }
-
     if cache_policy == SourceCachePolicy::Persistent {
         source_cache.save_if_dirty();
     }
 
-    rebucket_days(&mut all_messages, scanner_settings);
-
-    all_messages
-}
-
-/// Re-key every message onto the device's pinned bucketing timezone.
-///
-/// The parsers derive `date` from `chrono::Local`, read afresh on every scan,
-/// so which day a message lands in changes when the machine's zone does. This
-/// is the one pass that knows the user's settings and sees every message, so it
-/// is where the day key gets fixed to something a rescan cannot move.
-///
-/// Runs after the source cache is written on purpose: the cache stores raw
-/// parser output and `refresh_derived_fields` re-derives `date` on every load,
-/// so cached entries never carry a stale day key past this point and changing
-/// the pinned zone needs no cache invalidation.
-///
-/// **No-op when nothing is pinned.** An unpinned device must report exactly
-/// what it reported before, so the pass is skipped rather than re-derived
-/// through `Local`.
-fn rebucket_days(messages: &mut [UnifiedMessage], scanner_settings: &scanner::ScannerSettings) {
-    let timezone = bucket_tz::BucketTimezone::from_scanner_settings(scanner_settings);
-    if !timezone.is_pinned() {
-        return;
-    }
-
-    for message in messages.iter_mut() {
-        message.rebucket_date(&timezone);
-    }
+    // retain/normalize/rebucket used to run here as three whole-set passes.
+    // They now run per message inside `flush_lane`, which is also where the
+    // messages are released.
+    flush_lane(&mut all_messages, &flush_context, sink);
 }
 
 fn dedupe_latest_trae_messages(mut messages: Vec<UnifiedMessage>) -> Vec<UnifiedMessage> {
@@ -3825,28 +4021,218 @@ async fn generate_graph_with_loaded_pricing(
         clients
     });
 
-    let all_messages = parse_all_messages_with_pricing_with_env_strategy(
+    let bucket_timezone =
+        bucket_tz::BucketTimezone::from_scanner_settings(&options.scanner_settings);
+
+    // Fold straight out of the parse. Collecting here and filtering afterwards
+    // is what made this path hold every message at once (#1209); the sink
+    // applies the same date filters per message and drops each one after it
+    // has landed in the day map and produced its session span.
+    let mut sink = GraphSink::new(Some(&options), pricing, pricing_requirement);
+    parse_all_messages_streaming_with_env_strategy(
         &home_dir,
         &clients,
         pricing,
         options.use_env_roots,
         &options.scanner_settings,
+        &mut sink,
     );
 
-    let filtered = filter_messages_for_report(all_messages, &options);
-
-    let bucket_timezone =
-        bucket_tz::BucketTimezone::from_scanner_settings(&options.scanner_settings);
-
-    build_graph_from_messages(
-        filtered,
-        pricing,
-        pricing_requirement,
-        start,
-        &bucket_timezone,
-    )
+    sink.finish(start, &bucket_timezone)
 }
 
+/// Messages buffered before a batch is folded away.
+///
+/// Batching lets the sink reuse `exclude_unpriced_submission_messages` and
+/// `validate_priced_messages` verbatim rather than reimplementing their pricing
+/// rules, which is the part that would quietly diverge. Peak cost is one batch,
+/// not the corpus.
+const GRAPH_SINK_BATCH: usize = 65_536;
+
+/// Folds a graph report as messages arrive instead of collecting them.
+///
+/// The submit path made three passes over every message -- unpriced exclusion,
+/// sessionization, daily aggregation -- and so had to keep ~1M of them alive at
+/// once (#1209). All three are per message, so each runs as the message
+/// arrives and the message is dropped: what survives is the day map, an
+/// 80-byte [`sessionize::SessionSpan`] per message, and a few counters.
+struct GraphSink<'a> {
+    /// `Some` when the sink is fed straight from the parse and must apply the
+    /// report's date filters itself; `None` when the caller already filtered.
+    filter: Option<&'a ReportOptions>,
+    pricing: Option<&'a pricing::PricingService>,
+    requirement: GraphPricingRequirement,
+    buffer: Vec<UnifiedMessage>,
+    daily: aggregator::DailyFold,
+    interner: sessionize::SpanInterner,
+    spans: Vec<sessionize::SessionSpan>,
+    /// Merged across batches by (provider, model); counts and tokens add.
+    exclusions: HashMap<(String, String), (usize, i64, &'static str)>,
+    /// First batch error, surfaced from `finish` so the outcome matches the
+    /// whole-corpus path's `?` on the first failure.
+    failure: Option<String>,
+}
+
+impl<'a> GraphSink<'a> {
+    fn new(
+        filter: Option<&'a ReportOptions>,
+        pricing: Option<&'a pricing::PricingService>,
+        requirement: GraphPricingRequirement,
+    ) -> Self {
+        Self {
+            filter,
+            pricing,
+            requirement,
+            buffer: Vec::new(),
+            daily: aggregator::DailyFold::default(),
+            interner: sessionize::SpanInterner::default(),
+            spans: Vec::new(),
+            exclusions: HashMap::new(),
+            failure: None,
+        }
+    }
+
+    fn drain_batch(&mut self) {
+        if self.buffer.is_empty() {
+            return;
+        }
+        let batch = std::mem::take(&mut self.buffer);
+
+        let batch = match self.requirement {
+            GraphPricingRequirement::Lenient => batch,
+            GraphPricingRequirement::Submission => {
+                let (submitted, exclusions) =
+                    exclude_unpriced_submission_messages(batch, self.pricing);
+                for exclusion in exclusions {
+                    let entry = self
+                        .exclusions
+                        .entry((exclusion.provider_id, exclusion.model_id))
+                        .or_insert((0, 0, exclusion.reason));
+                    entry.0 += exclusion.message_count;
+                    entry.1 = entry.1.saturating_add(exclusion.total_tokens);
+                }
+                if self.failure.is_none() {
+                    if let Err(error) = validate_priced_messages(&submitted, self.pricing) {
+                        self.failure = Some(error);
+                    }
+                }
+                submitted
+            }
+        };
+
+        for message in &batch {
+            self.daily.add(message);
+            if message.timestamp > 0 {
+                self.spans.push(sessionize::SessionSpan::from_message(
+                    message,
+                    &mut self.interner,
+                ));
+            }
+        }
+    }
+
+    fn finish(
+        mut self,
+        start: Instant,
+        bucket_timezone: &bucket_tz::BucketTimezone,
+    ) -> Result<GraphResult, String> {
+        self.drain_batch();
+
+        let mut unpriced_submission_exclusions: Vec<UnpricedSubmissionExclusion> = self
+            .exclusions
+            .into_iter()
+            .map(
+                |((provider_id, model_id), (message_count, total_tokens, reason))| {
+                    UnpricedSubmissionExclusion {
+                        provider_id,
+                        model_id,
+                        message_count,
+                        total_tokens,
+                        reason,
+                    }
+                },
+            )
+            .collect();
+        // `exclude_unpriced_submission_messages` emits these from a BTreeMap
+        // keyed the same way, so sorting here keeps the reported order stable.
+        unpriced_submission_exclusions
+            .sort_by(|a, b| (&a.provider_id, &a.model_id).cmp(&(&b.provider_id, &b.model_id)));
+
+        require_trustworthy_exclusions(self.pricing, &unpriced_submission_exclusions)?;
+        if let Some(failure) = self.failure {
+            return Err(failure);
+        }
+
+        let intervals = sessionize::sessionize_spans(
+            &self.spans,
+            &self.interner,
+            sessionize::DEFAULT_IDLE_GAP_MS,
+        );
+        let time_metrics =
+            sessionize::compute_time_metrics(&intervals, sessionize::DEFAULT_IDLE_GAP_MS);
+
+        // Keyed by the same zone the messages were rebucketed into. Active time
+        // is joined onto contributions by date below, so a mismatch here
+        // silently drops a day's active time rather than misplacing it.
+        let daily_active_time =
+            sessionize::compute_daily_active_time_in(&intervals, bucket_timezone);
+        let contributions = self.daily.finish();
+
+        let processing_time_ms = start.elapsed().as_millis() as u32;
+        let mut result = aggregator::generate_graph_result(contributions, processing_time_ms);
+        result.time_metrics = Some(time_metrics);
+        result.unpriced_submission_exclusions = unpriced_submission_exclusions;
+
+        for contribution in &mut result.contributions {
+            if let Some(&ms) = daily_active_time.get(&contribution.date) {
+                contribution.active_time_ms = Some(ms);
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+impl MessageSink for GraphSink<'_> {
+    fn accept(&mut self, message: UnifiedMessage) {
+        if let Some(options) = self.filter {
+            if !message_passes_report_filter(&message, options) {
+                return;
+            }
+        }
+        self.buffer.push(message);
+        if self.buffer.len() >= GRAPH_SINK_BATCH {
+            self.drain_batch();
+        }
+    }
+}
+
+fn parse_all_messages_streaming_with_env_strategy<S: MessageSink>(
+    home_dir: &str,
+    clients: &[String],
+    pricing: Option<&pricing::PricingService>,
+    use_env_roots: bool,
+    scanner_settings: &scanner::ScannerSettings,
+    sink: &mut S,
+) {
+    parse_all_messages_streaming(
+        home_dir,
+        clients,
+        pricing,
+        use_env_roots,
+        scanner_settings,
+        SourceCachePolicy::Persistent,
+        sink,
+    );
+}
+
+/// Collecting form of the submit-report build, retained as the test surface for
+/// [`GraphSink`]: it feeds an already-filtered `Vec` through the same sink the
+/// streaming path uses, so the sink's folding, exclusion-merging and ordering
+/// behaviour stay under test without a full parse. Production callers stream
+/// into [`GraphSink`] directly and never collect, which is why this is
+/// `#[cfg(test)]` rather than dead code.
+#[cfg(test)]
 fn build_graph_from_messages(
     filtered: Vec<UnifiedMessage>,
     pricing: Option<&pricing::PricingService>,
@@ -3854,38 +4240,15 @@ fn build_graph_from_messages(
     start: Instant,
     bucket_timezone: &bucket_tz::BucketTimezone,
 ) -> Result<GraphResult, String> {
-    let (filtered, unpriced_submission_exclusions) = match pricing_requirement {
-        GraphPricingRequirement::Lenient => (filtered, Vec::new()),
-        GraphPricingRequirement::Submission => {
-            let (submitted, exclusions) = exclude_unpriced_submission_messages(filtered, pricing);
-            require_trustworthy_exclusions(pricing, &exclusions)?;
-            validate_priced_messages(&submitted, pricing)?;
-            (submitted, exclusions)
-        }
-    };
-
-    let intervals = sessionize::sessionize(&filtered, sessionize::DEFAULT_IDLE_GAP_MS);
-    let time_metrics =
-        sessionize::compute_time_metrics(&intervals, sessionize::DEFAULT_IDLE_GAP_MS);
-
-    // Keyed by the same zone the messages were rebucketed into. Active time is
-    // joined onto contributions by date below, so a mismatch here silently
-    // drops a day's active time rather than misplacing it.
-    let daily_active_time = sessionize::compute_daily_active_time_in(&intervals, bucket_timezone);
-    let contributions = aggregator::aggregate_by_date(filtered);
-
-    let processing_time_ms = start.elapsed().as_millis() as u32;
-    let mut result = aggregator::generate_graph_result(contributions, processing_time_ms);
-    result.time_metrics = Some(time_metrics);
-    result.unpriced_submission_exclusions = unpriced_submission_exclusions;
-
-    for contribution in &mut result.contributions {
-        if let Some(&ms) = daily_active_time.get(&contribution.date) {
-            contribution.active_time_ms = Some(ms);
-        }
+    // `filtered` has already been through the report's date filters, so the
+    // sink applies none of its own. Delegating rather than duplicating keeps
+    // this path and the streaming one on identical aggregation code, and lets
+    // this function's tests stand as the sink's correctness proof.
+    let mut sink = GraphSink::new(None, pricing, pricing_requirement);
+    for message in filtered {
+        sink.accept(message);
     }
-
-    Ok(result)
+    sink.finish(start, bucket_timezone)
 }
 
 const ROUTING_LABEL_UNPRICED_REASON: &str =
@@ -4174,24 +4537,47 @@ fn validate_priced_messages(
     ))
 }
 
+/// Per-message form of [`filter_messages_for_report`].
+///
+/// The report filters are three stateless predicates on `date`, so a streaming
+/// caller can drop a message on arrival instead of materializing the whole
+/// corpus and then retaining over it.
+fn message_passes_report_filter(message: &UnifiedMessage, options: &ReportOptions) -> bool {
+    if let Some(year) = &options.year {
+        // Matching the prefix in place rather than building `format!("{year}-")`
+        // keeps this predicate allocation-free. The streaming path runs it once
+        // per parsed message, so an allocation here is one heap round-trip per
+        // message on a corpus this change exists to make cheap.
+        if !message
+            .date
+            .strip_prefix(year.as_str())
+            .is_some_and(|rest| rest.starts_with('-'))
+        {
+            return false;
+        }
+    }
+
+    if let Some(since) = &options.since {
+        if message.date.as_str() < since.as_str() {
+            return false;
+        }
+    }
+
+    if let Some(until) = &options.until {
+        if message.date.as_str() > until.as_str() {
+            return false;
+        }
+    }
+
+    true
+}
+
 fn filter_messages_for_report(
     messages: Vec<UnifiedMessage>,
     options: &ReportOptions,
 ) -> Vec<UnifiedMessage> {
     let mut filtered = messages;
-
-    if let Some(year) = &options.year {
-        let year_prefix = format!("{}-", year);
-        filtered.retain(|m| m.date.starts_with(&year_prefix));
-    }
-
-    if let Some(since) = &options.since {
-        filtered.retain(|m| m.date.as_str() >= since.as_str());
-    }
-
-    if let Some(until) = &options.until {
-        filtered.retain(|m| m.date.as_str() <= until.as_str());
-    }
+    filtered.retain(|message| message_passes_report_filter(message, options));
     filtered
 }
 
@@ -4858,6 +5244,21 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     counts.set(ClientId::Dsh, dsh_count);
     messages.extend(dsh_msgs);
 
+    let lmstudio_msgs_raw: Vec<UnifiedMessage> = scan_result
+        .get(ClientId::LmStudio)
+        .par_iter()
+        .flat_map(|path| sessions::lmstudio::parse_lmstudio_file(path))
+        .collect();
+    let mut lmstudio_seen: HashSet<String> = HashSet::new();
+    let lmstudio_msgs: Vec<ParsedMessage> = lmstudio_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut lmstudio_seen, message))
+        .map(|message| unified_to_parsed(&message))
+        .collect();
+    let lmstudio_count = summed_parsed_message_count(&lmstudio_msgs);
+    counts.set(ClientId::LmStudio, lmstudio_count);
+    messages.extend(lmstudio_msgs);
+
     let mcode_msgs: Vec<ParsedMessage> = scan_result
         .get(ClientId::Mcode)
         .par_iter()
@@ -5300,8 +5701,8 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     })
 }
 
-/// [`rebucket_days`] for the `ParsedMessage` lane. Same contract: no-op unless
-/// a zone is pinned.
+/// [`FlushContext::timezone`] for the `ParsedMessage` lane. Same contract:
+/// no-op unless a zone is pinned.
 fn rebucket_parsed_days(
     messages: &mut [ParsedMessage],
     scanner_settings: &scanner::ScannerSettings,
@@ -5463,9 +5864,10 @@ mod tests {
     use super::{
         aggregate_hourly_usage_entries, aggregate_model_usage_entries,
         aggregate_monthly_usage_v2_entries, apply_pricing_if_available, build_graph_from_messages,
-        dedupe_latest_trae_messages, filter_messages_for_report,
-        generate_graph_with_loaded_pricing, get_home_dir_string, is_generic_routing_label,
-        merge_claude_cross_file_duplicate, message_cache, normalize_model_for_grouping,
+        dedupe_latest_trae_messages, exclude_unpriced_submission_messages,
+        filter_messages_for_report, generate_graph_with_loaded_pricing, get_home_dir_string,
+        is_generic_routing_label, merge_claude_cross_file_duplicate, message_cache,
+        message_passes_report_filter, normalize_model_for_grouping,
         opencode_json_superseded_by_sqlite, parse_all_messages_with_pricing_with_cache_policy,
         parse_all_messages_with_pricing_with_env_strategy, parse_local_clients, parsed_to_unified,
         paths, pricing, retain_for_requested_clients, scanner, select_local_parse_pricing,
@@ -7583,6 +7985,76 @@ mod tests {
         );
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn test_lmstudio_lane_deduplicates_files_and_preserves_zero_cost_on_cache_hits() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let logs = source_home.path().join(".lmstudio/server-logs/2026-07");
+        std::fs::create_dir_all(&logs).unwrap();
+
+        let response = |id: &str, prompt: i64, completion: i64| {
+            format!(
+                "[2026-07-09 10:00:00][INFO][fixture-model]\n{}\n",
+                serde_json::json!({
+                    "id": id,
+                    "model": "fixture-model",
+                    "usage": {
+                        "prompt_tokens": prompt,
+                        "completion_tokens": completion,
+                        "total_tokens": prompt + completion
+                    }
+                })
+            )
+        };
+        std::fs::write(
+            logs.join("first.log"),
+            format!(
+                "{}{}",
+                response("chatcmpl-shared", 7, 3),
+                response("chatcmpl-distinct", 14, 6)
+            ),
+        )
+        .unwrap();
+        std::fs::write(logs.join("mirrored.log"), response("chatcmpl-shared", 7, 3)).unwrap();
+
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "fixture-model".into(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(1.0),
+                output_cost_per_token: Some(1.0),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+        let clients = ["lmstudio".to_string()];
+
+        let cold = parse_all_messages_with_pricing(
+            source_home.path().to_str().unwrap(),
+            &clients,
+            Some(&pricing),
+        );
+        assert_eq!(cold.len(), 2);
+        assert_eq!(
+            cold.iter()
+                .map(|message| message.tokens.total())
+                .sum::<i64>(),
+            30
+        );
+        assert!(cold
+            .iter()
+            .all(|message| message.cost == 0.0 && message.has_authoritative_cost()));
+
+        let warm = parse_all_messages_with_pricing(
+            source_home.path().to_str().unwrap(),
+            &clients,
+            Some(&pricing),
+        );
+        assert_eq!(warm, cold);
+    }
+
     /// MiMo Code records carry an authoritative per-message cost. The micode
     /// lane must NOT reprice a record that already has a cost, even when the
     /// model has a market price that would compute a different (non-zero) value.
@@ -9275,6 +9747,189 @@ mod tests {
                 .unwrap();
             assert_eq!(repaired_entry.messages.len(), 1);
         }
+    }
+
+    /// Build a `message` table with the columns a modern OpenCode database has.
+    fn create_timed_opencode_db(db_path: &std::path::Path) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute_batch(
+            // `session.time_updated` matches the real schema: a rename moves it
+            // without touching a message row, so it is what the incremental
+            // scan watches to know cached titles and workspaces are still good.
+            "CREATE TABLE session (
+                 id TEXT PRIMARY KEY,
+                 directory TEXT NOT NULL,
+                 title TEXT,
+                 time_updated INTEGER NOT NULL
+             );
+             CREATE TABLE message (
+                 id TEXT PRIMARY KEY,
+                 session_id TEXT NOT NULL,
+                 time_created INTEGER NOT NULL,
+                 time_updated INTEGER NOT NULL,
+                 data TEXT NOT NULL
+             );
+             INSERT INTO session (id, directory, title, time_updated)
+             VALUES ('session-1', '/tmp/project', 'A session', 500);",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn timed_opencode_payload(id: &str, output: i64) -> String {
+        format!(
+            r#"{{
+                "id": "{id}",
+                "role": "assistant",
+                "modelID": "claude-sonnet-4",
+                "providerID": "anthropic",
+                "tokens": {{ "input": 100, "output": {output}, "reasoning": 0, "cache": {{ "read": 0, "write": 0 }} }},
+                "time": {{ "created": 1700000000000.0 }}
+            }}"#
+        )
+    }
+
+    fn insert_timed_opencode_row(conn: &rusqlite::Connection, id: &str, created: i64, output: i64) {
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data)
+             VALUES (?1, 'session-1', ?2, ?2, ?3)",
+            rusqlite::params![id, created, timed_opencode_payload(id, output)],
+        )
+        .unwrap();
+    }
+
+    fn total_output_tokens(messages: &[UnifiedMessage]) -> i64 {
+        messages.iter().map(|message| message.tokens.output).sum()
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_opencode_warm_scan_reads_only_changed_rows_and_agrees_with_a_cold_parse() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+
+        let db_dir = source_home.path().join(".local/share/opencode");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let db_path = db_dir.join("opencode.db");
+        let conn = create_timed_opencode_db(&db_path);
+        insert_timed_opencode_row(&conn, "msg-aaa", 1_000, 50);
+        insert_timed_opencode_row(&conn, "msg-zzz", 2_000, 60);
+
+        let cold = parse_all_messages_with_pricing(
+            source_home.path().to_str().unwrap(),
+            &["opencode".to_string()],
+            None,
+        );
+        assert_eq!(cold.len(), 2);
+        assert_eq!(total_output_tokens(&cold), 110);
+
+        let entry = message_cache::SourceMessageCache::load()
+            .get(
+                message_cache::CacheIdentity::for_client(ClientId::OpenCode),
+                &db_path,
+            )
+            .expect("the cold parse caches the database");
+        assert!(
+            entry.opencode_incremental.is_some(),
+            "a cold parse has to leave the mark a warm scan resumes from"
+        );
+
+        // The oldest row, first by id, is rewritten long after it was
+        // inserted -- the case an id-keyed mark would skip -- and a newer row
+        // arrives alongside it.
+        conn.execute(
+            "UPDATE message SET data = ?2, time_updated = ?3 WHERE id = ?1",
+            rusqlite::params!["msg-aaa", timed_opencode_payload("msg-aaa", 500), 9_000],
+        )
+        .unwrap();
+        insert_timed_opencode_row(&conn, "msg-mmm", 9_500, 70);
+
+        let rescans_before = sessions::opencode_schema::INCREMENTAL_RESCANS
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let warm = parse_all_messages_with_pricing(
+            source_home.path().to_str().unwrap(),
+            &["opencode".to_string()],
+            None,
+        );
+        assert_eq!(
+            sessions::opencode_schema::INCREMENTAL_RESCANS
+                .load(std::sync::atomic::Ordering::Relaxed),
+            rescans_before + 1,
+            "the warm scan must take the incremental path, not re-parse everything"
+        );
+        assert_eq!(warm.len(), 3);
+        assert_eq!(
+            total_output_tokens(&warm),
+            630,
+            "the rewritten row must be counted at its new value, once"
+        );
+
+        // Same database state, empty cache: the two paths have to agree.
+        let fresh_cache_home = tempfile::TempDir::new().unwrap();
+        let _fresh_cache_env = redirect_cache_home(fresh_cache_home.path());
+        let recold = parse_all_messages_with_pricing(
+            source_home.path().to_str().unwrap(),
+            &["opencode".to_string()],
+            None,
+        );
+        let mut warm_keys: Vec<Option<String>> = warm
+            .iter()
+            .map(|message| message.dedup_key.clone())
+            .collect();
+        let mut cold_keys: Vec<Option<String>> = recold
+            .iter()
+            .map(|message| message.dedup_key.clone())
+            .collect();
+        warm_keys.sort();
+        cold_keys.sort();
+        assert_eq!(warm_keys, cold_keys);
+        assert_eq!(total_output_tokens(&warm), total_output_tokens(&recold));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_opencode_warm_scan_re_parses_after_a_row_is_deleted() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+
+        let db_dir = source_home.path().join(".local/share/opencode");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let db_path = db_dir.join("opencode.db");
+        let conn = create_timed_opencode_db(&db_path);
+        insert_timed_opencode_row(&conn, "msg-aaa", 1_000, 50);
+        insert_timed_opencode_row(&conn, "msg-zzz", 2_000, 60);
+
+        let cold = parse_all_messages_with_pricing(
+            source_home.path().to_str().unwrap(),
+            &["opencode".to_string()],
+            None,
+        );
+        assert_eq!(cold.len(), 2);
+
+        // OpenCode cascades a session delete onto its messages. An incremental
+        // scan cannot see the row that went away, so the guard has to force a
+        // full re-parse rather than keep counting it.
+        conn.execute("DELETE FROM message WHERE id = 'msg-zzz'", [])
+            .unwrap();
+
+        let rescans_before = sessions::opencode_schema::INCREMENTAL_RESCANS
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let warm = parse_all_messages_with_pricing(
+            source_home.path().to_str().unwrap(),
+            &["opencode".to_string()],
+            None,
+        );
+        assert_eq!(
+            sessions::opencode_schema::INCREMENTAL_RESCANS
+                .load(std::sync::atomic::Ordering::Relaxed),
+            rescans_before,
+            "a deletion must not be served by an incremental scan"
+        );
+        assert_eq!(warm.len(), 1);
+        assert_eq!(warm[0].dedup_key.as_deref(), Some("msg-aaa"));
+        assert_eq!(total_output_tokens(&warm), 50);
     }
 
     #[test]
@@ -11595,6 +12250,85 @@ mod tests {
             graph.unpriced_submission_exclusions[0].reason,
             AMBIGUOUS_MODEL_PRICING_REASON
         );
+    }
+
+    /// Regression (#1211): the reporting lookup and the stricter submission
+    /// filter must agree when a first-party provider row competes with nested
+    /// reseller prices, and when OpenAI fast mode decorates a base GPT id.
+    #[test]
+    fn submission_keeps_first_party_prices_and_openai_fast_mode() {
+        let pricing = pricing::PricingService::new_with_custom_and_models_dev(
+            pricing::custom::CustomPricing::default(),
+            HashMap::from([(
+                "openai/gpt-5.5".to_string(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(5e-6),
+                    output_cost_per_token: Some(30e-6),
+                    ..Default::default()
+                },
+            )]),
+            HashMap::new(),
+            HashMap::from([
+                (
+                    "anthropic/claude-opus-4-8".to_string(),
+                    pricing::ModelPricing {
+                        input_cost_per_token: Some(5e-6),
+                        output_cost_per_token: Some(25e-6),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "gateway/anthropic/claude-opus-4-8".to_string(),
+                    pricing::ModelPricing {
+                        input_cost_per_token: Some(8e-6),
+                        output_cost_per_token: Some(40e-6),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "vercel/openai/gpt-5.5-fast".to_string(),
+                    pricing::ModelPricing {
+                        input_cost_per_token: Some(9e-6),
+                        output_cost_per_token: Some(54e-6),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+        );
+        let messages = vec![
+            UnifiedMessage::new(
+                "synthetic",
+                "claude-opus-4-8",
+                "anthropic",
+                "first-party-provider-row",
+                1_736_510_400_000,
+                TokenBreakdown {
+                    input: 100,
+                    output: 50,
+                    ..Default::default()
+                },
+                0.0,
+            ),
+            UnifiedMessage::new(
+                "synthetic",
+                "gpt-5.5-fast",
+                "openai",
+                "openai-fast-mode",
+                1_736_510_400_001,
+                TokenBreakdown {
+                    input: 100,
+                    output: 50,
+                    ..Default::default()
+                },
+                0.0,
+            ),
+        ];
+
+        let (submitted, exclusions) =
+            exclude_unpriced_submission_messages(messages, Some(&pricing));
+
+        assert_eq!(submitted.len(), 2);
+        assert!(exclusions.is_empty());
     }
 
     #[test]
@@ -15069,5 +15803,51 @@ mod tests {
         // Without verified cross-source dedup, both messages are preserved.
         let filtered = filter_messages_for_report(messages, &ReportOptions::default());
         assert_eq!(filtered.len(), 2);
+    }
+
+    /// The year filter compares the prefix in place rather than allocating
+    /// `format!("{year}-")` per message. The separator is load-bearing: without
+    /// it a truncated year like `202` would swallow every year it prefixes.
+    #[test]
+    fn year_filter_matches_on_the_full_year_and_its_separator() {
+        let dated = |date: &str| {
+            let mut message = UnifiedMessage::new(
+                "synthetic",
+                "gpt-4o",
+                "openai",
+                "session-1",
+                0,
+                TokenBreakdown::default(),
+                0.0,
+            );
+            message.date = date.to_string();
+            message
+        };
+
+        let options = ReportOptions {
+            year: Some("2026".to_string()),
+            ..Default::default()
+        };
+
+        assert!(message_passes_report_filter(&dated("2026-01-01"), &options));
+        assert!(message_passes_report_filter(&dated("2026-12-31"), &options));
+        assert!(!message_passes_report_filter(
+            &dated("2025-12-31"),
+            &options
+        ));
+        assert!(!message_passes_report_filter(
+            &dated("2027-01-01"),
+            &options
+        ));
+
+        // A partial year must not match the years it is a prefix of.
+        let truncated = ReportOptions {
+            year: Some("202".to_string()),
+            ..Default::default()
+        };
+        assert!(!message_passes_report_filter(
+            &dated("2026-01-01"),
+            &truncated
+        ));
     }
 }

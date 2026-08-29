@@ -380,8 +380,35 @@ pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
         return Vec::new();
     }
 
+    // #1153: `~/.config/Code/logs` can hold tens of thousands of entries
+    // (34,598 measured) from many extensions. The `codebuddy-extension-log`
+    // pattern only cares about `Tencent-Cloud.coding-copilot`, and every
+    // extension -- CodeBuddy included -- gets its own directory under an
+    // `exthost` parent. Pruning the siblings there drops the bulk of the tree.
+    //
+    // Deliberately keyed on the parent and not on the entry's own name: the
+    // CodeBuddy directory sits at `logs/<timestamp>/window<N>/exthost/...`, so
+    // admitting only directories named after the extension would prune the
+    // timestamp level and find nothing at all. Anything whose parent is not
+    // `exthost` is descended into, which keeps an unfamiliar layout correct
+    // and merely unpruned.
+    let prune_extension_siblings = pattern == "codebuddy-extension-log";
+
     let mut paths: Vec<PathBuf> = WalkDir::new(root)
         .into_iter()
+        .filter_entry(|e| {
+            if !prune_extension_siblings || !e.file_type().is_dir() {
+                return true;
+            }
+            let under_exthost = e
+                .path()
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|parent| parent.eq_ignore_ascii_case("exthost"));
+            !under_exthost
+                || e.file_name()
+                    .eq_ignore_ascii_case("Tencent-Cloud.coding-copilot")
+        })
         .filter_map(|e| e.ok())
         .filter(|e| {
             let path = e.path();
@@ -1084,6 +1111,26 @@ pub fn devin_desktop_additional_roots(home_dir: &str, use_env_roots: bool) -> Ve
     roots
 }
 
+/// Candidate roots for Devin CLI's Windows `sessions.db`.
+///
+/// Devin CLI stores its database under `%APPDATA%/devin/cli` on Windows,
+/// while the registered `PathRoot::XdgData` path remains the portable default.
+/// Keep the home-relative fallback alongside the environment-derived path so
+/// tests and explicit home overrides can exercise the same layout without
+/// depending on the process user's real AppData directory.
+fn devin_cli_additional_roots(home_dir: &str, use_env_roots: bool) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    if cfg!(target_os = "windows") && use_env_roots {
+        if let Some(app_data) = std::env::var_os("APPDATA").filter(|value| !value.is_empty()) {
+            roots.push(PathBuf::from(app_data).join("devin/cli"));
+        }
+    }
+
+    roots.push(PathBuf::from(home_dir).join("AppData/Roaming/devin/cli"));
+    roots
+}
+
 fn supports_extra_dir_scanning(client_id: ClientId) -> bool {
     // Kilo CLI currently loads a single SQLite DB via `scan_result.kilo_db`
     // Roo/KiloCode require local + remote and server task roots, and Crush
@@ -1478,6 +1525,11 @@ fn scan_all_clients_with_env_strategy_inner(
     let headless_roots = headless_roots_with_env_strategy(home_dir, use_env_roots);
 
     // Define scan tasks
+    /// Most workers a scan will run, however many cores the machine has.
+    /// Directory walks block on the filesystem rather than the CPU, so past a
+    /// handful the extra workers park and contend instead of finding files.
+    const SCAN_WORKER_CEILING: usize = 4;
+
     let mut tasks: Vec<(ClientId, String, &str)> = Vec::new();
     let mut seen_scan_roots: HashSet<(ClientId, PathBuf)> = HashSet::new();
     let mut devin_cli_roots: Vec<PathBuf> = Vec::new();
@@ -1972,6 +2024,7 @@ fn scan_all_clients_with_env_strategy_inner(
     }
 
     if enabled.contains(&ClientId::DevinCli) || enabled.contains(&ClientId::DevinDesktop) {
+        devin_cli_roots.extend(devin_cli_additional_roots(home_dir, use_env_roots));
         let devin_db_path = ClientId::DevinCli
             .data()
             .resolve_path_with_env_strategy(home_dir, use_env_roots);
@@ -2306,14 +2359,39 @@ fn scan_all_clients_with_env_strategy_inner(
         }
     }
 
-    // Execute scans in parallel
-    let scan_results: Vec<(ClientId, String, Vec<PathBuf>)> = tasks
-        .into_par_iter()
-        .map(|(client_id, path, pattern)| {
-            let files = scan_directory(&path, pattern);
-            (client_id, path, files)
-        })
-        .collect();
+    // #1153: bound scan parallelism to avoid futex storms on machines with
+    // huge log trees. These tasks are blocking directory walks rather than
+    // CPU work, so one worker per core leaves most of them parked on the
+    // filesystem and contending -- 97 threads in `futex_wait_queue` on the
+    // reporter's machine.
+    //
+    // The ceiling is deliberately a proportion of the machine rather than a
+    // constant: a fixed two workers would serialize scanning for every user to
+    // fix one user's storm, and scanning is what the whole command spends its
+    // time on. Four is enough to keep several disks-worth of walks in flight
+    // without the herd.
+    let scan = |tasks: Vec<(ClientId, String, &str)>| {
+        tasks
+            .into_par_iter()
+            .map(|(client_id, path, pattern)| {
+                let files = scan_directory(&path, pattern);
+                (client_id, path, files)
+            })
+            .collect()
+    };
+    let scan_workers = std::thread::available_parallelism()
+        .map_or(2, |cores| cores.get().min(SCAN_WORKER_CEILING));
+    let scan_results: Vec<(ClientId, String, Vec<PathBuf>)> = match rayon::ThreadPoolBuilder::new()
+        .num_threads(scan_workers)
+        .thread_name(|i| format!("tokscale-scan-{i}"))
+        .build()
+    {
+        Ok(pool) => pool.install(|| scan(tasks)),
+        // A pool that will not build is not worth failing the scan over. The
+        // global pool still produces correct results, just with the contention
+        // this cap exists to avoid.
+        Err(_) => scan(tasks),
+    };
 
     // Aggregate results, deduplicating canonical file paths across overlapping
     // roots while preserving one copy per client. Cherry Studio's V1 and V2
@@ -2595,6 +2673,87 @@ mod tests {
         let log_files = scan_directory(path.to_str().unwrap(), "*.log");
         assert_eq!(log_files.len(), 2);
         assert!(log_files.iter().all(|p| p.extension().unwrap() == "log"));
+    }
+
+    /// VS Code nests extension logs several levels below the root it is
+    /// scanned from: `logs/<timestamp>/window<N>/exthost/<publisher>.<ext>/`.
+    /// Pruning has to survive that descent -- the CodeBuddy directory is never
+    /// a direct child of the scan root, so a filter that only admits
+    /// directories named after the extension prunes the timestamp level and
+    /// finds nothing at all.
+    #[test]
+    fn test_scan_directory_finds_codebuddy_logs_below_the_vscode_log_tree() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let codebuddy = root
+            .join("20260823T075801")
+            .join("window1")
+            .join("exthost")
+            .join("Tencent-Cloud.coding-copilot");
+        fs::create_dir_all(&codebuddy).unwrap();
+        File::create(codebuddy.join("CodeBuddy.log")).unwrap();
+
+        let found = scan_directory(root.to_str().unwrap(), "codebuddy-extension-log");
+
+        assert_eq!(
+            found,
+            vec![codebuddy.join("CodeBuddy.log")],
+            "the extension log must survive the timestamp and window levels"
+        );
+    }
+
+    /// The point of the pruning: the sibling extension directories under
+    /// `exthost` are the bulk of the tree (34,598 entries on the #1153
+    /// reporter's machine) and none of them can contain CodeBuddy logs.
+    #[test]
+    fn test_scan_directory_skips_unrelated_extension_logs() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let exthost = root.join("20260823T075801").join("window1").join("exthost");
+
+        let codebuddy = exthost.join("Tencent-Cloud.coding-copilot");
+        fs::create_dir_all(&codebuddy).unwrap();
+        File::create(codebuddy.join("CodeBuddy.log")).unwrap();
+
+        for noisy in [
+            "ms-python.python",
+            "rust-lang.rust-analyzer",
+            "vscodevim.vim",
+        ] {
+            let other = exthost.join(noisy);
+            fs::create_dir_all(&other).unwrap();
+            File::create(other.join("extension.log")).unwrap();
+        }
+
+        let found = scan_directory(root.to_str().unwrap(), "codebuddy-extension-log");
+
+        assert_eq!(found, vec![codebuddy.join("CodeBuddy.log")]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_discovers_nested_lmstudio_logs() {
+        let mut env = EnvGuard::capture(&["LM_STUDIO_HOME"]);
+        env.remove("LM_STUDIO_HOME");
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let monthly_logs = home.join(".lmstudio/server-logs/2026-07");
+        fs::create_dir_all(&monthly_logs).unwrap();
+        let expected = monthly_logs.join("2026-07-09.log");
+        File::create(&expected).unwrap();
+        File::create(monthly_logs.join("ignore.txt")).unwrap();
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["lmstudio".to_string()],
+            false,
+        );
+
+        assert_eq!(
+            result.get(ClientId::LmStudio).as_slice(),
+            std::slice::from_ref(&expected)
+        );
+        assert_eq!(result.total_files(), 1);
     }
 
     #[test]
@@ -3723,6 +3882,34 @@ mod tests {
         );
 
         assert_eq!(result.get(ClientId::Codex).len(), 2);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_discovers_devin_cli_appdata_database() {
+        let previous_app_data = std::env::var("APPDATA").ok();
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let app_data = home.join("appdata");
+        let app_data_db = app_data.join("devin/cli/sessions.db");
+        fs::create_dir_all(app_data_db.parent().unwrap()).unwrap();
+        File::create(&app_data_db).unwrap();
+        unsafe { std::env::set_var("APPDATA", &app_data) };
+
+        let result = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["devin-cli".to_string()],
+            true,
+            &ScannerSettings::default(),
+        );
+
+        restore_env("APPDATA", previous_app_data);
+        assert!(
+            result.devin_dbs.contains(&app_data_db),
+            "expected Windows AppData database in {:?}",
+            result.devin_dbs
+        );
     }
 
     #[test]
