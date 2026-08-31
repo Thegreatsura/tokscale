@@ -32,9 +32,13 @@ use std::time::UNIX_EPOCH;
 // Both older layouts have wire migrations below, so nothing is discarded --
 // which matters most for Claude, whose entries are the only copy of compacted
 // history.
-const CACHE_FORMAT_VERSION: u32 = 6;
+// 7: OpenCode incremental marks record row provenance. Version-6 shards have a
+// wire migration below: unrelated clients retain their cache, while OpenCode
+// keeps its parsed messages and takes one full scan to acquire the new map.
+const CACHE_FORMAT_VERSION: u32 = 7;
 const LEGACY_CACHE_FORMAT_VERSION_V4: u32 = 4;
 const LEGACY_CACHE_FORMAT_VERSION_V5: u32 = 5;
+const LEGACY_CACHE_FORMAT_VERSION_V6: u32 = 6;
 // V2 intentionally starts cold and leaves source-message-cache.bin untouched:
 // the monolith did not record a trustworthy parser owner for migration.
 const CACHE_SHARD_DIRNAME: &str = "source-message-cache-v2";
@@ -1254,7 +1258,11 @@ fn parser_version(client: ClientId) -> u32 {
         // request model. Finished DSH transcripts are append-only and keep the
         // same fingerprint, so only this bump replaces cached alias/substitute
         // attribution and its derived pricing.
-        ClientId::Dsh => 4,
+        // v4->v5: compaction summaries now use their globally stable
+        // `data.compactionId` before the per-transcript `seq` fallback. Reparse
+        // released v4 rows so unrelated summaries with otherwise identical
+        // call data are no longer collapsed across files (#1187).
+        ClientId::Dsh => 5,
         // First version of the fx (vercel-labs) usage-v2.json parser. Entries
         // are versioned from the start so later parser changes have an
         // obvious local counter to bump, like every other client here.
@@ -1273,7 +1281,11 @@ fn parser_version(client: ClientId) -> u32 {
         // the legacy `session` join for workspace and title. A database that
         // carries both tables is byte-identical before and after, so only the
         // version bump discards entries still holding the old attribution.
-        ClientId::OpenCode => 2,
+        // v2 -> v3: id-less legacy JSON messages now carry a canonical
+        // path-scoped key instead of a globally colliding filename stem. The
+        // source bytes and fingerprint do not change, so invalidate cached v2
+        // rows to make same-named files in different sessions survive (#1198).
+        ClientId::OpenCode => 3,
         _ => 1,
     }
 }
@@ -1415,6 +1427,54 @@ struct LegacyCachedSourceEntryV5 {
 
 impl From<LegacyCachedSourceEntryV5> for CachedSourceEntry {
     fn from(entry: LegacyCachedSourceEntryV5) -> Self {
+        Self {
+            parser_namespace: entry.parser_namespace,
+            parser_version: entry.parser_version,
+            path: entry.path,
+            fingerprint: entry.fingerprint,
+            messages: entry.messages,
+            fallback_timestamp_indices: entry.fallback_timestamp_indices,
+            codex_incremental: entry.codex_incremental,
+            prime_accounting: entry.prime_accounting,
+            opencode_incremental: None,
+        }
+    }
+}
+
+/// Exact version-6 OpenCode mark layout. The aggregate/probe-based state has
+/// no trustworthy row provenance to synthesize during migration, so OpenCode
+/// entries keep their parsed messages but drop only this mark and rebuild it
+/// on the next changed-database scan.
+#[derive(Debug, Serialize, Deserialize)]
+struct LegacyOpenCodeGroupMarkV6 {
+    query_digest: u64,
+    row_count: i64,
+    created_high_water: i64,
+    updated_high_water: i64,
+    metadata_high_water: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LegacyOpenCodeIncrementalStateV6 {
+    groups: Vec<Option<LegacyOpenCodeGroupMarkV6>>,
+    merged_dedup_keys: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LegacyCachedSourceEntryV6 {
+    parser_namespace: String,
+    parser_version: u32,
+    path: CachedPath,
+    fingerprint: SourceFingerprint,
+    messages: Vec<UnifiedMessage>,
+    fallback_timestamp_indices: Vec<usize>,
+    codex_incremental: Option<CodexIncrementalCache>,
+    prime_accounting: Option<crate::sessions::prime_agent::PrimeFileAccounting>,
+    opencode_incremental: Option<LegacyOpenCodeIncrementalStateV6>,
+}
+
+impl From<LegacyCachedSourceEntryV6> for CachedSourceEntry {
+    fn from(entry: LegacyCachedSourceEntryV6) -> Self {
         Self {
             parser_namespace: entry.parser_namespace,
             parser_version: entry.parser_version,
@@ -2298,6 +2358,17 @@ fn read_shard_with_limit(
         return match bincode::options()
             .with_limit(max_shard_bytes)
             .deserialize::<Vec<LegacyCachedSourceEntryV5>>(&envelope.payload)
+        {
+            Ok(entries) => ShardReadStatus::Migrated(
+                entries.into_iter().map(CachedSourceEntry::from).collect(),
+            ),
+            Err(error) => ShardReadStatus::Invalid(error.to_string()),
+        };
+    }
+    if envelope.format_version == LEGACY_CACHE_FORMAT_VERSION_V6 {
+        return match bincode::options()
+            .with_limit(max_shard_bytes)
+            .deserialize::<Vec<LegacyCachedSourceEntryV6>>(&envelope.payload)
         {
             Ok(entries) => ShardReadStatus::Migrated(
                 entries.into_iter().map(CachedSourceEntry::from).collect(),
@@ -3361,11 +3432,95 @@ mod tests {
     }
 
     #[test]
-    fn test_opencode_session_v2_metadata_parser_version_invalidates_v1_entries() {
-        // A database holding both `session` and `session_v2` does not change on
-        // disk when the parser starts preferring the newer table, so the
-        // fingerprint keeps matching and only this bump forces the reparse.
-        assert_eq!(parser_version(ClientId::OpenCode), 2);
+    fn test_opencode_path_identity_parser_version_invalidates_v2_entries() {
+        // An id-less JSON file does not change on disk when its fallback key
+        // becomes path-scoped, so only this bump retires the colliding v2 key.
+        assert_eq!(parser_version(ClientId::OpenCode), 3);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn opencode_v2_shards_reparse_idless_json_with_path_identity() {
+        let temp_home = TempDir::new().unwrap();
+        let _cache_env = sandbox_cache_env(temp_home.path());
+        let source_root = TempDir::new().unwrap();
+        let source = source_root.path().join("session-a/shared-name.json");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(
+            &source,
+            br#"{"sessionID":"session-a","role":"assistant","modelID":"m","providerID":"p","tokens":{"input":10,"output":20,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1700000000000}}"#,
+        )
+        .unwrap();
+
+        let current_identity = CacheIdentity::for_client(ClientId::OpenCode);
+        assert_eq!(current_identity.parser_version, 3);
+        let stale_identity = CacheIdentity {
+            namespace: current_identity.namespace,
+            parser_version: 2,
+        };
+        let fingerprint = SourceFingerprint::from_path(&source).unwrap();
+        let mut stale_message = UnifiedMessage::new(
+            current_identity.namespace,
+            "m",
+            "p",
+            "session-a",
+            1_700_000_000_000,
+            crate::TokenBreakdown {
+                input: 10,
+                output: 20,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            0.0,
+        );
+        stale_message.dedup_key = Some("shared-name".to_string());
+        let stale_entry = CachedSourceEntry::new(
+            stale_identity,
+            &source,
+            fingerprint.clone(),
+            vec![stale_message],
+            Vec::new(),
+            None,
+        );
+        let stale_path = cache_shard_path(current_identity, &source);
+        ensure_cache_dir(stale_path.parent().unwrap()).unwrap();
+        write_shard_with_limit(
+            &stale_path,
+            stale_identity,
+            &[stale_entry],
+            MAX_CACHE_SHARD_BYTES,
+        )
+        .unwrap();
+
+        let mut cache = SourceMessageCache::load();
+        assert!(
+            cache.get(current_identity, &source).is_none(),
+            "the globally colliding v2 fallback must not survive the parser bump"
+        );
+
+        let rebuilt = crate::sessions::opencode::parse_opencode_file(&source)
+            .into_iter()
+            .collect::<Vec<_>>();
+        assert_eq!(rebuilt.len(), 1);
+        assert!(rebuilt[0]
+            .dedup_key
+            .as_deref()
+            .is_some_and(|key| key.starts_with("legacy-json-path:")));
+        cache.insert(CachedSourceEntry::new(
+            current_identity,
+            &source,
+            fingerprint,
+            rebuilt.clone(),
+            Vec::new(),
+            None,
+        ));
+        cache.save_if_dirty();
+
+        let warm = SourceMessageCache::load();
+        let cached = warm.get(current_identity, &source).unwrap();
+        assert_eq!(cached.parser_version, 3);
+        assert_eq!(cached.messages, rebuilt);
     }
 
     #[test]
@@ -3377,11 +3532,11 @@ mod tests {
     }
 
     #[test]
-    fn test_dsh_served_model_parser_version_invalidates_v3_entries() {
+    fn test_dsh_compaction_identity_parser_version_invalidates_v4_entries() {
         // A finished transcript is never rewritten when attribution starts
-        // preferring the provider-reported response model, so its fingerprint
-        // remains valid and only the parser version can retire the old row.
-        assert_eq!(parser_version(ClientId::Dsh), 4);
+        // preferring compactionId, so its fingerprint remains valid and only
+        // the parser version can retire the seq-keyed row released in v4.14.0.
+        assert_eq!(parser_version(ClientId::Dsh), 5);
     }
 
     #[test]
@@ -3395,7 +3550,7 @@ mod tests {
 "#,
         );
         let current_identity = CacheIdentity::for_client(ClientId::Dsh);
-        assert_eq!(current_identity.parser_version, 4);
+        assert_eq!(current_identity.parser_version, 5);
         let stale_identity = CacheIdentity {
             namespace: current_identity.namespace,
             parser_version: 3,
@@ -3456,7 +3611,87 @@ mod tests {
 
         let warm = SourceMessageCache::load();
         let cached = warm.get(current_identity, source.path()).unwrap();
-        assert_eq!(cached.parser_version, 4);
+        assert_eq!(cached.parser_version, 5);
+        assert_eq!(cached.messages, rebuilt);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dsh_v4_shards_are_reparsed_with_global_compaction_identity() {
+        let temp_home = TempDir::new().unwrap();
+        let _cache_env = sandbox_cache_env(temp_home.path());
+        let source = write_temp_file(
+            br#"{"type":"session","id":"session-summary","createdAt":1,"cwd":"/work"}
+{"type":"compaction/summary","seq":4,"time":1786669450002,"data":{"compactionId":"compact-global","message":{"source":{"provider":"p","model":"m"}},"usage":{"inputTokens":10,"outputTokens":20}}}
+"#,
+        );
+        let current_identity = CacheIdentity::for_client(ClientId::Dsh);
+        assert_eq!(current_identity.parser_version, 5);
+        let stale_identity = CacheIdentity {
+            namespace: current_identity.namespace,
+            parser_version: 4,
+        };
+        let fingerprint = SourceFingerprint::from_path(source.path()).unwrap();
+        let mut stale_message = UnifiedMessage::new(
+            current_identity.namespace,
+            "m",
+            "p",
+            "session-summary",
+            1786669450002,
+            crate::TokenBreakdown {
+                input: 10,
+                output: 20,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            0.0,
+        );
+        stale_message.dedup_key =
+            Some("dsh:summary:seq:4:1786669450002:p:m:10:20:0:0:0".to_string());
+        let stale_entry = CachedSourceEntry::new(
+            stale_identity,
+            source.path(),
+            fingerprint.clone(),
+            vec![stale_message],
+            Vec::new(),
+            None,
+        );
+        let stale_path = cache_shard_path(current_identity, source.path());
+        ensure_cache_dir(stale_path.parent().unwrap()).unwrap();
+        write_shard_with_limit(
+            &stale_path,
+            stale_identity,
+            &[stale_entry],
+            MAX_CACHE_SHARD_BYTES,
+        )
+        .unwrap();
+
+        let mut cache = SourceMessageCache::load();
+        assert!(
+            cache.get(current_identity, source.path()).is_none(),
+            "a released v4 seq-keyed row must not survive the parser change"
+        );
+
+        let rebuilt = crate::sessions::dsh::parse_dsh_file(source.path());
+        assert_eq!(rebuilt.len(), 1);
+        assert_eq!(
+            rebuilt[0].dedup_key.as_deref(),
+            Some("dsh:summary:cmp:compact-global:1786669450002:p:m:10:20:0:0:0")
+        );
+        cache.insert(CachedSourceEntry::new(
+            current_identity,
+            source.path(),
+            fingerprint,
+            rebuilt.clone(),
+            Vec::new(),
+            None,
+        ));
+        cache.save_if_dirty();
+
+        let warm = SourceMessageCache::load();
+        let cached = warm.get(current_identity, source.path()).unwrap();
+        assert_eq!(cached.parser_version, 5);
         assert_eq!(cached.messages, rebuilt);
     }
 
@@ -4587,6 +4822,71 @@ mod tests {
             cache.get(identity, source.path()).unwrap().messages[0].session_id,
             "legacy-opencode"
         );
+        assert!(cache.has_rewrite_shard(&shard_key));
+        cache.save_if_dirty();
+        assert!(matches!(
+            read_shard(&legacy_path, identity),
+            ShardReadStatus::Loaded(entries) if entries.len() == 1
+        ));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_v6_shard_migrates_messages_and_rebuilds_row_provenance() {
+        let temp_home = TempDir::new().unwrap();
+        let _cache_env = sandbox_cache_env(temp_home.path());
+        let source = write_temp_file(b"{}\n");
+        let identity = CacheIdentity::for_client(ClientId::OpenCode);
+        let entry = test_entry(identity, source.path(), "v6-opencode");
+        let key = CacheKey::from_entry(&entry);
+        let shard_key = key.shard();
+        let legacy_path = shard_path(&cache_shard_dir().unwrap(), &shard_key);
+        ensure_cache_dir(legacy_path.parent().unwrap()).unwrap();
+        let legacy_entry = LegacyCachedSourceEntryV6 {
+            parser_namespace: entry.parser_namespace,
+            parser_version: entry.parser_version,
+            path: entry.path,
+            fingerprint: entry.fingerprint,
+            messages: entry.messages,
+            fallback_timestamp_indices: entry.fallback_timestamp_indices,
+            codex_incremental: entry.codex_incremental,
+            prime_accounting: entry.prime_accounting,
+            opencode_incremental: Some(LegacyOpenCodeIncrementalStateV6 {
+                groups: vec![Some(LegacyOpenCodeGroupMarkV6 {
+                    query_digest: 7,
+                    row_count: 1,
+                    created_high_water: 10,
+                    updated_high_water: 20,
+                    metadata_high_water: 30,
+                })],
+                merged_dedup_keys: vec!["old-key".to_string()],
+            }),
+        };
+        let envelope = CachedShardEnvelope {
+            format_version: LEGACY_CACHE_FORMAT_VERSION_V6,
+            parser_namespace: identity.namespace.to_string(),
+            parser_version: identity.parser_version,
+            payload: bincode::options().serialize(&vec![legacy_entry]).unwrap(),
+        };
+        let mut writer = BufWriter::new(File::create(&legacy_path).unwrap());
+        bincode::options()
+            .serialize_into(&mut writer, &envelope)
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        assert!(matches!(
+            read_shard(&legacy_path, identity),
+            ShardReadStatus::Migrated(entries)
+                if entries.len() == 1
+                    && entries[0].messages[0].session_id == "v6-opencode"
+                    && entries[0].opencode_incremental.is_none()
+        ));
+
+        let mut cache = SourceMessageCache::load();
+        let migrated = cache.get(identity, source.path()).unwrap();
+        assert_eq!(migrated.messages[0].session_id, "v6-opencode");
+        assert!(migrated.opencode_incremental.is_none());
         assert!(cache.has_rewrite_shard(&shard_key));
         cache.save_if_dirty();
         assert!(matches!(

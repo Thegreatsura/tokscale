@@ -523,13 +523,22 @@ pub struct GraphResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time_metrics: Option<sessionize::TimeMetrics>,
     #[serde(skip)]
-    pub unpriced_submission_exclusions: Vec<UnpricedSubmissionExclusion>,
+    pub unpriced_submission_usage: Vec<UnpricedSubmissionUsage>,
+    /// Days whose submitted cost is only a floor because at least one
+    /// token-bearing message could not be priced authoritatively.
+    ///
+    /// The CLI serializes these days as `totals.costIsComplete: false`. Kept
+    /// outside `DailyTotals` because it is submission-only protocol metadata,
+    /// not part of local report aggregation or exported historical reports.
+    #[serde(skip)]
+    pub incomplete_cost_dates: BTreeSet<String>,
 }
 
-/// Token-bearing usage excluded only from a submission because it cannot be
-/// priced authoritatively. Local reports retain the original usage.
+/// Token-bearing usage submitted at zero cost because it cannot be priced
+/// authoritatively. The containing day is marked cost-incomplete so the server
+/// treats that amount as a floor rather than lowering a previously stored cost.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnpricedSubmissionExclusion {
+pub struct UnpricedSubmissionUsage {
     pub provider_id: String,
     pub model_id: String,
     pub message_count: usize,
@@ -770,14 +779,28 @@ fn parse_all_messages_with_pricing_with_env_strategy(
 /// lanes are scanned and the SQLite lane runs first, so every migrated file is
 /// parsed only for its message to be dropped by the dedup filter that follows.
 ///
-/// The file stem is the message id, which is exactly the dedup key the SQLite
-/// lane inserted, so the duplicate can be recognized from the path alone —
-/// before the file is opened. On a migrated install that skips nearly the whole
-/// directory (#1209); unmigrated files miss the set and are still parsed.
-fn opencode_json_superseded_by_sqlite(path: &Path, sqlite_keys: &HashSet<String>) -> bool {
-    path.file_stem()
-        .and_then(|stem| stem.to_str())
-        .is_some_and(|stem| sqlite_keys.contains(stem))
+/// The file stem is the message id and its parent directory is the session id.
+/// Requiring both preserves the pre-open migration fast path from #1209 while
+/// preventing an id-less file in another session from being suppressed merely
+/// because its local filename matches an unrelated SQLite id (#1198).
+fn opencode_json_superseded_by_sqlite(
+    path: &Path,
+    sqlite_locations: &HashMap<String, HashSet<String>>,
+) -> bool {
+    let Some(message_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return false;
+    };
+    let Some(session_id) = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+    else {
+        return false;
+    };
+
+    sqlite_locations
+        .get(session_id)
+        .is_some_and(|message_ids| message_ids.contains(message_id))
 }
 
 /// Receives fully-transformed messages as each client lane finishes, so the
@@ -835,31 +858,43 @@ fn flush_lane<S: MessageSink>(
     context: &FlushContext<'_>,
     sink: &mut S,
 ) {
-    for mut message in buffer.drain(..) {
-        if !context.include_all
-            && !retain_for_requested_clients(
-                &message.client,
-                &message.model_id,
-                &message.provider_id,
-                &context.requested,
-            )
-        {
-            continue;
-        }
-
-        if context.include_synthetic {
-            sessions::synthetic::normalize_synthetic_gateway_fields(
-                &mut message.model_id,
-                &mut message.provider_id,
-            );
-        }
-
-        if let Some(timezone) = &context.timezone {
-            message.rebucket_date(timezone);
-        }
-
-        sink.accept(message);
+    for message in buffer.drain(..) {
+        flush_message(message, context, sink);
     }
+}
+
+/// Apply the parse tail to one message and release it into the consumer.
+///
+/// Most parsers still hand back a lane buffer, but sources with their own
+/// streaming boundary can call this directly without rebuilding that buffer.
+fn flush_message<S: MessageSink>(
+    mut message: UnifiedMessage,
+    context: &FlushContext<'_>,
+    sink: &mut S,
+) {
+    if !context.include_all
+        && !retain_for_requested_clients(
+            &message.client,
+            &message.model_id,
+            &message.provider_id,
+            &context.requested,
+        )
+    {
+        return;
+    }
+
+    if context.include_synthetic {
+        sessions::synthetic::normalize_synthetic_gateway_fields(
+            &mut message.model_id,
+            &mut message.provider_id,
+        );
+    }
+
+    if let Some(timezone) = &context.timezone {
+        message.rebucket_date(timezone);
+    }
+
+    sink.accept(message);
 }
 
 fn parse_all_messages_with_pricing_with_cache_policy(
@@ -1866,6 +1901,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
     // Parse OpenCode: prefer SQLite, collapse forked SQLite history there, then
     // suppress legacy JSON overlap by message identity.
     let mut opencode_seen: HashSet<String> = HashSet::new();
+    let mut opencode_sqlite_locations: HashMap<String, HashSet<String>> = HashMap::new();
 
     for db_path in &scan_result.opencode_dbs {
         let CachedParseOutcome {
@@ -1878,12 +1914,18 @@ fn parse_all_messages_streaming<S: MessageSink>(
         // both `opencode.db` and `opencode-<channel>.db` if the user
         // switches channels mid-session. `discover_opencode_dbs` returns
         // paths in sorted order, so the first-seen copy is deterministic.
-        all_messages.extend(messages.into_iter().filter(|message| {
-            message
-                .dedup_key
-                .as_ref()
-                .is_none_or(|key| opencode_seen.insert(key.clone()))
-        }));
+        for message in messages {
+            if let Some(key) = message.dedup_key.as_ref() {
+                opencode_sqlite_locations
+                    .entry(message.session_id.clone())
+                    .or_default()
+                    .insert(key.clone());
+                if !opencode_seen.insert(key.clone()) {
+                    continue;
+                }
+            }
+            all_messages.push(message);
+        }
 
         if let Some(entry) = cache_entry {
             source_cache.insert(entry);
@@ -1893,7 +1935,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
     let opencode_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::OpenCode)
         .par_iter()
-        .filter(|path| !opencode_json_superseded_by_sqlite(path, &opencode_seen))
+        .filter(|path| !opencode_json_superseded_by_sqlite(path, &opencode_sqlite_locations))
         .filter_map(|path| {
             Some(load_or_parse_source(
                 message_cache::CacheIdentity::for_client(ClientId::OpenCode),
@@ -2102,31 +2144,37 @@ fn parse_all_messages_streaming<S: MessageSink>(
             .filter(|m| m.client == "copilot")
             .filter_map(|m| m.dedup_key.clone())
             .collect();
-        let existing_copilot_session_timestamps: HashSet<(String, i64)> = all_messages
-            .iter()
-            .filter(|m| m.client == "copilot")
-            .map(|m| (m.session_id.clone(), m.timestamp))
-            .collect();
-        let vscode_msgs = sessions::copilot_vscode::parse_copilot_vscode_sessions(
+        let mut existing_copilot_session_timestamps: HashMap<String, HashSet<i64>> = HashMap::new();
+        for message in all_messages.iter().filter(|m| m.client == "copilot") {
+            existing_copilot_session_timestamps
+                .entry(message.session_id.clone())
+                .or_default()
+                .insert(message.timestamp);
+        }
+
+        // These are the only rows the VS Code lane consults. Once their keys
+        // and timestamps are projected above, keeping the full OTEL/desktop
+        // messages alive serves no purpose. Release them before parsing the
+        // request-heavy source, then feed each VS Code message through the same
+        // tail instead of rebuilding `all_messages`.
+        flush_lane(&mut all_messages, &flush_context, sink);
+        sessions::copilot_vscode::parse_copilot_vscode_sessions_into(
             &scan_result.copilot_vscode_sessions,
-        );
-        all_messages.extend(
-            vscode_msgs
-                .into_iter()
-                .filter(|m| {
-                    let key_unique = m
-                        .dedup_key
-                        .as_deref()
-                        .map(|k| !existing_dedup_keys.contains(k))
-                        .unwrap_or(true);
-                    let session_ts_unique = !existing_copilot_session_timestamps
-                        .contains(&(m.session_id.clone(), m.timestamp));
-                    key_unique && session_ts_unique
-                })
-                .map(|mut message| {
-                    apply_pricing_if_available(&mut message, pricing);
-                    message
-                }),
+            &mut |mut message| {
+                let key_unique = message
+                    .dedup_key
+                    .as_deref()
+                    .is_none_or(|key| !existing_dedup_keys.contains(key));
+                let session_timestamp_unique = existing_copilot_session_timestamps
+                    .get(message.session_id.as_str())
+                    .is_none_or(|timestamps| !timestamps.contains(&message.timestamp));
+                if !key_unique || !session_timestamp_unique {
+                    return;
+                }
+
+                apply_pricing_if_available(&mut message, pricing);
+                flush_message(message, &flush_context, sink);
+            },
         );
     }
 
@@ -2606,6 +2654,36 @@ fn parse_all_messages_streaming<S: MessageSink>(
         ClientId::LmStudio,
         sessions::lmstudio::parse_lmstudio_file,
     );
+
+    // Unsloth Studio stores both internal chat usage and authenticated API
+    // receipts in a live SQLite database. Use the SQLite-aware fingerprint so
+    // WAL-only writes invalidate the cache, then dedupe configured overlapping
+    // roots by the stable message/request identities emitted by the parser.
+    let unsloth_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::Unsloth)
+        .par_iter()
+        .map(|db_path| {
+            load_or_parse_sqlite_source(
+                message_cache::CacheIdentity::for_client(ClientId::Unsloth),
+                db_path,
+                &source_cache,
+                pricing,
+                sessions::unsloth::parse_unsloth_sqlite,
+            )
+        })
+        .collect();
+    let mut unsloth_seen = HashSet::new();
+    for outcome in unsloth_outcomes {
+        all_messages.extend(
+            outcome
+                .messages
+                .into_iter()
+                .filter(|message| should_keep_deduped_message(&mut unsloth_seen, message)),
+        );
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
 
     // ZCode (Z.ai GLM-5.2 ADE) JSONL sessions. Token usage may be embedded
     // from the API response; otherwise estimated from content.
@@ -4043,15 +4121,19 @@ async fn generate_graph_with_loaded_pricing(
 
 /// Messages buffered before a batch is folded away.
 ///
-/// Batching lets the sink reuse `exclude_unpriced_submission_messages` and
+/// Batching lets the sink reuse `prepare_submission_pricing` and
 /// `validate_priced_messages` verbatim rather than reimplementing their pricing
 /// rules, which is the part that would quietly diverge. Peak cost is one batch,
 /// not the corpus.
-const GRAPH_SINK_BATCH: usize = 65_536;
+// A batch holds full `UnifiedMessage` values, including their separately
+// allocated strings. 65,536 made the buffer itself hundreds of megabytes on
+// Copilot-heavy profiles. 4,096 amortises the existing pricing validators
+// while placing a small, corpus-independent ceiling on this part of submit.
+const GRAPH_SINK_BATCH: usize = 4_096;
 
 /// Folds a graph report as messages arrive instead of collecting them.
 ///
-/// The submit path made three passes over every message -- unpriced exclusion,
+/// The submit path made three passes over every message -- pricing preparation,
 /// sessionization, daily aggregation -- and so had to keep ~1M of them alive at
 /// once (#1209). All three are per message, so each runs as the message
 /// arrives and the message is dropped: what survives is the day map, an
@@ -4067,7 +4149,8 @@ struct GraphSink<'a> {
     interner: sessionize::SpanInterner,
     spans: Vec<sessionize::SessionSpan>,
     /// Merged across batches by (provider, model); counts and tokens add.
-    exclusions: HashMap<(String, String), (usize, i64, &'static str)>,
+    unpriced_usage: HashMap<(String, String), (usize, i64, &'static str)>,
+    incomplete_cost_dates: BTreeSet<String>,
     /// First batch error, surfaced from `finish` so the outcome matches the
     /// whole-corpus path's `?` on the first failure.
     failure: Option<String>,
@@ -4087,7 +4170,8 @@ impl<'a> GraphSink<'a> {
             daily: aggregator::DailyFold::default(),
             interner: sessionize::SpanInterner::default(),
             spans: Vec::new(),
-            exclusions: HashMap::new(),
+            unpriced_usage: HashMap::new(),
+            incomplete_cost_dates: BTreeSet::new(),
             failure: None,
         }
     }
@@ -4101,21 +4185,27 @@ impl<'a> GraphSink<'a> {
         let batch = match self.requirement {
             GraphPricingRequirement::Lenient => batch,
             GraphPricingRequirement::Submission => {
-                let (submitted, exclusions) =
-                    exclude_unpriced_submission_messages(batch, self.pricing);
-                for exclusion in exclusions {
+                let (mut submitted, zeroed, unpriced_usage, incomplete_cost_dates) =
+                    prepare_submission_pricing(batch, self.pricing);
+                for usage in unpriced_usage {
                     let entry = self
-                        .exclusions
-                        .entry((exclusion.provider_id, exclusion.model_id))
-                        .or_insert((0, 0, exclusion.reason));
-                    entry.0 += exclusion.message_count;
-                    entry.1 = entry.1.saturating_add(exclusion.total_tokens);
+                        .unpriced_usage
+                        .entry((usage.provider_id, usage.model_id))
+                        .or_insert((0, 0, usage.reason));
+                    entry.0 += usage.message_count;
+                    entry.1 = entry.1.saturating_add(usage.total_tokens);
                 }
+                self.incomplete_cost_dates.extend(incomplete_cost_dates);
+                // Validate only the authoritatively priced subset. The zeroed
+                // messages are intentionally unpriceable; their protection is
+                // the day-level completeness signal, not pretending they pass
+                // this validator.
                 if self.failure.is_none() {
                     if let Err(error) = validate_priced_messages(&submitted, self.pricing) {
                         self.failure = Some(error);
                     }
                 }
+                submitted.extend(zeroed);
                 submitted
             }
         };
@@ -4138,12 +4228,12 @@ impl<'a> GraphSink<'a> {
     ) -> Result<GraphResult, String> {
         self.drain_batch();
 
-        let mut unpriced_submission_exclusions: Vec<UnpricedSubmissionExclusion> = self
-            .exclusions
+        let mut unpriced_submission_usage: Vec<UnpricedSubmissionUsage> = self
+            .unpriced_usage
             .into_iter()
             .map(
                 |((provider_id, model_id), (message_count, total_tokens, reason))| {
-                    UnpricedSubmissionExclusion {
+                    UnpricedSubmissionUsage {
                         provider_id,
                         model_id,
                         message_count,
@@ -4153,12 +4243,12 @@ impl<'a> GraphSink<'a> {
                 },
             )
             .collect();
-        // `exclude_unpriced_submission_messages` emits these from a BTreeMap
+        // `prepare_submission_pricing` emits these from a BTreeMap
         // keyed the same way, so sorting here keeps the reported order stable.
-        unpriced_submission_exclusions
+        unpriced_submission_usage
             .sort_by(|a, b| (&a.provider_id, &a.model_id).cmp(&(&b.provider_id, &b.model_id)));
 
-        require_trustworthy_exclusions(self.pricing, &unpriced_submission_exclusions)?;
+        require_trustworthy_unpriced_usage(self.pricing, &unpriced_submission_usage)?;
         if let Some(failure) = self.failure {
             return Err(failure);
         }
@@ -4181,7 +4271,8 @@ impl<'a> GraphSink<'a> {
         let processing_time_ms = start.elapsed().as_millis() as u32;
         let mut result = aggregator::generate_graph_result(contributions, processing_time_ms);
         result.time_metrics = Some(time_metrics);
-        result.unpriced_submission_exclusions = unpriced_submission_exclusions;
+        result.unpriced_submission_usage = unpriced_submission_usage;
+        result.incomplete_cost_dates = self.incomplete_cost_dates;
 
         for contribution in &mut result.contributions {
             if let Some(&ms) = daily_active_time.get(&contribution.date) {
@@ -4228,7 +4319,7 @@ fn parse_all_messages_streaming_with_env_strategy<S: MessageSink>(
 
 /// Collecting form of the submit-report build, retained as the test surface for
 /// [`GraphSink`]: it feeds an already-filtered `Vec` through the same sink the
-/// streaming path uses, so the sink's folding, exclusion-merging and ordering
+/// streaming path uses, so the sink's folding, diagnostic merging and ordering
 /// behaviour stay under test without a full parse. Production callers stream
 /// into [`GraphSink`] directly and never collect, which is why this is
 /// `#[cfg(test)]` rather than dead code.
@@ -4265,7 +4356,7 @@ const UNVERIFIED_PROVIDER_IDENTITY_REASON: &str =
 /// Routing labels name the router that served the request, never the model
 /// that answered it, so they have no authoritative model-to-price mapping.
 /// This defers to `lookup::is_routing_label` (lookup.rs) rather than restating
-/// its `ROUTING_LABELS` list: the reason a row is excluded has to name the same
+/// its `ROUTING_LABELS` list: the reason a row is zeroed has to name the same
 /// labels the resolver refuses at its top, and a second copy of the list would
 /// drift the moment a label is added to one side. Trimming matches for the same
 /// reason — the resolver trims, so ` auto ` must not read as a routing label
@@ -4285,21 +4376,30 @@ fn has_positive_token_usage(tokens: &TokenBreakdown) -> bool {
         || tokens.reasoning > 0
 }
 
-fn exclude_unpriced_submission_messages(
+fn prepare_submission_pricing(
     messages: Vec<UnifiedMessage>,
     pricing: Option<&pricing::PricingService>,
-) -> (Vec<UnifiedMessage>, Vec<UnpricedSubmissionExclusion>) {
+) -> (
+    Vec<UnifiedMessage>,
+    Vec<UnifiedMessage>,
+    Vec<UnpricedSubmissionUsage>,
+    BTreeSet<String>,
+) {
     use pricing::lookup::SubmissionSafetyGap;
 
     let Some(pricing) = pricing else {
-        return (messages, Vec::new());
+        return (messages, Vec::new(), Vec::new(), BTreeSet::new());
     };
 
-    let mut submitted = Vec::with_capacity(messages.len());
-    let mut exclusions: std::collections::BTreeMap<(String, String), (usize, i64, &'static str)> =
-        std::collections::BTreeMap::new();
+    let mut priced = Vec::with_capacity(messages.len());
+    let mut zeroed = Vec::new();
+    let mut unpriced_usage: std::collections::BTreeMap<
+        (String, String),
+        (usize, i64, &'static str),
+    > = std::collections::BTreeMap::new();
+    let mut incomplete_cost_dates = BTreeSet::new();
 
-    for message in messages {
+    for mut message in messages {
         let is_unpriced = has_positive_token_usage(&message.tokens)
             && !message.has_authoritative_cost()
             && !pricing.covers_usage_with_provider(
@@ -4327,7 +4427,7 @@ fn exclude_unpriced_submission_messages(
             );
             // The gap is read from the resolution that made the row
             // unpublishable rather than restated here: a lookup with a single
-            // candidate is excluded for not naming the model, and reporting it
+            // candidate is unsafe for not naming the model, and reporting it
             // as ambiguous across candidates would describe a disagreement
             // that never happened.
             let safety_gap = resolution
@@ -4350,23 +4450,31 @@ fn exclude_unpriced_submission_messages(
             } else {
                 MISSING_MODEL_PRICING_REASON
             };
-            let entry = exclusions
+            let entry = unpriced_usage
                 .entry((message.provider_id.clone(), message.model_id.clone()))
                 .or_insert((0, 0, reason));
             entry.0 = entry
                 .0
                 .saturating_add(message.message_count.max(0) as usize);
             entry.1 = entry.1.saturating_add(message.tokens.total());
+            incomplete_cost_dates.insert(message.date.clone());
+            // An unsafe estimate must not cross the submission boundary. Keep
+            // the usage, but represent the unknown part honestly as zero and
+            // let `costIsComplete: false` make the server preserve any higher
+            // cost it already has for this day.
+            message.cost = 0.0;
+            message.cost_source = CostSource::Unknown;
+            zeroed.push(message);
         } else {
-            submitted.push(message);
+            priced.push(message);
         }
     }
 
-    let exclusions = exclusions
+    let unpriced_usage = unpriced_usage
         .into_iter()
         .map(
             |((provider_id, model_id), (message_count, total_tokens, reason))| {
-                UnpricedSubmissionExclusion {
+                UnpricedSubmissionUsage {
                     provider_id,
                     model_id,
                     message_count,
@@ -4376,7 +4484,7 @@ fn exclude_unpriced_submission_messages(
             },
         )
         .collect();
-    (submitted, exclusions)
+    (priced, zeroed, unpriced_usage, incomplete_cost_dates)
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -4443,18 +4551,18 @@ pub async fn generate_local_graph_report(options: ReportOptions) -> Result<Graph
 const UNAVAILABLE_SUBMISSION_PRICING: &str = "pricing data is unavailable for submission";
 
 // @keep: the two conditions are load-bearing together; either alone is wrong.
-/// Refuse to act on exclusions that no pricing dataset backs.
+/// Refuse to zero costs when no pricing dataset backs that decision.
 ///
-/// `exclude_unpriced_submission_messages` drops what the pricing service cannot
-/// cover, but a service with no dataset covers *nothing*, so "unpriced" and "we
-/// have no prices" produce identical exclusions. Left alone, a cold cache with
-/// no network excludes the entire batch, leaves `total_tokens == 0`, and lets
-/// the CLI print "No usage data found to submit" and exit 0 — indistinguishable
-/// from genuinely having no usage, and reported as success to autosubmit.
+/// `prepare_submission_pricing` zeroes what the pricing service cannot cover,
+/// but a service with no dataset covers *nothing*, so "unpriced" and "we have
+/// no prices" produce identical diagnostics. Left alone, a cold cache with no
+/// network would submit every cost as zero. The completeness protocol prevents
+/// a decrease on the server, but silently accepting a wholly ungrounded local
+/// payload is still indistinguishable from a real all-free history.
 ///
 /// Both conditions matter:
 ///
-/// - Only when something was excluded. A batch whose messages all carry
+/// - Only when something needed zeroing. A batch whose messages all carry
 ///   provider-reported costs never consults pricing, so a missing dataset is
 ///   irrelevant and must not block it.
 /// - Only when no dataset loaded. A populated dataset that simply lacks a price
@@ -4462,14 +4570,15 @@ const UNAVAILABLE_SUBMISSION_PRICING: &str = "pricing data is unavailable for su
 ///   break autosubmit for anyone whose usage is legitimately unpriceable, which
 ///   is the trap #1044 documents.
 ///
-/// This runs after exclusion because the exclusion list is the signal. It
-/// cannot move into `validate_priced_messages`, which sees only the survivors —
-/// and when everything is excluded that slice is empty and validates trivially.
-fn require_trustworthy_exclusions(
+/// This runs after classification because the unpriced-usage list is the
+/// signal. It cannot move into `validate_priced_messages`, which sees only the
+/// authoritatively priced subset — and when everything is zeroed that slice is
+/// empty and validates trivially.
+fn require_trustworthy_unpriced_usage(
     pricing: Option<&pricing::PricingService>,
-    exclusions: &[UnpricedSubmissionExclusion],
+    unpriced_usage: &[UnpricedSubmissionUsage],
 ) -> Result<(), String> {
-    if exclusions.is_empty() {
+    if unpriced_usage.is_empty() {
         return Ok(());
     }
 
@@ -4776,6 +4885,7 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
 
     let opencode_count: i32 = {
         let mut seen: HashSet<String> = HashSet::new();
+        let mut sqlite_locations: HashMap<String, HashSet<String>> = HashMap::new();
         let mut count: i32 = 0;
 
         for db_path in &scan_result.opencode_dbs {
@@ -4784,6 +4894,12 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
                     .into_iter()
                     .filter_map(|msg| {
                         let key = msg.dedup_key.clone().unwrap_or_default();
+                        if !key.is_empty() {
+                            sqlite_locations
+                                .entry(msg.session_id.clone())
+                                .or_default()
+                                .insert(key.clone());
+                        }
                         // Dedup across multiple channel-suffixed dbs: the
                         // same session can end up in both `opencode.db` and
                         // `opencode-<channel>.db` if the user switches
@@ -4803,7 +4919,7 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
         let json_msgs: Vec<(String, ParsedMessage)> = scan_result
             .get(ClientId::OpenCode)
             .par_iter()
-            .filter(|path| !opencode_json_superseded_by_sqlite(path, &seen))
+            .filter(|path| !opencode_json_superseded_by_sqlite(path, &sqlite_locations))
             .filter_map(|path| {
                 let msg = sessions::opencode::parse_opencode_file(path)?;
                 let key = msg.dedup_key.clone().unwrap_or_default();
@@ -5258,6 +5374,21 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     let lmstudio_count = summed_parsed_message_count(&lmstudio_msgs);
     counts.set(ClientId::LmStudio, lmstudio_count);
     messages.extend(lmstudio_msgs);
+
+    let unsloth_msgs_raw: Vec<UnifiedMessage> = scan_result
+        .get(ClientId::Unsloth)
+        .par_iter()
+        .flat_map(|path| sessions::unsloth::parse_unsloth_sqlite(path))
+        .collect();
+    let mut unsloth_seen: HashSet<String> = HashSet::new();
+    let unsloth_msgs: Vec<ParsedMessage> = unsloth_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut unsloth_seen, message))
+        .map(|message| unified_to_parsed(&message))
+        .collect();
+    let unsloth_count = summed_parsed_message_count(&unsloth_msgs);
+    counts.set(ClientId::Unsloth, unsloth_count);
+    messages.extend(unsloth_msgs);
 
     let mcode_msgs: Vec<ParsedMessage> = scan_result
         .get(ClientId::Mcode)
@@ -5864,27 +5995,102 @@ mod tests {
     use super::{
         aggregate_hourly_usage_entries, aggregate_model_usage_entries,
         aggregate_monthly_usage_v2_entries, apply_pricing_if_available, build_graph_from_messages,
-        dedupe_latest_trae_messages, exclude_unpriced_submission_messages,
-        filter_messages_for_report, generate_graph_with_loaded_pricing, get_home_dir_string,
-        is_generic_routing_label, merge_claude_cross_file_duplicate, message_cache,
-        message_passes_report_filter, normalize_model_for_grouping,
-        opencode_json_superseded_by_sqlite, parse_all_messages_with_pricing_with_cache_policy,
+        dedupe_latest_trae_messages, filter_messages_for_report,
+        generate_graph_with_loaded_pricing, get_home_dir_string, is_generic_routing_label,
+        merge_claude_cross_file_duplicate, message_cache, message_passes_report_filter,
+        normalize_model_for_grouping, opencode_json_superseded_by_sqlite,
+        parse_all_messages_with_pricing_with_cache_policy,
         parse_all_messages_with_pricing_with_env_strategy, parse_local_clients, parsed_to_unified,
-        paths, pricing, retain_for_requested_clients, scanner, select_local_parse_pricing,
-        sessions, unified_to_parsed, validate_priced_messages, ClientId, GraphPricingRequirement,
-        GroupBy, LocalParseOptions, MonthlyReportV2, MonthlyUsage, MonthlyUsageV2, ReportOptions,
-        SourceCachePolicy, TokenBreakdown, UnifiedMessage, UnpricedSubmissionExclusion,
-        AMBIGUOUS_MODEL_PRICING_REASON, INCOMPLETE_MODEL_PRICING_REASON,
-        MISSING_MODEL_PRICING_REASON, ROUTING_LABEL_UNPRICED_REASON, UNKNOWN_WORKSPACE_LABEL,
-        UNVERIFIED_MODEL_IDENTITY_REASON, UNVERIFIED_PROVIDER_IDENTITY_REASON,
+        paths, prepare_submission_pricing, pricing, retain_for_requested_clients, scanner,
+        select_local_parse_pricing, sessions, unified_to_parsed, validate_priced_messages,
+        ClientId, GraphPricingRequirement, GraphSink, GroupBy, LocalParseOptions, MessageSink,
+        MonthlyReportV2, MonthlyUsage, MonthlyUsageV2, ReportOptions, SourceCachePolicy,
+        TokenBreakdown, UnifiedMessage, UnpricedSubmissionUsage, AMBIGUOUS_MODEL_PRICING_REASON,
+        GRAPH_SINK_BATCH, INCOMPLETE_MODEL_PRICING_REASON, MISSING_MODEL_PRICING_REASON,
+        ROUTING_LABEL_UNPRICED_REASON, UNKNOWN_WORKSPACE_LABEL, UNVERIFIED_MODEL_IDENTITY_REASON,
+        UNVERIFIED_PROVIDER_IDENTITY_REASON,
     };
     // Kept as its own statement rather than folded into the list above: that list
     // is edited by nearly every PR that touches this file, and sharing it made
     // this branch conflict on every single upstream merge.
     use super::{aggregate_model_usage_entries_with_rollup, WorktreeRollup};
     use serial_test::serial;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{BTreeSet, HashMap, HashSet};
     use std::io::Write;
+
+    #[test]
+    fn graph_sink_keeps_only_one_bounded_pricing_batch() {
+        let mut sink = GraphSink::new(None, None, GraphPricingRequirement::Lenient);
+        for timestamp in 1..=(GRAPH_SINK_BATCH * 2 + 1) {
+            sink.accept(UnifiedMessage::new(
+                "copilot",
+                "gpt-4o",
+                "openai",
+                "bounded",
+                timestamp as i64,
+                TokenBreakdown {
+                    input: 1,
+                    ..Default::default()
+                },
+                0.0,
+            ));
+        }
+
+        assert_eq!(sink.buffer.len(), 1);
+        assert_eq!(sink.spans.len(), GRAPH_SINK_BATCH * 2);
+    }
+
+    #[test]
+    fn submission_merges_unpriced_usage_across_bounded_batches() {
+        let messages: Vec<UnifiedMessage> = (0..=GRAPH_SINK_BATCH)
+            .map(|offset| {
+                UnifiedMessage::new(
+                    "copilot",
+                    "unlisted-model",
+                    "github-copilot",
+                    "bounded",
+                    1_736_510_400_000 + offset as i64,
+                    TokenBreakdown {
+                        input: 2,
+                        output: 1,
+                        ..Default::default()
+                    },
+                    0.0,
+                )
+            })
+            .collect();
+        let pricing = pricing::PricingService::new(unrelated_litellm_dataset(), HashMap::new());
+
+        let graph = build_graph_from_messages(
+            messages,
+            Some(&pricing),
+            GraphPricingRequirement::Submission,
+            std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
+        )
+        .expect("unpriced rows should be zeroed and retained across every batch");
+
+        let expected_tokens = (GRAPH_SINK_BATCH as i64 + 1) * 3;
+        assert_eq!(graph.summary.total_tokens, expected_tokens);
+        assert_eq!(graph.summary.total_cost, 0.0);
+        assert_eq!(graph.contributions.len(), 1);
+        assert_eq!(graph.incomplete_cost_dates.len(), 1);
+        assert!(
+            graph
+                .incomplete_cost_dates
+                .contains(&graph.contributions[0].date),
+            "the retained zero-cost batch must mark its day as incomplete"
+        );
+        assert_eq!(graph.unpriced_submission_usage.len(), 1);
+        assert_eq!(
+            graph.unpriced_submission_usage[0].message_count,
+            GRAPH_SINK_BATCH + 1
+        );
+        assert_eq!(
+            graph.unpriced_submission_usage[0].total_tokens,
+            expected_tokens
+        );
+    }
 
     #[test]
     fn token_breakdown_add_assign_includes_every_field() {
@@ -8055,6 +8261,133 @@ mod tests {
         assert_eq!(warm, cold);
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn test_unsloth_lane_reads_sqlite_and_invalidates_on_wal_changes() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let studio_root = source_home.path().join(".unsloth/studio");
+        std::fs::create_dir_all(&studio_root).unwrap();
+        let db_path = studio_root.join("studio.db");
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE chat_threads (
+                    id TEXT PRIMARY KEY,
+                    model_id TEXT
+                );
+                CREATE TABLE chat_messages (
+                    id TEXT PRIMARY KEY,
+                    thread_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    metadata_json TEXT,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE TABLE api_usage_events (
+                    id TEXT PRIMARY KEY,
+                    subject TEXT NOT NULL,
+                    endpoint TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    prompt_tokens INTEGER NOT NULL,
+                    completion_tokens INTEGER NOT NULL,
+                    total_tokens INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                INSERT INTO chat_threads (id, model_id)
+                VALUES ('thread-1', 'fixture-local-model');
+                INSERT INTO chat_messages (id, thread_id, role, metadata_json, created_at)
+                VALUES (
+                    'message-1',
+                    'thread-1',
+                    'assistant',
+                    '{"contextUsage":{"promptTokens":100,"completionTokens":40,"totalTokens":140,"cachedTokens":25,"modelId":"fixture-local-model"}}',
+                    1788000000
+                );
+                INSERT INTO api_usage_events (
+                    id, subject, endpoint, model, status,
+                    prompt_tokens, completion_tokens, total_tokens, created_at
+                ) VALUES (
+                    'request-1', 'private-user', '/v1/chat/completions',
+                    'fixture-local-model', 'completed', 8, 2, 10, 1788000100
+                );
+                "#,
+            )
+            .unwrap();
+        }
+
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "fixture-local-model".into(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(1.0),
+                output_cost_per_token: Some(1.0),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+        let clients = ["unsloth".to_string()];
+
+        let cold = parse_all_messages_with_pricing(
+            source_home.path().to_str().unwrap(),
+            &clients,
+            Some(&pricing),
+        );
+        assert_eq!(cold.len(), 2);
+        assert_eq!(
+            cold.iter()
+                .map(|message| message.tokens.total())
+                .sum::<i64>(),
+            150
+        );
+        assert!(cold
+            .iter()
+            .all(|message| message.cost == 0.0 && message.has_authoritative_cost()));
+
+        let warm = parse_all_messages_with_pricing(
+            source_home.path().to_str().unwrap(),
+            &clients,
+            Some(&pricing),
+        );
+        assert_eq!(warm, cold);
+
+        let writer = rusqlite::Connection::open(&db_path).unwrap();
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+        writer.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        writer
+            .execute(
+                "INSERT INTO chat_messages (id, thread_id, role, metadata_json, created_at) VALUES (?1, ?2, 'assistant', ?3, ?4)",
+                rusqlite::params![
+                    "message-2",
+                    "thread-1",
+                    r#"{"contextUsage":{"promptTokens":9,"completionTokens":1,"totalTokens":10,"modelId":"fixture-local-model"}}"#,
+                    1_788_000_200_i64,
+                ],
+            )
+            .unwrap();
+        assert!(db_path.with_file_name("studio.db-wal").exists());
+
+        let refreshed = parse_all_messages_with_pricing(
+            source_home.path().to_str().unwrap(),
+            &clients,
+            Some(&pricing),
+        );
+        assert_eq!(refreshed.len(), 3);
+        assert_eq!(
+            refreshed
+                .iter()
+                .map(|message| message.tokens.total())
+                .sum::<i64>(),
+            160
+        );
+        assert!(refreshed
+            .iter()
+            .all(|message| message.cost == 0.0 && message.has_authoritative_cost()));
+    }
+
     /// MiMo Code records carry an authoritative per-message cost. The micode
     /// lane must NOT reprice a record that already has a cost, even when the
     /// model has a market price that would compute a different (non-zero) value.
@@ -9889,7 +10222,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_opencode_warm_scan_re_parses_after_a_row_is_deleted() {
+    fn test_opencode_warm_scan_removes_a_deleted_row_incrementally() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
         let _cache_env = redirect_cache_home(cache_home.path());
@@ -9908,9 +10241,8 @@ mod tests {
         );
         assert_eq!(cold.len(), 2);
 
-        // OpenCode cascades a session delete onto its messages. An incremental
-        // scan cannot see the row that went away, so the guard has to force a
-        // full re-parse rather than keep counting it.
+        // OpenCode cascades a session delete onto its messages. The persisted
+        // row provenance lets the warm scan remove exactly that cached source.
         conn.execute("DELETE FROM message WHERE id = 'msg-zzz'", [])
             .unwrap();
 
@@ -9924,8 +10256,8 @@ mod tests {
         assert_eq!(
             sessions::opencode_schema::INCREMENTAL_RESCANS
                 .load(std::sync::atomic::Ordering::Relaxed),
-            rescans_before,
-            "a deletion must not be served by an incremental scan"
+            rescans_before + 1,
+            "an ordinary deletion should stay incremental"
         );
         assert_eq!(warm.len(), 1);
         assert_eq!(warm[0].dedup_key.as_deref(), Some("msg-aaa"));
@@ -10264,32 +10596,43 @@ mod tests {
 
     #[test]
     fn test_opencode_json_superseded_by_sqlite_matches_on_message_id() {
-        let mut sqlite_keys: HashSet<String> = HashSet::new();
-        sqlite_keys.insert("msg_migrated".to_string());
+        let mut sqlite_locations: HashMap<String, HashSet<String>> = HashMap::new();
+        sqlite_locations.insert(
+            "ses_1".to_string(),
+            HashSet::from(["msg_migrated".to_string()]),
+        );
 
         // The legacy file is named after the message id the migration copied
         // into SQLite, so the duplicate is recognizable from the path alone.
         assert!(opencode_json_superseded_by_sqlite(
             std::path::Path::new("/s/storage/message/ses_1/msg_migrated.json"),
-            &sqlite_keys
+            &sqlite_locations
         ));
 
         // A file the migration never reached has no row to shadow it.
         assert!(!opencode_json_superseded_by_sqlite(
             std::path::Path::new("/s/storage/message/ses_1/msg_unmigrated.json"),
-            &sqlite_keys
+            &sqlite_locations
+        ));
+
+        // A stem is not globally unique. Another session's id-less file must
+        // be parsed and receive its path-scoped fallback instead of being
+        // discarded by the migration fast path.
+        assert!(!opencode_json_superseded_by_sqlite(
+            std::path::Path::new("/s/storage/message/ses_2/msg_migrated.json"),
+            &sqlite_locations
         ));
 
         // Without any SQLite db every file has to be read.
         assert!(!opencode_json_superseded_by_sqlite(
             std::path::Path::new("/s/storage/message/ses_1/msg_migrated.json"),
-            &HashSet::new()
+            &HashMap::new()
         ));
 
-        // Only the stem participates: the session directory is not a message id.
+        // Neither coordinate may be borrowed from a different path level.
         assert!(!opencode_json_superseded_by_sqlite(
             std::path::Path::new("/s/storage/message/msg_migrated/other.json"),
-            &sqlite_keys
+            &sqlite_locations
         ));
     }
 
@@ -10336,6 +10679,126 @@ mod tests {
             r#"{"id":"msg_unmigrated","sessionID":"ses_1","role":"assistant","modelID":"claude-sonnet-4","providerID":"anthropic","cost":0.02,"tokens":{"input":7,"output":3,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1700000001000}}"#,
         )
         .unwrap();
+    }
+
+    /// SQLite holds one globally identified message. Two different legacy
+    /// sessions reuse that id as a local filename but omit the embedded id,
+    /// while a third JSON file carries the real embedded id and is a true
+    /// duplicate of SQLite.
+    fn write_opencode_idless_collision_fixture(source_home: &std::path::Path) {
+        let db_dir = source_home.join(".local/share/opencode");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let conn = create_opencode_sqlite_db(&db_dir.join("opencode.db"));
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                "shared-id",
+                "sqlite-session",
+                build_opencode_sqlite_payload(
+                    1_700_000_000_000.0,
+                    1_700_000_000_500.0,
+                    100,
+                    10,
+                    0,
+                    0,
+                    0,
+                    0.01,
+                )
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let root = source_home.join(".local/share/opencode/storage/message");
+        for (session, input) in [("legacy-a", 7), ("legacy-b", 11)] {
+            let dir = root.join(session);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("shared-id.json"),
+                format!(
+                    r#"{{"sessionID":"{session}","role":"assistant","modelID":"claude-sonnet-4","providerID":"anthropic","tokens":{{"input":{input},"output":1,"reasoning":0,"cache":{{"read":0,"write":0}}}},"time":{{"created":1700000001000}}}}"#
+                ),
+            )
+            .unwrap();
+        }
+
+        let embedded_dir = root.join("legacy-embedded-copy");
+        std::fs::create_dir_all(&embedded_dir).unwrap();
+        std::fs::write(
+            embedded_dir.join("different-filename.json"),
+            r#"{"id":"shared-id","sessionID":"legacy-embedded-copy","role":"assistant","modelID":"claude-sonnet-4","providerID":"anthropic","tokens":{"input":100,"output":10,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1700000000000}}"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_parse_all_messages_keeps_same_named_idless_opencode_files() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        write_opencode_idless_collision_fixture(source_home.path());
+
+        for pass in ["cold", "warm"] {
+            let messages = parse_all_messages_with_pricing(
+                source_home.path().to_str().unwrap(),
+                &["opencode".to_string()],
+                None,
+            );
+
+            assert_eq!(messages.len(), 3, "{pass} cache pass");
+            assert_eq!(
+                messages
+                    .iter()
+                    .map(|message| message.tokens.input)
+                    .sum::<i64>(),
+                118,
+                "{pass} cache pass"
+            );
+            let keys: HashSet<&str> = messages
+                .iter()
+                .filter_map(|message| message.dedup_key.as_deref())
+                .collect();
+            assert!(keys.contains("shared-id"), "{pass} cache pass");
+            assert_eq!(
+                keys.iter()
+                    .filter(|key| key.starts_with("legacy-json-path:"))
+                    .count(),
+                2,
+                "{pass} cache pass"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_parse_local_clients_keeps_same_named_idless_opencode_files() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        write_opencode_idless_collision_fixture(source_home.path());
+
+        let parsed = parse_local_clients(LocalParseOptions {
+            home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["opencode".to_string()]),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings::default(),
+        })
+        .unwrap();
+
+        assert_eq!(parsed.counts.get(ClientId::OpenCode), 3);
+        assert_eq!(parsed.messages.len(), 3);
+        assert_eq!(
+            parsed
+                .messages
+                .iter()
+                .map(|message| message.input)
+                .sum::<i64>(),
+            118
+        );
     }
 
     #[test]
@@ -11537,7 +12000,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_pricing_policy_excludes_unpriced_only_from_submission() {
+    fn submission_keeps_unpriced_tokens_and_marks_their_day_incomplete() {
         let message = UnifiedMessage::new(
             "opencode",
             "genuinely-unpriced-model",
@@ -11569,15 +12032,85 @@ mod tests {
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
-        .expect("submission graphs should exclude unpriced usage");
+        .expect("submission graphs should retain unpriced usage safely");
 
         assert_eq!(report.summary.total_tokens, 1);
-        assert_eq!(submission.summary.total_tokens, 0);
-        assert_eq!(submission.unpriced_submission_exclusions.len(), 1);
+        assert_eq!(submission.summary.total_tokens, 1);
+        assert_eq!(submission.summary.total_cost, 0.0);
+        assert_eq!(submission.contributions.len(), 1);
+        assert_eq!(submission.incomplete_cost_dates.len(), 1);
+        assert!(submission
+            .incomplete_cost_dates
+            .contains(&submission.contributions[0].date));
+        assert_eq!(submission.unpriced_submission_usage.len(), 1);
         assert_eq!(
-            submission.unpriced_submission_exclusions[0].model_id,
+            submission.unpriced_submission_usage[0].model_id,
             "genuinely-unpriced-model"
         );
+    }
+
+    #[test]
+    fn submission_cost_completeness_is_day_scoped_and_zeroes_unsafe_estimates() {
+        let pricing = pricing::PricingService::new(unrelated_litellm_dataset(), HashMap::new());
+        let mut unpriced = UnifiedMessage::new(
+            "synthetic",
+            "unlisted-model",
+            "unknown",
+            "unpriced-day",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input: 10,
+                ..Default::default()
+            },
+            9.0,
+        );
+        unpriced.date = "2026-01-01".to_string();
+        unpriced.mark_estimated_cost();
+
+        let mut complete = UnifiedMessage::new(
+            "opencode",
+            "provider-priced",
+            "anthropic",
+            "complete-day",
+            1_736_596_800_000,
+            TokenBreakdown {
+                input: 20,
+                ..Default::default()
+            },
+            2.0,
+        );
+        complete.date = "2026-01-02".to_string();
+        complete.mark_provider_reported_cost();
+
+        let graph = build_graph_from_messages(
+            vec![unpriced, complete],
+            Some(&pricing),
+            GraphPricingRequirement::Submission,
+            std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
+        )
+        .expect("partial pricing should produce an honest incomplete payload");
+
+        assert_eq!(graph.summary.total_tokens, 30);
+        assert_eq!(graph.summary.total_cost, 2.0);
+        assert_eq!(
+            graph.incomplete_cost_dates,
+            BTreeSet::from(["2026-01-01".to_string()])
+        );
+        let unpriced_day = graph
+            .contributions
+            .iter()
+            .find(|day| day.date == "2026-01-01")
+            .unwrap();
+        assert_eq!(unpriced_day.totals.tokens, 10);
+        assert_eq!(unpriced_day.totals.cost, 0.0);
+        assert_eq!(unpriced_day.clients[0].cost, 0.0);
+        let complete_day = graph
+            .contributions
+            .iter()
+            .find(|day| day.date == "2026-01-02")
+            .unwrap();
+        assert_eq!(complete_day.totals.cost, 2.0);
     }
 
     /// A dataset that loaded successfully but prices an unrelated model.
@@ -11668,11 +12201,11 @@ mod tests {
         .expect("authoritative costs must not need a pricing dataset");
 
         assert_eq!(graph.summary.total_tokens, 1_500);
-        assert!(graph.unpriced_submission_exclusions.is_empty());
+        assert!(graph.unpriced_submission_usage.is_empty());
     }
 
     #[test]
-    fn submission_excludes_unpriced_generic_gemini_default_but_keeps_priceable_usage() {
+    fn submission_zeroes_unpriced_generic_gemini_default_and_keeps_priceable_usage() {
         let mut litellm = HashMap::new();
         litellm.insert(
             "gpt-4o".to_string(),
@@ -11718,13 +12251,17 @@ mod tests {
         )
         .expect("generic routing label must not block fully priced submission usage");
 
-        assert_eq!(graph.summary.total_tokens, 13);
-        assert_eq!(graph.contributions[0].clients.len(), 1);
-        assert_eq!(graph.contributions[0].clients[0].model_id, "gpt-4o");
-        assert_eq!(graph.unpriced_submission_exclusions.len(), 1);
+        assert_eq!(graph.summary.total_tokens, 31);
+        assert_eq!(graph.contributions[0].clients.len(), 2);
+        assert!(graph.contributions[0]
+            .clients
+            .iter()
+            .any(|client| client.model_id == "gpt-4o"));
+        assert_eq!(graph.incomplete_cost_dates.len(), 1);
+        assert_eq!(graph.unpriced_submission_usage.len(), 1);
         assert_eq!(
-            graph.unpriced_submission_exclusions[0],
-            UnpricedSubmissionExclusion {
+            graph.unpriced_submission_usage[0],
+            UnpricedSubmissionUsage {
                 provider_id: "google".to_string(),
                 model_id: "gemini-default".to_string(),
                 message_count: 7,
@@ -11735,7 +12272,7 @@ mod tests {
     }
 
     #[test]
-    fn submission_excludes_unpriced_auto_routing_label() {
+    fn submission_zeroes_unpriced_auto_routing_label() {
         // `auto` is the unknown-model label Kiro emits and the default-model
         // label Cursor/Copilot record in usage rows. A models.dev `morph/auto`
         // paid row exists, so before the resolver refused routing labels the
@@ -11744,8 +12281,8 @@ mod tests {
         // pre-fix fallback covers all three populated buckets (7 input, 11
         // cache-read, 0 output) and submits the row — without it, the row
         // would fail coverage on the missing cache rate and the test would
-        // pass even with the bug. The label must instead be excluded with the
-        // routing-label reason.
+        // pass even with the bug. The label must instead be zeroed with the
+        // routing-label reason and an incomplete-cost marker.
         let mut models_dev = HashMap::new();
         models_dev.insert(
             "morph/auto".to_string(),
@@ -11786,11 +12323,12 @@ mod tests {
         )
         .expect("routing label must not abort submission");
 
-        assert_eq!(graph.summary.total_tokens, 0);
-        assert_eq!(graph.unpriced_submission_exclusions.len(), 1);
+        assert_eq!(graph.summary.total_tokens, 18);
+        assert_eq!(graph.incomplete_cost_dates.len(), 1);
+        assert_eq!(graph.unpriced_submission_usage.len(), 1);
         assert_eq!(
-            graph.unpriced_submission_exclusions[0],
-            UnpricedSubmissionExclusion {
+            graph.unpriced_submission_usage[0],
+            UnpricedSubmissionUsage {
                 provider_id: "amazon-bedrock".to_string(),
                 model_id: "auto".to_string(),
                 message_count: 7,
@@ -11803,7 +12341,7 @@ mod tests {
     #[test]
     fn whitespace_padded_routing_label_is_classified_the_same_by_resolver_and_reason() {
         // `lookup::is_routing_label` trims before comparing, so the resolver
-        // refuses to price ` auto `. The exclusion reason has to agree, or the
+        // refuses to price ` auto `. The zeroing reason has to agree, or the
         // row is reported as having no model-to-price mapping while the reason
         // it is unpriced is that it names a router. Both paths now read the
         // same list, so a label added to `lookup::ROUTING_LABELS` cannot drift
@@ -11811,12 +12349,12 @@ mod tests {
         assert_eq!(
             crate::pricing::lookup::is_routing_label(" auto "),
             is_generic_routing_label("amazon-bedrock", " auto "),
-            "resolver and exclusion reason must classify a padded routing label alike"
+            "resolver and zeroing reason must classify a padded routing label alike"
         );
 
         // The models.dev `morph/auto` row is fully priced, so if the resolver
         // did not refuse the padded label the row would submit at Morph rates
-        // (#1062) instead of reaching the exclusion path at all.
+        // (#1062) instead of reaching the zeroing path at all.
         let mut models_dev = HashMap::new();
         models_dev.insert(
             "morph/auto".to_string(),
@@ -11857,10 +12395,11 @@ mod tests {
         )
         .expect("routing label must not abort submission");
 
-        assert_eq!(graph.summary.total_tokens, 0);
-        assert_eq!(graph.unpriced_submission_exclusions.len(), 1);
+        assert_eq!(graph.summary.total_tokens, 18);
+        assert_eq!(graph.incomplete_cost_dates.len(), 1);
+        assert_eq!(graph.unpriced_submission_usage.len(), 1);
         assert_eq!(
-            graph.unpriced_submission_exclusions[0].reason, ROUTING_LABEL_UNPRICED_REASON,
+            graph.unpriced_submission_usage[0].reason, ROUTING_LABEL_UNPRICED_REASON,
             "padded routing label must report the routing-label reason"
         );
     }
@@ -11913,10 +12452,10 @@ mod tests {
         )
         .expect("routing label must not abort submission");
 
-        assert_eq!(graph.unpriced_submission_exclusions.len(), 1);
+        assert_eq!(graph.unpriced_submission_usage.len(), 1);
         assert_eq!(
-            graph.unpriced_submission_exclusions[0],
-            UnpricedSubmissionExclusion {
+            graph.unpriced_submission_usage[0],
+            UnpricedSubmissionUsage {
                 provider_id: "amazon-bedrock".to_string(),
                 model_id: "auto".to_string(),
                 message_count: 7,
@@ -11927,7 +12466,7 @@ mod tests {
     }
 
     #[test]
-    fn submission_excludes_unpriced_concrete_models() {
+    fn submission_zeroes_unpriced_concrete_models() {
         let concrete = UnifiedMessage::new(
             "synthetic",
             "gemini-3.5-pro",
@@ -11952,11 +12491,12 @@ mod tests {
         )
         .expect("one unpriced model must not block the submission");
 
-        assert_eq!(graph.summary.total_tokens, 0);
-        assert!(graph.contributions.is_empty());
+        assert_eq!(graph.summary.total_tokens, 1);
+        assert_eq!(graph.summary.total_cost, 0.0);
+        assert_eq!(graph.incomplete_cost_dates.len(), 1);
         assert_eq!(
-            graph.unpriced_submission_exclusions,
-            vec![UnpricedSubmissionExclusion {
+            graph.unpriced_submission_usage,
+            vec![UnpricedSubmissionUsage {
                 provider_id: "google".to_string(),
                 model_id: "gemini-3.5-pro".to_string(),
                 message_count: 1,
@@ -11968,9 +12508,9 @@ mod tests {
 
     /// An unscoped model-part fallback proves only the model spelling, not
     /// which provider served it. The estimate remains available locally, while
-    /// submission excludes it with the provider-specific evidence gap.
+    /// submission zeroes it with the provider-specific evidence gap.
     #[test]
-    fn submission_excludes_cross_provider_model_part_estimate() {
+    fn submission_zeroes_cross_provider_model_part_estimate() {
         let openrouter = HashMap::from([(
             "vendor/atlas-chat".to_string(),
             pricing::ModelPricing {
@@ -12010,12 +12550,14 @@ mod tests {
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
-        .expect("the unsafe estimate must be excluded, not abort the graph");
+        .expect("the unsafe estimate must be zeroed, not abort the graph");
 
-        assert!(graph.contributions.is_empty());
-        assert_eq!(graph.unpriced_submission_exclusions.len(), 1);
+        assert_eq!(graph.summary.total_tokens, 150);
+        assert_eq!(graph.summary.total_cost, 0.0);
+        assert_eq!(graph.incomplete_cost_dates.len(), 1);
+        assert_eq!(graph.unpriced_submission_usage.len(), 1);
         assert_eq!(
-            graph.unpriced_submission_exclusions[0].reason,
+            graph.unpriced_submission_usage[0].reason,
             UNVERIFIED_PROVIDER_IDENTITY_REASON
         );
     }
@@ -12024,7 +12566,7 @@ mod tests {
     /// not proof that the recorded provider used the candidate's billing
     /// endpoint. Both stay estimate-only at the submission boundary.
     #[test]
-    fn submission_excludes_provider_prefix_and_cross_endpoint_alias_estimates() {
+    fn submission_zeroes_provider_prefix_and_cross_endpoint_alias_estimates() {
         let litellm = HashMap::from([
             (
                 "anthropic/atlas-chat".to_string(),
@@ -12094,12 +12636,13 @@ mod tests {
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
-        .expect("unsafe estimates must be excluded, not abort the graph");
+        .expect("unsafe estimates must be zeroed, not abort the graph");
 
-        assert!(graph.contributions.is_empty());
-        assert_eq!(graph.unpriced_submission_exclusions.len(), 3);
-        for exclusion in graph.unpriced_submission_exclusions {
-            assert_eq!(exclusion.reason, UNVERIFIED_PROVIDER_IDENTITY_REASON);
+        assert_eq!(graph.summary.total_tokens, 450);
+        assert_eq!(graph.summary.total_cost, 0.0);
+        assert_eq!(graph.unpriced_submission_usage.len(), 3);
+        for usage in graph.unpriced_submission_usage {
+            assert_eq!(usage.reason, UNVERIFIED_PROVIDER_IDENTITY_REASON);
         }
 
         // Source-constrained OpenRouter uses a separate scoped wrapper. Keep a
@@ -12135,21 +12678,22 @@ mod tests {
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
-        .expect("the OpenRouter alias estimate must be excluded");
-        assert!(openrouter_graph.contributions.is_empty());
+        .expect("the OpenRouter alias estimate must be zeroed");
+        assert_eq!(openrouter_graph.summary.total_tokens, 150);
+        assert_eq!(openrouter_graph.summary.total_cost, 0.0);
         assert_eq!(
-            openrouter_graph.unpriced_submission_exclusions[0].reason,
+            openrouter_graph.unpriced_submission_usage[0].reason,
             UNVERIFIED_PROVIDER_IDENTITY_REASON
         );
     }
 
-    /// A fuzzy lookup with one candidate is excluded because nothing proves
+    /// A fuzzy lookup with one candidate is zeroed because nothing proves
     /// the priced key names the model that was used — not because candidates
     /// disagreed. There is only one candidate, so it cannot disagree with
     /// anything, and reporting a disagreement would send audit and submission
     /// diagnostics after a conflict that does not exist.
     #[test]
-    fn submission_excludes_single_candidate_fuzzy_price_for_unverified_identity() {
+    fn submission_zeroes_single_candidate_fuzzy_price_for_unverified_identity() {
         let litellm = HashMap::from([(
             "vendor-a/atlas-chat-preview".to_string(),
             pricing::ModelPricing {
@@ -12190,18 +12734,19 @@ mod tests {
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
-        .expect("an unverified estimate must be excluded, not abort the graph");
+        .expect("an unverified estimate must be zeroed, not abort the graph");
 
-        assert!(graph.contributions.is_empty());
-        assert_eq!(graph.unpriced_submission_exclusions.len(), 1);
+        assert_eq!(graph.summary.total_tokens, 150);
+        assert_eq!(graph.summary.total_cost, 0.0);
+        assert_eq!(graph.unpriced_submission_usage.len(), 1);
         assert_eq!(
-            graph.unpriced_submission_exclusions[0].reason,
+            graph.unpriced_submission_usage[0].reason,
             UNVERIFIED_MODEL_IDENTITY_REASON
         );
     }
 
     #[test]
-    fn submission_excludes_ambiguous_fuzzy_price_with_specific_reason() {
+    fn submission_zeroes_ambiguous_fuzzy_price_with_specific_reason() {
         let litellm = HashMap::from([
             (
                 "vendor-a/atlas-chat-preview".to_string(),
@@ -12242,12 +12787,13 @@ mod tests {
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
-        .expect("an ambiguous estimate must be excluded, not abort the graph");
+        .expect("an ambiguous estimate must be zeroed, not abort the graph");
 
-        assert!(graph.contributions.is_empty());
-        assert_eq!(graph.unpriced_submission_exclusions.len(), 1);
+        assert_eq!(graph.summary.total_tokens, 150);
+        assert_eq!(graph.summary.total_cost, 0.0);
+        assert_eq!(graph.unpriced_submission_usage.len(), 1);
         assert_eq!(
-            graph.unpriced_submission_exclusions[0].reason,
+            graph.unpriced_submission_usage[0].reason,
             AMBIGUOUS_MODEL_PRICING_REASON
         );
     }
@@ -12324,11 +12870,13 @@ mod tests {
             ),
         ];
 
-        let (submitted, exclusions) =
-            exclude_unpriced_submission_messages(messages, Some(&pricing));
+        let (submitted, zeroed, unpriced_usage, incomplete_dates) =
+            prepare_submission_pricing(messages, Some(&pricing));
 
         assert_eq!(submitted.len(), 2);
-        assert!(exclusions.is_empty());
+        assert!(zeroed.is_empty());
+        assert!(unpriced_usage.is_empty());
+        assert!(incomplete_dates.is_empty());
     }
 
     #[test]
@@ -12392,18 +12940,19 @@ mod tests {
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
-        .expect("ambiguous borrowed pricing must be excluded, not abort the graph");
+        .expect("ambiguous borrowed pricing must be zeroed, not abort the graph");
 
-        assert!(graph.contributions.is_empty());
-        assert_eq!(graph.unpriced_submission_exclusions.len(), 1);
+        assert_eq!(graph.summary.total_tokens, 170);
+        assert_eq!(graph.summary.total_cost, 0.0);
+        assert_eq!(graph.unpriced_submission_usage.len(), 1);
         assert_eq!(
-            graph.unpriced_submission_exclusions[0].reason,
+            graph.unpriced_submission_usage[0].reason,
             AMBIGUOUS_MODEL_PRICING_REASON
         );
     }
 
     #[test]
-    fn submission_excludes_usage_with_an_unpriced_cache_write_bucket() {
+    fn submission_zeroes_usage_with_an_unpriced_cache_write_bucket() {
         let mut litellm = HashMap::new();
         litellm.insert(
             "gpt-5.5".to_string(),
@@ -12458,11 +13007,18 @@ mod tests {
         )
         .expect("an incomplete cache rate must not block covered usage");
 
-        assert_eq!(graph.summary.total_tokens, 40);
-        assert_eq!(graph.contributions[0].clients[0].model_id, "gpt-4o");
+        assert_eq!(graph.summary.total_tokens, 100);
+        assert_eq!(graph.incomplete_cost_dates.len(), 1);
+        let incomplete_client = graph.contributions[0]
+            .clients
+            .iter()
+            .find(|client| client.model_id == "gpt-5.5")
+            .expect("the unpriced model's tokens must stay in the payload");
+        assert_eq!(incomplete_client.tokens.total(), 60);
+        assert_eq!(incomplete_client.cost, 0.0);
         assert_eq!(
-            graph.unpriced_submission_exclusions,
-            vec![UnpricedSubmissionExclusion {
+            graph.unpriced_submission_usage,
+            vec![UnpricedSubmissionUsage {
                 provider_id: "custom".to_string(),
                 model_id: "gpt-5.5".to_string(),
                 message_count: 1,
