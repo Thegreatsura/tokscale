@@ -670,22 +670,260 @@ pub fn built_in_extra_scan_paths_for(
         );
     }
 
-    if enabled.contains(&ClientId::Senpi) && use_env_roots {
-        if let Some(path) =
-            std::env::var_os("SENPI_CODING_AGENT_SESSION_DIR").filter(|path| !path.is_empty())
-        {
-            paths.push((ClientId::Senpi, PathBuf::from(path)));
+    if enabled.contains(&ClientId::Senpi) {
+        // The user layer applies to every project that does not override it,
+        // so it is read once rather than per discovered project.
+        // Only a usable user-level `state_dir` propagates; a user `task` block
+        // without one leaves each project on its own default layout.
+        let user_state_dir = match omo_task_state(&Path::new(home_dir).join(".omo")) {
+            OmoTaskState::StateDir(path) => Some(path),
+            OmoTaskState::DefaultLayout | OmoTaskState::Unset => None,
+        };
+        if use_env_roots {
+            let env_session_dir =
+                std::env::var_os("SENPI_CODING_AGENT_SESSION_DIR").filter(|path| !path.is_empty());
+            if let Some(path) = &env_session_dir {
+                paths.push((ClientId::Senpi, PathBuf::from(path)));
+            }
+
+            if let Ok(current_dir) = std::env::current_dir() {
+                paths.push((
+                    ClientId::Senpi,
+                    senpi_omo_children_root(&current_dir, user_state_dir.as_deref()),
+                ));
+            }
+
+            // OmO task children live inside each project (`.omo/senpi-task/children`),
+            // so the cwd- and home-derived roots only cover the project tokscale
+            // happens to run from and the home directory. Recover every other
+            // project root from the global sessions tree, where each per-project
+            // subdirectory's transcripts record the true `cwd` in their header line.
+            let senpi_root = ClientId::Senpi
+                .data()
+                .root
+                .resolve_with_env_strategy(home_dir, use_env_roots);
+            let mut sessions_roots = vec![PathBuf::from(join_native(&senpi_root, "sessions"))];
+            if let Some(path) = &env_session_dir {
+                sessions_roots.push(PathBuf::from(path));
+            }
+            for sessions_root in sessions_roots {
+                paths.extend(
+                    discover_senpi_omo_children_roots(&sessions_root, user_state_dir.as_deref())
+                        .into_iter()
+                        .map(|path| (ClientId::Senpi, path)),
+                );
+            }
         }
 
-        if let Ok(current_dir) = std::env::current_dir() {
-            paths.push((
-                ClientId::Senpi,
-                current_dir.join(".omo").join("senpi-task").join("children"),
-            ));
-        }
+        paths.push((
+            ClientId::Senpi,
+            senpi_omo_children_root(Path::new(home_dir), user_state_dir.as_deref()),
+        ));
     }
 
     paths
+}
+
+/// How much of a Senpi session file the project-root probe may read. The
+/// `{"type":"session",...}` header is the first line and stays well under 1KB
+/// in practice; the cap only bounds pathological files.
+const SENPI_SESSION_HEADER_MAX_BYTES: u64 = 8 * 1024;
+
+/// What one `.omo` config layer says about OmO's task state directory.
+///
+/// The three cases are deliberately distinct. OmO's merge replaces the whole
+/// `task` block rather than deep-merging it, so a layer that declares `task`
+/// silences the layer above it even when it names no usable `state_dir` — that
+/// is [`OmoTaskState::DefaultLayout`], and it must not fall through.
+#[derive(Debug, PartialEq)]
+enum OmoTaskState {
+    /// No config here, or one that declares no `task` block: the layer above
+    /// still decides.
+    Unset,
+    /// A `task` block naming a state directory this host can use as-is.
+    StateDir(PathBuf),
+    /// A `task` block that overrides the layer above but names no usable
+    /// `state_dir`, so OmO's default `<project>/.omo/senpi-task` applies.
+    DefaultLayout,
+}
+
+/// Read OmO's `task` state-directory setting out of one `.omo` directory.
+///
+/// OmO loads `omo.jsonc` and falls back to `omo.json`
+/// (`omo-config-core/src/loader/paths.ts`), both JSONC, so comments and
+/// trailing commas have to survive the parse. A file that exists but cannot be
+/// parsed is treated as absent rather than as an override, since a syntax error
+/// should not silently redirect the scan.
+///
+/// A relative `state_dir` yields [`OmoTaskState::DefaultLayout`]: OmO resolves
+/// it against its own process cwd, which a later tokscale run cannot
+/// reconstruct, so the default project layout is safer than guessing a base —
+/// but the declaring layer still wins over the one above it.
+fn omo_task_state(omo_dir: &Path) -> OmoTaskState {
+    for filename in ["omo.jsonc", "omo.json"] {
+        let Ok(contents) = std::fs::read_to_string(omo_dir.join(filename)) else {
+            continue;
+        };
+        let Some(config) = crate::opencode_model_name::parse_jsonc(&contents) else {
+            continue;
+        };
+        let Some(task) = config.get("task") else {
+            return OmoTaskState::Unset;
+        };
+        let state_dir = task
+            .get("state_dir")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute());
+        return match state_dir {
+            Some(path) => OmoTaskState::StateDir(path),
+            None => OmoTaskState::DefaultLayout,
+        };
+    }
+    OmoTaskState::Unset
+}
+
+/// The OmO task-children root to scan for one project.
+///
+/// Mirrors `resolveStateDir()` in OmO's `senpi-task` package,
+/// `config.task?.state_dir ?? join(config.project_dir, ".omo", "senpi-task")`,
+/// with the children hanging off it as `<state_dir>/children/<task>/sessions/`
+/// (`tools/output/transcript/session-dir.ts`). The project's own `.omo` config
+/// wins over the user's `~/.omo` one, matching OmO's nearest-config-first merge;
+/// tokscale deliberately does not walk the intermediate directories OmO would,
+/// because a report spans many workspaces and there is no single current project.
+fn senpi_omo_children_root(project_dir: &Path, user_state_dir: Option<&Path>) -> PathBuf {
+    let default_layout = || project_dir.join(".omo").join("senpi-task");
+    let state_dir = match omo_task_state(&project_dir.join(".omo")) {
+        OmoTaskState::StateDir(path) => path,
+        // The project declared `task`, so the user layer is already replaced.
+        OmoTaskState::DefaultLayout => default_layout(),
+        OmoTaskState::Unset => user_state_dir
+            .map(PathBuf::from)
+            .unwrap_or_else(default_layout),
+    };
+    state_dir.join("children")
+}
+
+/// Discover OmO task-children scan roots from a Senpi sessions tree.
+///
+/// OmO redirects task child transcripts into project-local
+/// `.omo/senpi-task/children/` (#1112), which is only reachable if you know the
+/// project root. Senpi's sessions dir has one subdirectory per project
+/// (`sessions/<encoded-cwd>/`), but the encoding is lossy — a `-` may be a
+/// separator or a literal character — so instead of decoding the name, read the
+/// `cwd`s recorded in that subdirectory's session headers. Because the encoding
+/// is lossy in both directions, one subdirectory can serve several projects, so
+/// every distinct header `cwd` is taken, not just the newest one. Every
+/// discovered `<cwd>/.omo/senpi-task/children` that exists on disk becomes a
+/// scan root; overlaps with the cwd-derived root are collapsed by the scanner's
+/// existing path dedup.
+fn discover_senpi_omo_children_roots(
+    sessions_root: &Path,
+    user_state_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let entries = match std::fs::read_dir(sessions_root) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut roots: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        // A symlinked per-project directory is still a project directory; the
+        // scanner follows those when it walks the sessions tree.
+        .filter(|entry| {
+            entry
+                .file_type()
+                .is_ok_and(|kind| kind.is_dir() || (kind.is_symlink() && entry.path().is_dir()))
+        })
+        .flat_map(|entry| senpi_project_cwds_from_session_dir(&entry.path()))
+        // A relative `cwd` (corrupt or hand-edited header) would resolve
+        // against the tokscale process cwd and could register an unrelated
+        // directory as a scan root.
+        .filter(|cwd| cwd.is_absolute())
+        .filter_map(|cwd| {
+            let children = senpi_omo_children_root(&cwd, user_state_dir);
+            children.is_dir().then_some(children)
+        })
+        .collect();
+    roots.sort_unstable();
+    roots.dedup();
+    roots
+}
+
+/// Read every distinct project `cwd` recorded in one per-project Senpi session
+/// directory.
+///
+/// `sessions/<encoded-cwd>` names are lossy — a `-` is either a path separator
+/// or a literal character — so two projects can share one directory
+/// (`/a/b-c` and `/a/b/c` both encode to `--a-b-c--`), and their transcripts
+/// then interleave inside it. Returning only the first header's `cwd` would
+/// hide every colliding project but the newest, which is the exact
+/// cross-project omission this discovery exists to fix, so all headers are read
+/// and the distinct `cwd`s collected.
+///
+/// Every transcript is read, with no window or cap: any sampling scheme can
+/// bury a project whose only header falls outside it, and this discovery exists
+/// precisely so that no project is missed. The cost is one `open` plus one
+/// `read_line` per transcript — 0.3ms over the real sessions tree measured here
+/// (9 projects, 26 transcripts) and ~24us per transcript as the tree grows.
+///
+/// Only the first line of each candidate is examined: real transcripts always
+/// start with the `{"type":"session",...}` header, so a non-header first line
+/// means a truncated or foreign file, not a deeper-buried header. Results are
+/// sorted so the scan order of the directory does not leak into the output.
+fn senpi_project_cwds_from_session_dir(session_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(session_dir) else {
+        return Vec::new();
+    };
+    let mut cwds: Vec<PathBuf> = Vec::new();
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        // Same follow-file rule as `scan_directory`: trust the cheap dirent
+        // type for regular files and pay a following stat only for symlinks,
+        // which the normal scanner counts as transcripts too.
+        if !entry
+            .file_type()
+            .is_ok_and(|kind| kind.is_file() || (kind.is_symlink() && entry.path().is_file()))
+        {
+            continue;
+        }
+        let path = entry.path();
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".jsonl"))
+        {
+            continue;
+        }
+        if let Some(cwd) = senpi_session_header_cwd(&path) {
+            // A directory holds a handful of distinct projects at most, so a
+            // linear membership check beats hashing every path, and streaming
+            // the entries avoids materialising one `PathBuf` per transcript.
+            if !cwds.contains(&cwd) {
+                cwds.push(cwd);
+            }
+        }
+    }
+    cwds.sort_unstable();
+    cwds
+}
+
+/// Parse the `cwd` field from a Senpi session file's header line, if the first
+/// line is a session header.
+fn senpi_session_header_cwd(path: &Path) -> Option<PathBuf> {
+    use std::io::{BufRead, BufReader, Read};
+
+    let file = std::fs::File::open(path).ok()?;
+    let mut first_line = String::new();
+    BufReader::new(file.take(SENPI_SESSION_HEADER_MAX_BYTES))
+        .read_line(&mut first_line)
+        .ok()?;
+
+    let header: Value = serde_json::from_str(first_line.trim()).ok()?;
+    if header.get("type").and_then(Value::as_str) != Some("session") {
+        return None;
+    }
+    header.get("cwd").and_then(Value::as_str).map(PathBuf::from)
 }
 
 /// Discover Hermes profile databases under a Hermes home directory.
@@ -7146,11 +7384,101 @@ mod tests {
 
     #[test]
     #[serial]
+    fn built_in_paths_include_home_omo_children() {
+        let home_dir = TempDir::new().unwrap();
+        let other_dir = TempDir::new().unwrap();
+        let child_session = setup_mock_senpi_omo_child(home_dir.path());
+        let mut env =
+            EnvGuard::capture(&["SENPI_CODING_AGENT_DIR", "SENPI_CODING_AGENT_SESSION_DIR"]);
+        env.remove("SENPI_CODING_AGENT_DIR");
+        env.remove("SENPI_CODING_AGENT_SESSION_DIR");
+        let _current_dir = CurrentDirGuard::set(other_dir.path());
+
+        let result =
+            scan_without_extra_dirs(home_dir.path().to_str().unwrap(), &["senpi".to_string()]);
+
+        let files = result.get(ClientId::Senpi);
+        assert_eq!(
+            files.len(),
+            1,
+            "home-directory OmO child sessions must be auto-discovered"
+        );
+        assert_eq!(files[0].canonicalize().unwrap(), child_session);
+    }
+
+    #[test]
+    #[serial]
+    fn home_omo_children_are_discovered_when_env_roots_disabled() {
+        let home_dir = TempDir::new().unwrap();
+        let project_dir = TempDir::new().unwrap();
+        let child_session = setup_mock_senpi_omo_child(home_dir.path());
+        let project_children = project_dir.path().join(".omo/senpi-task/children");
+        let redirected_agent = TempDir::new().unwrap();
+        let mut env =
+            EnvGuard::capture(&["SENPI_CODING_AGENT_DIR", "SENPI_CODING_AGENT_SESSION_DIR"]);
+        env.set("SENPI_CODING_AGENT_DIR", redirected_agent.path());
+        env.set("SENPI_CODING_AGENT_SESSION_DIR", &project_children);
+        let _current_dir = CurrentDirGuard::set(project_dir.path());
+
+        let result = scan_all_clients_with_env_strategy(
+            home_dir.path().to_str().unwrap(),
+            &["senpi".to_string()],
+            false,
+        );
+
+        let files = result.get(ClientId::Senpi);
+        assert_eq!(
+            files.len(),
+            1,
+            "an explicit home must discover its OmO children without using environment roots"
+        );
+        assert_eq!(files[0].canonicalize().unwrap(), child_session);
+    }
+
+    #[test]
+    #[serial]
+    fn home_omo_children_are_deduplicated_with_env_override() {
+        let home_dir = TempDir::new().unwrap();
+        let other_dir = TempDir::new().unwrap();
+        let child_session = setup_mock_senpi_omo_child(home_dir.path());
+        let children_dir = home_dir.path().join(".omo/senpi-task/children");
+        let mut env =
+            EnvGuard::capture(&["SENPI_CODING_AGENT_DIR", "SENPI_CODING_AGENT_SESSION_DIR"]);
+        env.remove("SENPI_CODING_AGENT_DIR");
+        env.set("SENPI_CODING_AGENT_SESSION_DIR", &children_dir);
+        let _current_dir = CurrentDirGuard::set(other_dir.path());
+        let enabled = HashSet::from([ClientId::Senpi]);
+
+        let matching_roots =
+            built_in_extra_scan_paths_for(home_dir.path().to_str().unwrap(), &enabled, true)
+                .into_iter()
+                .filter(|(client_id, path)| *client_id == ClientId::Senpi && path == &children_dir)
+                .count();
+        assert_eq!(
+            matching_roots, 2,
+            "home discovery and the explicit override must both register the child root"
+        );
+
+        let result =
+            scan_without_extra_dirs(home_dir.path().to_str().unwrap(), &["senpi".to_string()]);
+        let files = result.get(ClientId::Senpi);
+        assert_eq!(
+            files.len(),
+            1,
+            "overlapping home and environment roots must not duplicate child usage"
+        );
+        assert_eq!(files[0].canonicalize().unwrap(), child_session);
+    }
+
+    #[test]
+    #[serial]
     fn test_senpi_discovers_omo_task_children_in_current_project() {
         let home_dir = TempDir::new().unwrap();
         let project_dir = TempDir::new().unwrap();
         let child_session = setup_mock_senpi_omo_child(project_dir.path());
-        let mut env = EnvGuard::capture(&["SENPI_CODING_AGENT_SESSION_DIR"]);
+        let mut env =
+            EnvGuard::capture(&["SENPI_CODING_AGENT_DIR", "SENPI_CODING_AGENT_SESSION_DIR"]);
+        env.remove("SENPI_CODING_AGENT_DIR");
         env.remove("SENPI_CODING_AGENT_SESSION_DIR");
         let _current_dir = CurrentDirGuard::set(project_dir.path());
 
@@ -7175,7 +7503,9 @@ mod tests {
         let redirected_sessions = TempDir::new().unwrap();
         let redirected_session = redirected_sessions.path().join("redirected.jsonl");
         File::create(&redirected_session).unwrap();
-        let mut env = EnvGuard::capture(&["SENPI_CODING_AGENT_SESSION_DIR"]);
+        let mut env =
+            EnvGuard::capture(&["SENPI_CODING_AGENT_DIR", "SENPI_CODING_AGENT_SESSION_DIR"]);
+        env.remove("SENPI_CODING_AGENT_DIR");
         env.set("SENPI_CODING_AGENT_SESSION_DIR", redirected_sessions.path());
         let _current_dir = CurrentDirGuard::set(project_dir.path());
 
@@ -7201,7 +7531,9 @@ mod tests {
         let children_dir = project_dir.path().join(".omo/senpi-task/children");
         let task_dir = children_dir.join("task-123");
         let exact_session_dir = task_dir.join("sessions/task-123");
-        let mut env = EnvGuard::capture(&["SENPI_CODING_AGENT_SESSION_DIR"]);
+        let mut env =
+            EnvGuard::capture(&["SENPI_CODING_AGENT_DIR", "SENPI_CODING_AGENT_SESSION_DIR"]);
+        env.remove("SENPI_CODING_AGENT_DIR");
         let _current_dir = CurrentDirGuard::set(project_dir.path());
 
         for env_root in [
@@ -7240,7 +7572,9 @@ mod tests {
             &symlink_root,
         )
         .unwrap();
-        let mut env = EnvGuard::capture(&["SENPI_CODING_AGENT_SESSION_DIR"]);
+        let mut env =
+            EnvGuard::capture(&["SENPI_CODING_AGENT_DIR", "SENPI_CODING_AGENT_SESSION_DIR"]);
+        env.remove("SENPI_CODING_AGENT_DIR");
         env.set("SENPI_CODING_AGENT_SESSION_DIR", &symlink_root);
         let _current_dir = CurrentDirGuard::set(project_dir.path());
 
@@ -7250,5 +7584,605 @@ mod tests {
         let files = result.get(ClientId::Senpi);
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].canonicalize().unwrap(), child_session);
+    }
+
+    fn write_senpi_global_session(
+        home_dir: &Path,
+        project_key: &str,
+        file_name: &str,
+        cwd: &Path,
+    ) -> PathBuf {
+        let dir = home_dir
+            .join(".senpi")
+            .join("agent")
+            .join("sessions")
+            .join(project_key);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(file_name);
+        fs::write(
+            &path,
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"test\",\"timestamp\":\"2026-08-31T00:00:00.000Z\",\"cwd\":{}}}\n",
+                json_path_literal(cwd)
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    #[serial]
+    fn test_senpi_discovers_omo_task_children_across_projects_via_global_sessions() {
+        let home_dir = TempDir::new().unwrap();
+        let project_dir = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let child_session = setup_mock_senpi_omo_child(project_dir.path());
+        let global_session = write_senpi_global_session(
+            home_dir.path(),
+            "--project--",
+            "2026-08-31T00-00-00-000Z_global.jsonl",
+            project_dir.path(),
+        );
+        let mut env =
+            EnvGuard::capture(&["SENPI_CODING_AGENT_SESSION_DIR", "SENPI_CODING_AGENT_DIR"]);
+        env.remove("SENPI_CODING_AGENT_SESSION_DIR");
+        env.remove("SENPI_CODING_AGENT_DIR");
+        let _current_dir = CurrentDirGuard::set(elsewhere.path());
+
+        let result =
+            scan_without_extra_dirs(home_dir.path().to_str().unwrap(), &["senpi".to_string()]);
+
+        let canonical_files: HashSet<PathBuf> = result
+            .get(ClientId::Senpi)
+            .iter()
+            .map(|path| path.canonicalize().unwrap())
+            .collect();
+        assert!(
+            canonical_files.contains(&child_session),
+            "OmO child sessions of other projects must be discovered via the global sessions tree"
+        );
+        assert!(canonical_files.contains(&global_session.canonicalize().unwrap()));
+        assert_eq!(canonical_files.len(), 2);
+    }
+
+    #[test]
+    #[serial]
+    fn test_senpi_global_sessions_ignore_projects_without_children() {
+        let home_dir = TempDir::new().unwrap();
+        let bare_project = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let global_session = write_senpi_global_session(
+            home_dir.path(),
+            "--bare--",
+            "2026-08-31T00-00-00-000Z_bare.jsonl",
+            bare_project.path(),
+        );
+        let mut env =
+            EnvGuard::capture(&["SENPI_CODING_AGENT_SESSION_DIR", "SENPI_CODING_AGENT_DIR"]);
+        env.remove("SENPI_CODING_AGENT_SESSION_DIR");
+        env.remove("SENPI_CODING_AGENT_DIR");
+        let _current_dir = CurrentDirGuard::set(elsewhere.path());
+
+        let result =
+            scan_without_extra_dirs(home_dir.path().to_str().unwrap(), &["senpi".to_string()]);
+
+        let files = result.get(ClientId::Senpi);
+        assert_eq!(
+            files.len(),
+            1,
+            "a project without .omo/senpi-task/children must contribute no extra root"
+        );
+        assert_eq!(
+            files[0].canonicalize().unwrap(),
+            global_session.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_senpi_global_discovery_overlapping_cwd_root_returns_each_file_once() {
+        let home_dir = TempDir::new().unwrap();
+        let project_dir = TempDir::new().unwrap();
+        let child_session = setup_mock_senpi_omo_child(project_dir.path());
+        let global_session = write_senpi_global_session(
+            home_dir.path(),
+            "--project--",
+            "2026-08-31T00-00-00-000Z_global.jsonl",
+            project_dir.path(),
+        );
+        let mut env =
+            EnvGuard::capture(&["SENPI_CODING_AGENT_SESSION_DIR", "SENPI_CODING_AGENT_DIR"]);
+        env.remove("SENPI_CODING_AGENT_SESSION_DIR");
+        env.remove("SENPI_CODING_AGENT_DIR");
+        let _current_dir = CurrentDirGuard::set(project_dir.path());
+
+        let result =
+            scan_without_extra_dirs(home_dir.path().to_str().unwrap(), &["senpi".to_string()]);
+
+        let files = result.get(ClientId::Senpi);
+        assert_eq!(
+            files.len(),
+            2,
+            "cwd-derived and globally-discovered children roots must dedup to one copy per file"
+        );
+        let canonical_files: HashSet<PathBuf> = files
+            .iter()
+            .map(|path| path.canonicalize().unwrap())
+            .collect();
+        assert!(canonical_files.contains(&child_session));
+        assert!(canonical_files.contains(&global_session.canonicalize().unwrap()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_senpi_global_discovery_registers_every_project_sharing_one_session_dir() {
+        // Two projects whose paths encode to the same lossy directory name keep
+        // their transcripts side by side in one `sessions/<encoded-cwd>`
+        // directory. Both must contribute their OmO children root — discovering
+        // only the newest is the cross-project omission this feature fixes.
+        let home_dir = TempDir::new().unwrap();
+        let older_project = TempDir::new().unwrap();
+        let newer_project = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let older_child = setup_mock_senpi_omo_child(older_project.path());
+        let newer_child = setup_mock_senpi_omo_child(newer_project.path());
+        let older_session = write_senpi_global_session(
+            home_dir.path(),
+            "--collided--",
+            "2026-01-01T00-00-00-000Z_older.jsonl",
+            older_project.path(),
+        );
+        let newer_session = write_senpi_global_session(
+            home_dir.path(),
+            "--collided--",
+            "2026-08-31T00-00-00-000Z_newer.jsonl",
+            newer_project.path(),
+        );
+        let mut env =
+            EnvGuard::capture(&["SENPI_CODING_AGENT_SESSION_DIR", "SENPI_CODING_AGENT_DIR"]);
+        env.remove("SENPI_CODING_AGENT_SESSION_DIR");
+        env.remove("SENPI_CODING_AGENT_DIR");
+        let _current_dir = CurrentDirGuard::set(elsewhere.path());
+
+        let result =
+            scan_without_extra_dirs(home_dir.path().to_str().unwrap(), &["senpi".to_string()]);
+
+        let canonical_files: HashSet<PathBuf> = result
+            .get(ClientId::Senpi)
+            .iter()
+            .map(|path| path.canonicalize().unwrap())
+            .collect();
+        assert!(
+            canonical_files.contains(&older_child),
+            "the older project sharing the encoded directory must still be discovered"
+        );
+        assert!(canonical_files.contains(&newer_child));
+        assert!(canonical_files.contains(&older_session.canonicalize().unwrap()));
+        assert!(canonical_files.contains(&newer_session.canonicalize().unwrap()));
+        assert_eq!(canonical_files.len(), 4);
+    }
+
+    #[test]
+    fn test_senpi_project_cwd_probe_skips_headerless_transcripts() {
+        let sessions = TempDir::new().unwrap();
+        let project_dir = sessions.path().join("--proj--");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("2026-03-01T00-00-00-000Z_c.jsonl"),
+            "{not json",
+        )
+        .unwrap();
+        fs::write(
+            project_dir.join("2026-02-01T00-00-00-000Z_b.jsonl"),
+            "{\"type\":\"model_change\",\"id\":\"x\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            project_dir.join("2026-01-01T00-00-00-000Z_a.jsonl"),
+            "{\"type\":\"session\",\"cwd\":\"/tmp/real-project\"}\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            senpi_project_cwds_from_session_dir(&project_dir),
+            vec![PathBuf::from("/tmp/real-project")]
+        );
+    }
+
+    #[test]
+    fn test_senpi_project_cwd_probe_reads_every_header_in_a_large_directory() {
+        // Neither end of the history may be privileged: a project that stopped
+        // writing lives among the oldest transcripts, and the one that took the
+        // shared directory over lives among the newest.
+        let sessions = TempDir::new().unwrap();
+        let project_dir = sessions.path().join("--proj--");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("2026-01-01T00-00-00-000Z_oldest.jsonl"),
+            "{\"type\":\"session\",\"cwd\":\"/tmp/dormant-project\"}\n",
+        )
+        .unwrap();
+        for index in 0..200 {
+            fs::write(
+                project_dir.join(format!("2026-02-01T00-00-00-000Z_filler-{index:04}.jsonl")),
+                "{not json",
+            )
+            .unwrap();
+        }
+        fs::write(
+            project_dir.join("2026-03-01T00-00-00-000Z_newest.jsonl"),
+            "{\"type\":\"session\",\"cwd\":\"/tmp/active-project\"}\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            senpi_project_cwds_from_session_dir(&project_dir)
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            HashSet::from([
+                PathBuf::from("/tmp/active-project"),
+                PathBuf::from("/tmp/dormant-project"),
+            ]),
+            "both ends of a large directory must be read"
+        );
+    }
+
+    #[test]
+    fn test_senpi_project_cwd_probe_finds_a_header_buried_between_the_ends() {
+        // The regression that a windowed probe reintroduces: a project whose
+        // only transcript sits in the middle of a busy shared directory must
+        // still contribute its OmO children root.
+        let sessions = TempDir::new().unwrap();
+        let project_dir = sessions.path().join("--proj--");
+        fs::create_dir_all(&project_dir).unwrap();
+        for index in 0..100 {
+            fs::write(
+                project_dir.join(format!("2026-01-01T00-00-00-000Z_old-{index:04}.jsonl")),
+                "{not json",
+            )
+            .unwrap();
+        }
+        fs::write(
+            project_dir.join("2026-02-01T00-00-00-000Z_buried.jsonl"),
+            "{\"type\":\"session\",\"cwd\":\"/tmp/buried-project\"}\n",
+        )
+        .unwrap();
+        for index in 0..100 {
+            fs::write(
+                project_dir.join(format!("2026-03-01T00-00-00-000Z_new-{index:04}.jsonl")),
+                "{not json",
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            senpi_project_cwds_from_session_dir(&project_dir),
+            vec![PathBuf::from("/tmp/buried-project")],
+            "a header between the ends of the directory must not be skipped"
+        );
+    }
+
+    #[test]
+    fn test_senpi_project_cwd_probe_collects_every_colliding_project() {
+        // `/tmp/a/b-c` and `/tmp/a/b/c` both encode to `--tmp-a-b-c--`, so their
+        // transcripts share one session directory. Every distinct `cwd` must
+        // survive the probe, not just the newest project's.
+        let sessions = TempDir::new().unwrap();
+        let project_dir = sessions.path().join("--tmp-a-b-c--");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("2026-01-01T00-00-00-000Z_older.jsonl"),
+            "{\"type\":\"session\",\"cwd\":\"/tmp/a/b-c\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            project_dir.join("2026-02-01T00-00-00-000Z_newer.jsonl"),
+            "{\"type\":\"session\",\"cwd\":\"/tmp/a/b/c\"}\n",
+        )
+        .unwrap();
+        // A second transcript of the newest project must not produce a duplicate.
+        fs::write(
+            project_dir.join("2026-03-01T00-00-00-000Z_newest.jsonl"),
+            "{\"type\":\"session\",\"cwd\":\"/tmp/a/b/c\"}\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            senpi_project_cwds_from_session_dir(&project_dir)
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            HashSet::from([PathBuf::from("/tmp/a/b/c"), PathBuf::from("/tmp/a/b-c")]),
+            "every distinct header cwd must be collected, without duplicates"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_senpi_project_cwd_probe_follows_symlinked_transcripts() {
+        use std::os::unix::fs::symlink;
+
+        // `scan_directory` counts symlinked transcripts, so skipping them here
+        // would hide their project's OmO children from a tree the scanner reads.
+        let sessions = TempDir::new().unwrap();
+        let real = sessions.path().join("real-transcript.jsonl");
+        fs::write(
+            &real,
+            "{\"type\":\"session\",\"cwd\":\"/tmp/linked-project\"}\n",
+        )
+        .unwrap();
+        let project_dir = sessions.path().join("--proj--");
+        fs::create_dir_all(&project_dir).unwrap();
+        symlink(
+            &real,
+            project_dir.join("2026-01-01T00-00-00-000Z_link.jsonl"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            senpi_project_cwds_from_session_dir(&project_dir),
+            vec![PathBuf::from("/tmp/linked-project")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_discover_senpi_omo_children_roots_follows_symlinked_project_dirs() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let project = temp.path().join("project");
+        let children = project.join(".omo").join("senpi-task").join("children");
+        fs::create_dir_all(&children).unwrap();
+        let real_session_dir = temp.path().join("real-sessions").join("--project--");
+        fs::create_dir_all(&real_session_dir).unwrap();
+        fs::write(
+            real_session_dir.join("2026-01-01T00-00-00-000Z_a.jsonl"),
+            format!(
+                "{{\"type\":\"session\",\"cwd\":{}}}\n",
+                json_path_literal(&project)
+            ),
+        )
+        .unwrap();
+        let sessions_root = temp.path().join("sessions");
+        fs::create_dir_all(&sessions_root).unwrap();
+        symlink(&real_session_dir, sessions_root.join("--project--")).unwrap();
+
+        assert_eq!(
+            discover_senpi_omo_children_roots(&sessions_root, None),
+            vec![children]
+        );
+    }
+
+    /// An absolute path the host platform agrees is absolute. A Unix-style
+    /// `/srv/...` is drive-relative on Windows, so `Path::is_absolute` rejects
+    /// it there and the probe would correctly refuse to use it.
+    fn absolute_state_dir(name: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!(r"C:\{name}"))
+        } else {
+            PathBuf::from(format!("/{name}"))
+        }
+    }
+
+    #[test]
+    fn test_omo_task_state_reads_jsonc_with_comments() {
+        let temp = TempDir::new().unwrap();
+        let omo_dir = temp.path().join(".omo");
+        fs::create_dir_all(&omo_dir).unwrap();
+        let state_dir = absolute_state_dir("srv-omo-state");
+        fs::write(
+            omo_dir.join("omo.jsonc"),
+            format!(
+                "{{\n  // OmO config\n  \"task\": {{\n    \"state_dir\": {},\n  }},\n}}\n",
+                json_path_literal(&state_dir)
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(omo_task_state(&omo_dir), OmoTaskState::StateDir(state_dir));
+    }
+
+    #[test]
+    fn test_omo_task_state_falls_back_to_omo_json() {
+        let temp = TempDir::new().unwrap();
+        let omo_dir = temp.path().join(".omo");
+        fs::create_dir_all(&omo_dir).unwrap();
+        let state_dir = absolute_state_dir("srv-legacy");
+        fs::write(
+            omo_dir.join("omo.json"),
+            format!(
+                "{{\"task\":{{\"state_dir\":{}}}}}",
+                json_path_literal(&state_dir)
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(omo_task_state(&omo_dir), OmoTaskState::StateDir(state_dir));
+    }
+
+    #[test]
+    fn test_omo_task_state_separates_an_unset_layer_from_an_overriding_one() {
+        let temp = TempDir::new().unwrap();
+        let omo_dir = temp.path().join(".omo");
+        fs::create_dir_all(&omo_dir).unwrap();
+
+        // A `task` block still replaces the layer above even when its
+        // `state_dir` is unusable, so these must not fall through.
+        fs::write(
+            omo_dir.join("omo.jsonc"),
+            "{\"task\":{\"state_dir\":\"relative/state\"}}",
+        )
+        .unwrap();
+        assert_eq!(omo_task_state(&omo_dir), OmoTaskState::DefaultLayout);
+
+        fs::write(omo_dir.join("omo.jsonc"), "{\"task\":{}}").unwrap();
+        assert_eq!(omo_task_state(&omo_dir), OmoTaskState::DefaultLayout);
+
+        // No `task` block, an unparseable file, and no file at all all leave
+        // the decision to the layer above.
+        fs::write(omo_dir.join("omo.jsonc"), "{\"agents\":{}}").unwrap();
+        assert_eq!(omo_task_state(&omo_dir), OmoTaskState::Unset);
+
+        fs::write(omo_dir.join("omo.jsonc"), "{ not json").unwrap();
+        assert_eq!(omo_task_state(&omo_dir), OmoTaskState::Unset);
+
+        assert_eq!(
+            omo_task_state(&temp.path().join("missing")),
+            OmoTaskState::Unset
+        );
+    }
+
+    #[test]
+    fn test_senpi_omo_children_root_does_not_inherit_user_state_after_a_project_override() {
+        let temp = TempDir::new().unwrap();
+        let omo_dir = temp.path().join(".omo");
+        fs::create_dir_all(&omo_dir).unwrap();
+        let user_state = absolute_state_dir("srv-user-state");
+
+        for config in [
+            "{\"task\":{\"state_dir\":\"relative/state\"}}",
+            "{\"task\":{}}",
+        ] {
+            fs::write(omo_dir.join("omo.jsonc"), config).unwrap();
+            assert_eq!(
+                senpi_omo_children_root(temp.path(), Some(&user_state)),
+                temp.path().join(".omo").join("senpi-task").join("children"),
+                "a project `task` block replaces the user layer even without a usable state_dir: {config}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_senpi_omo_children_root_defaults_to_the_project_layout() {
+        let temp = TempDir::new().unwrap();
+
+        assert_eq!(
+            senpi_omo_children_root(temp.path(), None),
+            temp.path().join(".omo").join("senpi-task").join("children"),
+            "an unconfigured project keeps OmO's default state dir"
+        );
+    }
+
+    #[test]
+    fn test_senpi_omo_children_root_prefers_project_config_over_user_layer() {
+        let temp = TempDir::new().unwrap();
+        let omo_dir = temp.path().join(".omo");
+        fs::create_dir_all(&omo_dir).unwrap();
+        let project_state = absolute_state_dir("srv-project-state");
+        let user_state = absolute_state_dir("srv-user-state");
+        fs::write(
+            omo_dir.join("omo.jsonc"),
+            format!(
+                "{{\"task\":{{\"state_dir\":{}}}}}",
+                json_path_literal(&project_state)
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            senpi_omo_children_root(temp.path(), Some(&user_state)),
+            project_state.join("children"),
+            "the project's own .omo config wins over the user layer"
+        );
+        assert_eq!(
+            senpi_omo_children_root(&temp.path().join("other"), Some(&user_state)),
+            user_state.join("children"),
+            "a project without its own config inherits the user layer"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_senpi_discovers_omo_children_under_a_configured_state_dir() {
+        let home_dir = TempDir::new().unwrap();
+        let project_dir = TempDir::new().unwrap();
+        let state_dir = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        // The project redirects its OmO task state out of `.omo/senpi-task`.
+        let omo_dir = project_dir.path().join(".omo");
+        fs::create_dir_all(&omo_dir).unwrap();
+        fs::write(
+            omo_dir.join("omo.jsonc"),
+            format!(
+                "{{\n  // redirected\n  \"task\": {{ \"state_dir\": {} }},\n}}\n",
+                json_path_literal(state_dir.path())
+            ),
+        )
+        .unwrap();
+        let child_session = state_dir
+            .path()
+            .join("children/task-9/sessions/task-9")
+            .join("child.jsonl");
+        fs::create_dir_all(child_session.parent().unwrap()).unwrap();
+        File::create(&child_session).unwrap();
+        let global_session = write_senpi_global_session(
+            home_dir.path(),
+            "--project--",
+            "2026-08-31T00-00-00-000Z_global.jsonl",
+            project_dir.path(),
+        );
+        let mut env =
+            EnvGuard::capture(&["SENPI_CODING_AGENT_SESSION_DIR", "SENPI_CODING_AGENT_DIR"]);
+        env.remove("SENPI_CODING_AGENT_SESSION_DIR");
+        env.remove("SENPI_CODING_AGENT_DIR");
+        let _current_dir = CurrentDirGuard::set(elsewhere.path());
+
+        let result =
+            scan_without_extra_dirs(home_dir.path().to_str().unwrap(), &["senpi".to_string()]);
+
+        let canonical_files: HashSet<PathBuf> = result
+            .get(ClientId::Senpi)
+            .iter()
+            .map(|path| path.canonicalize().unwrap())
+            .collect();
+        assert!(
+            canonical_files.contains(&child_session.canonicalize().unwrap()),
+            "children under a configured task.state_dir must be discovered"
+        );
+        assert!(canonical_files.contains(&global_session.canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn test_discover_senpi_omo_children_roots_dedups_and_skips_missing() {
+        let temp = TempDir::new().unwrap();
+        let project = temp.path().join("project");
+        let children = project.join(".omo").join("senpi-task").join("children");
+        fs::create_dir_all(&children).unwrap();
+        let sessions_root = temp.path().join("sessions");
+        for key in ["--project--", "--project-again--", "--gone--"] {
+            let dir = sessions_root.join(key);
+            fs::create_dir_all(&dir).unwrap();
+            let cwd = if key == "--gone--" {
+                temp.path().join("does-not-exist")
+            } else {
+                project.clone()
+            };
+            fs::write(
+                dir.join("2026-08-31T00-00-00-000Z_s.jsonl"),
+                format!(
+                    "{{\"type\":\"session\",\"cwd\":{}}}\n",
+                    json_path_literal(&cwd)
+                ),
+            )
+            .unwrap();
+        }
+        // A relative header cwd must never resolve against the process cwd.
+        let relative_dir = sessions_root.join("--relative--");
+        fs::create_dir_all(&relative_dir).unwrap();
+        fs::write(
+            relative_dir.join("2026-08-31T00-00-00-000Z_s.jsonl"),
+            "{\"type\":\"session\",\"cwd\":\"relative/project\"}\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            discover_senpi_omo_children_roots(&sessions_root, None),
+            vec![children],
+            "same project referenced twice must yield one root; missing and relative projects none"
+        );
+        assert!(
+            discover_senpi_omo_children_roots(&temp.path().join("no-such-root"), None).is_empty(),
+            "a missing sessions root must discover nothing"
+        );
     }
 }

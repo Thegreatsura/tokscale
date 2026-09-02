@@ -9,8 +9,11 @@
 //! `subagent-<name>-<id>` marker.
 //!
 //! OmO task children are senpi sessions too. The scanner honors
-//! `SENPI_CODING_AGENT_SESSION_DIR` and discovers the current project's
-//! `.omo/senpi-task/children` tree so their redirected sessions are counted.
+//! `SENPI_CODING_AGENT_SESSION_DIR`, discovers `.omo/senpi-task/children`
+//! under both the supplied home and the current project, and recovers every
+//! other project's children root from the `cwd` recorded in global session
+//! headers, so redirected child sessions are counted no matter where tokscale
+//! runs from.
 
 use super::pi::parse_pi_format_file;
 use super::UnifiedMessage;
