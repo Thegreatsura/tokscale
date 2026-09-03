@@ -1168,7 +1168,12 @@ fn parser_version(client: ClientId) -> u32 {
         // instead of subtracting `Input (w/o Cache Write)`, and a numeric CSV
         // `Cost` (including explicit zero) is retained as provider-reported so
         // repricing no longer drops the Team/Enterprise Cursor Token Rate.
-        ClientId::Cursor => 2,
+        // v2->v3: usage-events JSON keys sessions by `conversationId`, takes cost
+        // from the metered `tokenUsage.totalCents` (falling back to
+        // `chargedCents`) so plan-included rows keep Cursor's own figure instead
+        // of landing unpriced, and uses a UTC-stable synthetic id for the id-less
+        // fallback.
+        ClientId::Cursor => 3,
         // v1->v2: Kimchi's Pi-compatible messages now carry stable namespaced
         // deduplication keys.
         ClientId::Kimchi => 2,
@@ -1196,6 +1201,11 @@ fn parser_version(client: ClientId) -> u32 {
         // session_model_usage instead of crediting the whole session to
         // sessions.model, and dedup keys are namespaced per (session, model).
         ClientId::Hermes => 2,
+        // v1->v2: Unsloth Studio now reads the responding model and provider
+        // route from scalar responseDetails fields. Reparse cached rows so
+        // local usage stays authoritatively free, metered providers receive
+        // estimates, and unknown/custom routes remain explicitly unpriced.
+        ClientId::Unsloth => 2,
         // v2 added per-turn usage records. v3 adds the canonical unified log,
         // non-overlapping output/cache/reasoning buckets, and session metadata.
         // v4 scopes unified model attribution by PID generation and exact child
@@ -3424,6 +3434,11 @@ mod tests {
     }
 
     #[test]
+    fn test_unsloth_provider_parser_version_invalidates_v1_entries() {
+        assert_eq!(parser_version(ClientId::Unsloth), 2);
+    }
+
+    #[test]
     fn test_grok_resilient_line_reader_parser_version_invalidates_v6_entries() {
         // A Grok session file that is never appended to again keeps its
         // fingerprint forever, so only the version bump discards the truncated
@@ -3702,7 +3717,7 @@ mod tests {
 
     #[test]
     fn test_cursor_parser_version_invalidates_incorrect_token_and_cost_rows() {
-        assert_eq!(parser_version(ClientId::Cursor), 2);
+        assert_eq!(parser_version(ClientId::Cursor), 3);
     }
 
     #[test]

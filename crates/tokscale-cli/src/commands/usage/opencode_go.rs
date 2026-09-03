@@ -182,7 +182,7 @@ pub fn has_credentials() -> bool {
 ///
 /// `reqwest` is built here with `default-features = false`, so `bytes_stream()`
 /// (feature `stream`) does not exist. `Response::chunk` is ungated and is the
-/// same primitive `cursor::read_cursor_csv_with_cap` and
+/// same primitive `cursor::read_cursor_body_with_cap` and
 /// `antigravity::read_reqwest_response_with_cap` already use for this job.
 ///
 /// Bytes rather than a `String`: the success path deserializes JSON straight
@@ -238,7 +238,7 @@ fn fetch_blocking_with_cap(
         .enable_all()
         .build()?;
     rt.block_on(async {
-        let client = reqwest::Client::builder()
+        let client = tokscale_core::http::client_builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()?;
         let resp = client

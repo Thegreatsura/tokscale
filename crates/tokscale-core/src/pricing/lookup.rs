@@ -126,11 +126,22 @@ pub struct PricingLookup {
     cursor: HashMap<String, ModelPricing>,
     sakana: HashMap<String, ModelPricing>,
     models_dev: HashMap<String, ModelPricing>,
+    /// Last-known tariffs for models the upstream datasets may stop carrying.
+    ///
+    /// Deliberately not folded into `cursor`/`sakana`: those two are *current*
+    /// price sheets for models upstream never carried, and they answer with
+    /// `BuiltIn` evidence, which is unconditionally submission-safe. An
+    /// archived row is a snapshot of a rate that was real when it was taken and
+    /// may since have moved, so it is matched through the ordinary
+    /// provider-qualified path instead and can only be submission-safe when the
+    /// lookup actually proves the publishing endpoint.
+    archive: HashMap<String, ModelPricing>,
     litellm_keys: Vec<String>,
     openrouter_keys: Vec<String>,
     litellm_key_parts: Vec<KeyModelPart>,
     openrouter_key_parts: Vec<KeyModelPart>,
     models_dev_key_parts: Vec<KeyModelPart>,
+    archive_key_parts: Vec<KeyModelPart>,
     litellm_lower: HashMap<String, String>,
     openrouter_lower: HashMap<String, String>,
     models_dev_lower: HashMap<String, String>,
@@ -360,10 +371,10 @@ impl PricingLookup {
     // @keep: the omission of cursor/sakana is the whole point and reads like a bug otherwise.
     /// True when at least one *fetchable* upstream dataset loaded.
     ///
-    /// The `cursor` and `sakana` tables are compiled-in constants that are
-    /// present on every run, so they are deliberately not consulted: counting
-    /// them would report healthy pricing during a total upstream outage, which
-    /// is exactly the condition callers use this to detect.
+    /// The `cursor`, `sakana` and `archive` tables are compiled-in constants
+    /// that are present on every run, so they are deliberately not consulted:
+    /// counting them would report healthy pricing during a total upstream
+    /// outage, which is exactly the condition callers use this to detect.
     pub fn has_upstream_dataset(&self) -> bool {
         !self.litellm.is_empty() || !self.openrouter.is_empty() || !self.models_dev.is_empty()
     }
@@ -374,6 +385,34 @@ impl PricingLookup {
         cursor: HashMap<String, ModelPricing>,
         sakana: HashMap<String, ModelPricing>,
         models_dev: HashMap<String, ModelPricing>,
+    ) -> Self {
+        Self::new_with_archive(
+            litellm,
+            openrouter,
+            cursor,
+            sakana,
+            models_dev,
+            HashMap::new(),
+        )
+    }
+
+    // @keep: the reason this is a separate constructor and not a sixth
+    // parameter on `new_with_models_dev` is the whole design, and reads like
+    // gratuitous API surface otherwise.
+    /// Full wiring, including the retirement archive of last-known tariffs.
+    ///
+    /// The archive is the only table here that can answer for a model no live
+    /// dataset carries, so a test that wants to observe upstream-only
+    /// resolution — including the absence of a price — has to be able to build
+    /// a lookup without it. Production always goes through `PricingService`,
+    /// which always passes it.
+    pub fn new_with_archive(
+        litellm: HashMap<String, ModelPricing>,
+        openrouter: HashMap<String, ModelPricing>,
+        cursor: HashMap<String, ModelPricing>,
+        sakana: HashMap<String, ModelPricing>,
+        models_dev: HashMap<String, ModelPricing>,
+        archive: HashMap<String, ModelPricing>,
     ) -> Self {
         // Longest key first, then alphabetical. The alphabetical leg only pins
         // equal-length ties so a run is reproducible; it carries no pricing
@@ -387,6 +426,9 @@ impl PricingLookup {
 
         let mut models_dev_keys: Vec<String> = models_dev.keys().cloned().collect();
         models_dev_keys.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+
+        let mut archive_keys: Vec<String> = archive.keys().cloned().collect();
+        archive_keys.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
 
         let mut litellm_lower = HashMap::with_capacity(litellm.len());
         for key in &litellm_keys {
@@ -464,6 +506,7 @@ impl PricingLookup {
         let litellm_key_parts = build_key_parts(&litellm_keys);
         let openrouter_key_parts = build_key_parts(&openrouter_keys);
         let models_dev_key_parts = build_key_parts(&models_dev_keys);
+        let archive_key_parts = build_key_parts(&archive_keys);
 
         Self {
             litellm,
@@ -471,11 +514,13 @@ impl PricingLookup {
             cursor,
             sakana,
             models_dev,
+            archive,
             litellm_keys,
             openrouter_keys,
             litellm_key_parts,
             openrouter_key_parts,
             models_dev_key_parts,
+            archive_key_parts,
             litellm_lower,
             openrouter_lower,
             models_dev_lower,
@@ -577,6 +622,16 @@ impl PricingLookup {
         force_source: Option<&str>,
         provider_id: Option<&str>,
     ) -> Option<LookupResult> {
+        // Parsers use this namespace when they know which model responded but
+        // the source does not establish whether the route was metered,
+        // subscription-backed, or custom. Preserve the model for reporting,
+        // but never turn that incomplete route into an upstream API estimate.
+        // An exact custom-pricing entry is still consulted by PricingService
+        // before this lookup and remains the explicit user escape hatch.
+        if provider_id.is_some_and(is_unpriced_provider) {
+            return None;
+        }
+
         if force_source.is_none() {
             if let Some(result) = self_hosted::lookup(model_id, provider_id) {
                 return Some(result);
@@ -963,6 +1018,15 @@ impl PricingLookup {
             if let Some(result) = self.exact_match_sakana(&version_normalized) {
                 return Some(result.with_normalization());
             }
+        }
+
+        // The retirement archive answers only once every live dataset has
+        // failed, so a model still carried upstream never reaches it. It still
+        // runs ahead of the fuzzy stage below: an exact snapshot of this
+        // model's own last published rate is better evidence than the
+        // nearest-neighbour row fuzzy would elect.
+        if let Some(result) = self.exact_match_archive(model_id, provider_id) {
+            return Some(result);
         }
 
         if !is_fuzzy_eligible(model_id) {
@@ -1384,6 +1448,79 @@ impl PricingLookup {
             }
         }
         None
+    }
+
+    /// Match `model_id` against the retirement archive of last-known tariffs.
+    ///
+    /// Unlike the Cursor and Sakana built-ins above, this does NOT stamp
+    /// `BuiltIn`. `BuiltIn` is unconditionally submission-safe, and an archived
+    /// rate is a snapshot rather than a live quote: it earns provider-scoped
+    /// evidence only when the lookup proves the endpoint that published it, and
+    /// otherwise stays an estimate.
+    fn exact_match_archive(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        if self.archive.is_empty() {
+            return None;
+        }
+
+        // Every archived key is a canonical `claude-{family}-{major}-{minor}`
+        // under a provider root, so the normalizer the upstream exact passes
+        // already use is the whole matcher. It folds the dated
+        // (`claude-haiku-4-5-20251001`), context-tagged (`claude-opus-4-8[1m]`),
+        // dotted (`claude-haiku-4.5`) and reasoning-tier
+        // (`claude-opus-4-7-thinking-xhigh`) spellings real clients emit, and it
+        // drops any leading provider segment on the way. Comparing the raw id to
+        // the key by equality instead would miss every one of those shapes —
+        // that is, every shape the archive exists to cover.
+        let lower = model_id.trim().to_ascii_lowercase();
+        let canonical = normalize_model_name(&lower)?;
+
+        // The id's own leading segment authorises the tariff exactly as a hint
+        // does, so `anthropic/claude-opus-4-8` resolves provider-scoped with no
+        // hint at all, while `openrouter/anthropic/claude-haiku-4.5` roots on
+        // the reseller and is refused here. (The outer resolver then peels the
+        // unknown vendor prefix and retries the bare id, which lands in the
+        // unhinted branch below and is priced as an estimate, never
+        // submission-safe.) An explicit hint wins over the id, matching every
+        // other resolver.
+        let embedded_root = lower.split_once('/').map(|(root, _)| root);
+        let hint = provider_id.or(embedded_root);
+
+        let result = match hint {
+            Some(hint) => exact_match_with_provider_prefixes(
+                &canonical,
+                Some(hint),
+                &self.archive_key_parts,
+                &self.archive,
+                ARCHIVE_SOURCE,
+            )?,
+            // Nothing here names the publishing endpoint, so this is the same
+            // estimate-only evidence an unhinted cross-provider fallback gets:
+            // priced for display, never submission-safe.
+            None => {
+                let matches: Vec<&String> = self
+                    .archive_key_parts
+                    .iter()
+                    .filter(|kp| model_part_matches_exact(&kp.lower_model_part, &canonical))
+                    .map(|kp| &kp.key)
+                    .collect();
+                select_best_match(
+                    &matches,
+                    &self.archive,
+                    ARCHIVE_SOURCE,
+                    None,
+                    ResolutionKind::ModelPart,
+                    &canonical,
+                )?
+            }
+        };
+
+        // The matched key is never the requested id verbatim, so disclose the
+        // normalization the way every other normalized pass does.
+        Some(result.with_normalization())
     }
 
     fn prefix_match_litellm(
@@ -2746,9 +2883,22 @@ fn prefers_model_part_key(candidate: &str, existing: &str) -> bool {
 /// knows their router's effective rate can still state it.
 const ROUTING_LABELS: &[&str] = &["auto", "agent_review"];
 
+/// Source label reported for a price served from the retirement archive.
+///
+/// Deliberately distinct from the live dataset labels: `tokscale pricing` and
+/// the submission diagnostics print this verbatim, and a reader has to be able
+/// to tell "this rate is a snapshot of a model upstream no longer carries" from
+/// "LiteLLM says so today".
+pub(super) const ARCHIVE_SOURCE: &str = "Tokscale Archive";
+
 pub(crate) fn is_routing_label(model_id: &str) -> bool {
     let lower = model_id.trim().to_lowercase();
     ROUTING_LABELS.contains(&lower.as_str())
+}
+
+pub(crate) fn is_unpriced_provider(provider_id: &str) -> bool {
+    let lower = provider_id.trim().to_ascii_lowercase();
+    lower == "unpriced" || lower.starts_with("unpriced:")
 }
 
 fn is_original_provider(key: &str) -> bool {
@@ -8170,6 +8320,37 @@ mod tests {
 
         // A qualified id names a real vendor's model and still prices.
         assert!(lookup.lookup("morph/auto").is_some());
+    }
+
+    #[test]
+    fn explicitly_unpriced_provider_routes_do_not_inherit_model_pricing() {
+        let litellm = HashMap::from([(
+            "openai/gpt-5.4".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(1e-6),
+                output_cost_per_token: Some(2e-6),
+                ..Default::default()
+            },
+        )]);
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let usage = TokenBreakdown {
+            input: 1_000,
+            output: 100,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+        };
+
+        assert!(super::is_unpriced_provider("unpriced:custom"));
+        assert!(super::is_unpriced_provider(" UNPRICED "));
+        assert!(!super::is_unpriced_provider("openai"));
+        assert!(lookup
+            .lookup_with_provider("gpt-5.4", Some("unpriced:custom"))
+            .is_none());
+        assert_eq!(
+            lookup.calculate_cost_with_provider("gpt-5.4", Some("unpriced:subscription"), &usage,),
+            0.0
+        );
     }
 
     /// The shortest-key tie-break is a coin flip. Preferring the original

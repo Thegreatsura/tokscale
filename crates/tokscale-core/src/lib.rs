@@ -6,6 +6,7 @@ mod cc_mirror;
 pub mod clients;
 pub mod content_extractor;
 pub mod fs_atomic;
+pub mod http;
 pub mod mcp;
 mod message_cache;
 pub mod model_alias;
@@ -2508,12 +2509,18 @@ fn parse_all_messages_streaming<S: MessageSink>(
         }
     }
 
-    // Command Code does not persist token usage or cost locally, so tokens are
-    // estimated and priced. The model id comes from ~/.commandcode/config.json
-    // (canonicalized, e.g. "MiniMaxAI/MiniMax-M3-Free" -> "MiniMax-M3"), not the
-    // transcript, so the source cache — which fingerprints only the transcript
-    // file — is bypassed: otherwise a config.json model change would leave stale
-    // cached pricing until the transcript itself changed.
+    // Command Code's v3 transcripts persist per-request usage and cost
+    // (`usage` with `inputTokens`/`outputTokens`/`cacheReadTokens`/
+    // `cacheWriteTokens`/`costUsd`) on assistant lines, so the parser embeds
+    // provider-reported cost when present. Reprice only messages that carry no
+    // embedded cost, mirroring the gjc/junie lanes' guards. The model id comes
+    // from the transcript's own `model`/`model_change` records (canonicalized,
+    // e.g. "MiniMaxAI/MiniMax-M3-Free" -> "MiniMax-M3-Free"), falling back to
+    // ~/.commandcode/config.json, so the source cache — which fingerprints only
+    // the transcript file — is bypassed: otherwise a model change would leave
+    // stale cached pricing until the transcript itself changed. Message-level
+    // dedup collapses `/fork`/`/clone` copies of the same entries across files.
+    let mut commandcode_seen: HashSet<String> = HashSet::new();
     let commandcode_messages: Vec<UnifiedMessage> = scan_result
         .get(ClientId::CommandCode)
         .par_iter()
@@ -2521,13 +2528,19 @@ fn parse_all_messages_streaming<S: MessageSink>(
             sessions::commandcode::parse_commandcode_file(path)
                 .into_iter()
                 .map(|mut msg| {
-                    apply_pricing_if_available(&mut msg, pricing);
+                    if msg.cost <= 0.0 {
+                        apply_pricing_if_available(&mut msg, pricing);
+                    }
                     msg
                 })
                 .collect::<Vec<_>>()
         })
         .collect();
-    all_messages.extend(commandcode_messages);
+    all_messages.extend(
+        commandcode_messages
+            .into_iter()
+            .filter(|message| should_keep_deduped_message(&mut commandcode_seen, message)),
+    );
 
     // gjc (gajae-code) JSONL sessions. Binding note N1: this cached cluster
     // MUST obtain messages via the non-repricing parser and apply the A1
@@ -2684,6 +2697,19 @@ fn parse_all_messages_streaming<S: MessageSink>(
             source_cache.insert(entry);
         }
     }
+
+    // Hindsight persists exact LLM usage metadata from its self-hosted memory
+    // service. The client integration parses a local append-only JSONL mirror
+    // synchronized by `tokscale hindsight sync`. Request IDs provide a stable
+    // cross-file dedup key.
+    parse_cached_lane_deduped(
+        &scan_result,
+        &mut source_cache,
+        pricing,
+        &mut all_messages,
+        ClientId::Hindsight,
+        sessions::hindsight::parse_hindsight_file,
+    );
 
     // ZCode (Z.ai GLM-5.2 ADE) JSONL sessions. Token usage may be embedded
     // from the API response; otherwise estimated from content.
@@ -5252,15 +5278,22 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     counts.set(ClientId::Augment, augment_count);
     messages.extend(augment_msgs);
 
-    let commandcode_msgs: Vec<ParsedMessage> = scan_result
+    // Message-level dedup collapses the `/fork`/`/clone` copies that
+    // Command Code writes as duplicate entries across separate transcript
+    // files. The cached pricing lane above already does this; without the
+    // same filter here, local `tokscale` output double-counts a forked
+    // session while `submit` does not, and the two disagree on the same
+    // machine. Mirrors the augment lane above and the gjc lane below.
+    let commandcode_msgs_raw: Vec<UnifiedMessage> = scan_result
         .get(ClientId::CommandCode)
         .par_iter()
-        .flat_map(|path| {
-            sessions::commandcode::parse_commandcode_file(path)
-                .into_iter()
-                .map(|msg| unified_to_parsed(&msg))
-                .collect::<Vec<_>>()
-        })
+        .flat_map(|path| sessions::commandcode::parse_commandcode_file(path))
+        .collect();
+    let mut commandcode_seen: HashSet<String> = HashSet::new();
+    let commandcode_msgs: Vec<ParsedMessage> = commandcode_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut commandcode_seen, message))
+        .map(|msg| unified_to_parsed(&msg))
         .collect();
     let commandcode_count = commandcode_msgs.len() as i32;
     counts.set(ClientId::CommandCode, commandcode_count);
@@ -5389,6 +5422,21 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     let unsloth_count = summed_parsed_message_count(&unsloth_msgs);
     counts.set(ClientId::Unsloth, unsloth_count);
     messages.extend(unsloth_msgs);
+
+    let hindsight_msgs_raw: Vec<UnifiedMessage> = scan_result
+        .get(ClientId::Hindsight)
+        .par_iter()
+        .flat_map(|path| sessions::hindsight::parse_hindsight_file(path))
+        .collect();
+    let mut hindsight_seen: HashSet<String> = HashSet::new();
+    let hindsight_msgs: Vec<ParsedMessage> = hindsight_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut hindsight_seen, message))
+        .map(|message| unified_to_parsed(&message))
+        .collect();
+    let hindsight_count = summed_parsed_message_count(&hindsight_msgs);
+    counts.set(ClientId::Hindsight, hindsight_count);
+    messages.extend(hindsight_msgs);
 
     let mcode_msgs: Vec<ParsedMessage> = scan_result
         .get(ClientId::Mcode)
@@ -8263,7 +8311,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_unsloth_lane_reads_sqlite_and_invalidates_on_wal_changes() {
+    fn test_unsloth_lane_prices_metered_routes_and_invalidates_on_wal_changes() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
         let _cache_env = redirect_cache_home(cache_home.path());
@@ -8304,7 +8352,7 @@ mod tests {
                     'message-1',
                     'thread-1',
                     'assistant',
-                    '{"contextUsage":{"promptTokens":100,"completionTokens":40,"totalTokens":140,"cachedTokens":25,"modelId":"fixture-local-model"}}',
+                    '{"contextUsage":{"promptTokens":100,"completionTokens":40,"totalTokens":140,"cachedTokens":25,"modelId":"requested-model"},"responseDetails":{"responseModelId":"fixture-local-model","providerType":"openai"}}',
                     1788000000
                 );
                 INSERT INTO api_usage_events (
@@ -8343,9 +8391,20 @@ mod tests {
                 .sum::<i64>(),
             150
         );
-        assert!(cold
+        let chat = cold
             .iter()
-            .all(|message| message.cost == 0.0 && message.has_authoritative_cost()));
+            .find(|message| message.dedup_key.as_deref() == Some("unsloth:chat:message-1"))
+            .unwrap();
+        assert_eq!(chat.provider_id, "openai");
+        assert_eq!(chat.cost, 115.0);
+        assert_eq!(chat.cost_source, sessions::CostSource::Estimated);
+        let api = cold
+            .iter()
+            .find(|message| message.dedup_key.as_deref() == Some("unsloth:api:request-1"))
+            .unwrap();
+        assert_eq!(api.provider_id, "local");
+        assert_eq!(api.cost, 0.0);
+        assert!(api.has_authoritative_cost());
 
         let warm = parse_all_messages_with_pricing(
             source_home.path().to_str().unwrap(),
@@ -8363,7 +8422,7 @@ mod tests {
                 rusqlite::params![
                     "message-2",
                     "thread-1",
-                    r#"{"contextUsage":{"promptTokens":9,"completionTokens":1,"totalTokens":10,"modelId":"fixture-local-model"}}"#,
+                    r#"{"contextUsage":{"promptTokens":9,"completionTokens":1,"totalTokens":10,"modelId":"fixture-local-model"},"responseDetails":{"responseModelId":"fixture-local-model","providerType":"local"}}"#,
                     1_788_000_200_i64,
                 ],
             )
@@ -8383,9 +8442,13 @@ mod tests {
                 .sum::<i64>(),
             160
         );
-        assert!(refreshed
+        let new_local = refreshed
             .iter()
-            .all(|message| message.cost == 0.0 && message.has_authoritative_cost()));
+            .find(|message| message.dedup_key.as_deref() == Some("unsloth:chat:message-2"))
+            .unwrap();
+        assert_eq!(new_local.provider_id, "local");
+        assert_eq!(new_local.cost, 0.0);
+        assert!(new_local.has_authoritative_cost());
     }
 
     /// MiMo Code records carry an authoritative per-message cost. The micode
@@ -11330,6 +11393,100 @@ mod tests {
         }
     }
 
+    /// `/fork` copies the transcript into a new session file, so the same
+    /// assistant entry lands on disk twice. The pricing lane collapses that
+    /// with `should_keep_deduped_message`; this asserts the local lane does
+    /// too, end to end through `parse_local_clients`.
+    ///
+    /// The parser's own `test_fork_copies_share_dedup_key` cannot catch this:
+    /// it re-implements the dedup filter inline instead of exercising the
+    /// caller, so it stayed green while the caller had no filter at all.
+    #[test]
+    #[serial_test::serial]
+    fn test_parse_local_clients_commandcode_counts_deduplicated_forked_history() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+
+        {
+            let projects_dir = client_scan_root(source_home.path(), ClientId::CommandCode);
+            std::fs::create_dir_all(projects_dir.join("proj")).unwrap();
+            let root_dir = projects_dir.parent().unwrap();
+            std::fs::write(
+                root_dir.join("config.json"),
+                r#"{"provider":"command-code","model":"model-x"}"#,
+            )
+            .unwrap();
+
+            // One assistant entry (`a1` at a fixed timestamp), written twice:
+            // once in the original session and once in the fork, where an
+            // extra user turn shifts its position in the file.
+            let assistant = concat!(
+                r#"{"type":"message","id":"a1","parentId":"PARENT","timestamp":"2026-08-31T00:00:05Z","#,
+                r#""message":{"role":"assistant","content":[{"type":"text","text":"answer"}]},"#,
+                r#""usage":{"inputTokens":100,"outputTokens":10,"cacheReadTokens":5,"cacheWriteTokens":0,"costUsd":0.001},"#,
+                r#""model":"model-x"}"#
+            );
+            let original = format!(
+                "{}\n{}\n{}\n",
+                r#"{"type":"session","version":3,"id":"orig-sess"}"#,
+                r#"{"type":"message","id":"u1","parentId":"","timestamp":"2026-08-31T00:00:00Z","message":{"role":"user","content":[{"type":"text","text":"prompt"}]}}"#,
+                assistant.replace("PARENT", "u1"),
+            );
+            let fork = format!(
+                "{}\n{}\n{}\n{}\n",
+                r#"{"type":"session","version":3,"id":"fork-sess"}"#,
+                r#"{"type":"message","id":"u1","parentId":"","timestamp":"2026-08-31T00:00:00Z","message":{"role":"user","content":[{"type":"text","text":"prompt"}]}}"#,
+                r#"{"type":"message","id":"u2","parentId":"u1","timestamp":"2026-08-31T00:00:02Z","message":{"role":"user","content":[{"type":"text","text":"extra turn"}]}}"#,
+                assistant.replace("PARENT", "u2"),
+            );
+            std::fs::write(projects_dir.join("proj").join("orig.jsonl"), original).unwrap();
+            std::fs::write(projects_dir.join("proj").join("fork.jsonl"), fork).unwrap();
+
+            let parsed = parse_local_clients(LocalParseOptions {
+                home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+                use_env_roots: false,
+                clients: Some(vec!["commandcode".to_string()]),
+                since: None,
+                until: None,
+                year: None,
+                scanner_settings: scanner::ScannerSettings::default(),
+            })
+            .unwrap();
+
+            assert_eq!(
+                parsed.counts.get(ClientId::CommandCode),
+                1,
+                "the forked copy of `a1` must not be counted a second time",
+            );
+            assert_eq!(parsed.messages.len(), 1);
+            assert_eq!(
+                parsed
+                    .messages
+                    .iter()
+                    .map(|message| message.input)
+                    .sum::<i64>(),
+                100,
+            );
+            assert_eq!(
+                parsed
+                    .messages
+                    .iter()
+                    .map(|message| message.output)
+                    .sum::<i64>(),
+                10,
+            );
+            assert_eq!(
+                parsed
+                    .messages
+                    .iter()
+                    .map(|message| message.cache_read)
+                    .sum::<i64>(),
+                5,
+            );
+        }
+    }
+
     #[test]
     #[serial_test::serial]
     fn test_codex_cache_reparses_from_zero_when_incremental_prefix_is_stale() {
@@ -12336,6 +12493,58 @@ mod tests {
                 reason: ROUTING_LABEL_UNPRICED_REASON,
             }
         );
+    }
+
+    #[test]
+    fn cursor_routing_label_with_provider_reported_cost_stays_priced() {
+        // End-to-end guard for #1247. `is_routing_label` still refuses to price
+        // the bare label `auto`, so the only thing keeping Cursor's plan-included
+        // rows out of the unpriced bucket is the authoritative cost the parser
+        // reads from `tokenUsage.totalCents`. If a future change stops marking
+        // those rows provider-reported they fall straight through the branch
+        // above: on a real 5,037-row export that was 515 rows and 65,785,639
+        // tokens zeroed across 42 of 116 dates. Pricing is empty here on
+        // purpose — nothing but the reported cost can rescue the row.
+        let pricing = pricing::PricingService::new_with_custom_and_models_dev(
+            pricing::custom::CustomPricing::default(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let mut auto = UnifiedMessage::new(
+            "cursor",
+            "auto",
+            "cursor",
+            "b92fdbf1-36d4-4d78-bd5b-afcb939eab16",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input: 10,
+                output: 5,
+                ..Default::default()
+            },
+            0.062,
+        );
+        auto.mark_provider_reported_cost();
+
+        let graph = build_graph_from_messages(
+            vec![auto],
+            Some(&pricing),
+            GraphPricingRequirement::Submission,
+            std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
+        )
+        .expect("provider-reported routing label must not abort submission");
+
+        assert!(
+            graph.incomplete_cost_dates.is_empty(),
+            "a provider-reported cost must not mark the date incomplete"
+        );
+        assert!(
+            graph.unpriced_submission_usage.is_empty(),
+            "a provider-reported cost must not land in the unpriced bucket"
+        );
+        assert_eq!(graph.summary.total_tokens, 15);
+        assert!((graph.summary.total_cost - 0.062).abs() < 1e-9);
     }
 
     #[test]
