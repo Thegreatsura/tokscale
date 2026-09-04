@@ -72,42 +72,87 @@ beforeEach(() => {
 });
 
 describe("profile moderation notice delivery", () => {
-  it("forwards the notice only to the profile owner", async () => {
-    const notice = {
-      tone: "pending" as const,
-      message: "Your account is currently withheld from the leaderboard pending review.",
-    };
+  const notice = {
+    tone: "pending" as const,
+    title: "Withheld from the leaderboard",
+    message: "This account is withheld from the leaderboard pending review.",
+  };
+
+  it("asks for the owner wording when the viewer owns the profile", async () => {
     getSession.mockResolvedValue({ id: "profile-owner" });
     getModerationNotice.mockResolvedValue(notice);
 
     const page = await renderProfile();
 
-    expect(getModerationNotice).toHaveBeenCalledWith("profile-owner");
+    expect(getModerationNotice).toHaveBeenCalledWith("profile-owner", "owner");
     expect(page.props.moderationNotice).toEqual(notice);
   });
 
-  it("does not look up or forward a notice to anonymous visitors", async () => {
+  it("shows anonymous visitors the public wording", async () => {
     getSession.mockResolvedValue(null);
+    getModerationNotice.mockResolvedValue(notice);
 
     const page = await renderProfile();
 
-    expect(getModerationNotice).not.toHaveBeenCalled();
-    expect(page.props.moderationNotice).toBeNull();
+    expect(getModerationNotice).toHaveBeenCalledWith("profile-owner", "public");
+    expect(page.props.moderationNotice).toEqual(notice);
   });
 
-  it("does not look up or forward a notice to a different authenticated user", async () => {
+  it("shows a different authenticated user the public wording", async () => {
     getSession.mockResolvedValue({ id: "another-user" });
+    getModerationNotice.mockResolvedValue(notice);
 
     const page = await renderProfile();
 
-    expect(getModerationNotice).not.toHaveBeenCalled();
+    expect(getModerationNotice).toHaveBeenCalledWith("profile-owner", "public");
+    expect(page.props.moderationNotice).toEqual(notice);
+  });
+
+  it("falls back to the public wording when the session lookup fails", async () => {
+    // Ownership could not be established, so the safe side is the wording that
+    // does not address the reader as the account holder.
+    getSession.mockRejectedValue(new Error("session store unavailable"));
+    getModerationNotice.mockResolvedValue(notice);
+
+    await renderProfile();
+
+    expect(getModerationNotice).toHaveBeenCalledWith("profile-owner", "public");
+  });
+
+  it("forwards nothing when the account is not hidden", async () => {
+    getSession.mockResolvedValue(null);
+    getModerationNotice.mockResolvedValue(null);
+
+    const page = await renderProfile();
+
     expect(page.props.moderationNotice).toBeNull();
   });
 
-  it("preserves a moderation lookup failure for the page error boundary", async () => {
+  it("preserves a moderation lookup failure for the owner's error boundary", async () => {
     getSession.mockResolvedValue({ id: "profile-owner" });
     getModerationNotice.mockRejectedValue(new Error("database unavailable"));
 
     await expect(renderProfile()).rejects.toThrow("database unavailable");
+  });
+
+  it("keeps a visitor's profile working when the moderation lookup fails", async () => {
+    // This lookup now runs for every viewer, so letting it throw would turn one
+    // unhealthy query into every profile page being down. A visitor loses the
+    // banner and nothing else.
+    getSession.mockResolvedValue({ id: "another-user" });
+    getModerationNotice.mockRejectedValue(new Error("database unavailable"));
+
+    const page = await renderProfile();
+
+    expect(page.props.moderationNotice).toBeNull();
+  });
+
+  it("keeps an anonymous visitor's profile working when the moderation lookup fails", async () => {
+    getSession.mockResolvedValue(null);
+    getModerationNotice.mockRejectedValue(new Error("database unavailable"));
+
+    const page = await renderProfile();
+
+    expect(page.props.moderationNotice).toBeNull();
   });
 });
