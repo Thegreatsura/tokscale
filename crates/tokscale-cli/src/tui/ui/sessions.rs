@@ -1,13 +1,12 @@
 use chrono::{Local, NaiveDateTime, TimeZone};
 use ratatui::prelude::*;
-use ratatui::widgets::{
-    Block, Borders, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, Table,
-};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
 use super::widgets::{
-    display_width, format_cache_hit_rate, format_cost, format_cost_per_million, format_tokens,
-    get_compact_client_display_name, prefix_to_width, total_tokens_cell, truncate_text,
-    truncate_to_width, viewport_scrollbar_state, MIDDLE_ELLIPSIS,
+    ambient_stable_scrollbar, display_width, format_cache_hit_rate, format_cost,
+    format_cost_per_million, format_tokens, get_compact_client_display_name, prefix_to_width,
+    total_tokens_cell, truncate_text, truncate_to_width, viewport_scrollbar_state,
+    AMBIENT_STABLE_BORDER_SET, MIDDLE_ELLIPSIS,
 };
 use crate::tui::app::{App, SortDirection, SortField};
 use crate::tui::data::{SessionModel, SessionUsage};
@@ -167,7 +166,11 @@ impl SessionColumn {
             Self::Output => "Output",
             Self::CacheRead => "Cache R",
             Self::CacheWrite => "Cache W",
-            Self::CacheHit => "Cache×",
+            // U+2715, not U+00D7: the multiplication sign is
+            // East-Asian-Ambiguous and would make the header row stream a
+            // cell wide in a CJK locale; the multiplication X is
+            // East-Asian-Neutral, one cell in both ambients.
+            Self::CacheHit => "Cache✕",
             Self::Total => "Total",
             Self::Cost => "Cost",
             Self::CostPerMillion => "Cost/1M",
@@ -442,7 +445,7 @@ fn admit_and_distribute(available: u16, ctx: &WideCtx) -> WideLayout {
         } else {
             // Stop, don't skip. Trying the next (narrower) group packs more
             // columns in but makes the admitted set non-monotonic in width —
-            // Cache× at W, Duration and no Cache× at W+1 — which is the same
+            // Cache✕ at W, Duration and no Cache✕ at W+1 — which is the same
             // disorientation the ratatui solver produces today.
             break;
         }
@@ -483,6 +486,7 @@ fn session_label(s: &SessionUsage) -> &str {
 pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_set(AMBIENT_STABLE_BORDER_SET)
         .border_style(Style::default().fg(app.theme.border))
         .title(Span::styled(
             " Sessions ",
@@ -552,8 +556,8 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let sort_indicator = |field: SortField| -> &'static str {
         if sort_field == field {
             match sort_direction {
-                SortDirection::Ascending => " ▲",
-                SortDirection::Descending => " ▼",
+                SortDirection::Ascending => " ▴",
+                SortDirection::Descending => " ▾",
             }
         } else {
             ""
@@ -718,9 +722,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(table, inner);
 
     if sessions_len > visible_height {
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(Some("▲"))
-            .end_symbol(Some("▼"));
+        let scrollbar = ambient_stable_scrollbar();
 
         let mut scrollbar_state =
             viewport_scrollbar_state(sessions_len, scroll_offset, visible_height);
@@ -1332,7 +1334,7 @@ mod tests {
     }
 
     /// The active sort arrow is legible whenever its column is admitted, and
-    /// absent from the whole header when it is not. Today `Last Active ▼` is
+    /// absent from the whole header when it is not. Today `Last Active ▾` is
     /// missing at 77 of 121 widths.
     ///
     /// Both directions, because `make_app` fixes the sort to descending and an
@@ -1345,8 +1347,8 @@ mod tests {
         for width in 80u16..=SWEEP_MAX {
             for has_turn in [true, false] {
                 for (direction, arrow) in [
-                    (SortDirection::Descending, '▼'),
-                    (SortDirection::Ascending, '▲'),
+                    (SortDirection::Descending, '▾'),
+                    (SortDirection::Ascending, '▴'),
                 ] {
                     for (field, column) in [
                         (SortField::Cost, SessionColumn::Cost),
@@ -1377,7 +1379,7 @@ mod tests {
                         }
                         // The other glyph must never appear at all — one active
                         // sort, one arrow.
-                        let other = if arrow == '▼' { '▲' } else { '▼' };
+                        let other = if arrow == '▾' { '▴' } else { '▾' };
                         assert!(
                             !header.contains(other),
                             "both arrows drawn at width {width} (turn={has_turn})\n{header}"
@@ -1390,7 +1392,7 @@ mod tests {
 
     /// Widening the terminal never removes a column. `break` in the admission
     /// loop is what buys this: skipping a group that does not fit and trying the
-    /// next, narrower one would show Cache× at W and Duration instead at W+1.
+    /// next, narrower one would show Cache✕ at W and Duration instead at W+1.
     ///
     /// Note what this does **not** cover: it compares header *sets*, so it stays
     /// green through the Session sawtooth (Session is 40 cells at 149 and 20 at
@@ -1708,43 +1710,43 @@ mod tests {
                 59u16,
                 true,
                 SortField::Cost,
-                "│Session                           Cost ▼                 │",
-                "│A fairly long ses...              $12.35                 │",
+                "|Session                           Cost ▾                 |",
+                "|A fairly long ses...              $12.35                 |",
             ),
             (
                 59,
                 true,
                 SortField::Date,
-                "│Session                           Cost                   │",
-                "│A fairly long ses...              $12.35                 │",
+                "|Session                           Cost                   |",
+                "|A fairly long ses...              $12.35                 |",
             ),
             (
                 60,
                 true,
                 SortField::Cost,
-                "│Session     Client     Turn   Msgs    Tokens     Cost ▼   │",
-                "│A fairly lo OpenCode   137    428     49.5M      $12.35   │",
+                "|Session     Client     Turn   Msgs    Tokens     Cost ▾   |",
+                "|A fairly lo OpenCode   137    428     49.5M      $12.35   |",
             ),
             (
                 60,
                 false,
                 SortField::Tokens,
-                "│Session         Client     Msgs    Tokens ▼   Cost        │",
-                "│A fairly long s OpenCode   428     49.5M      $12.35      │",
+                "|Session         Client     Msgs    Tokens ▾   Cost        |",
+                "|A fairly long s OpenCode   428     49.5M      $12.35      |",
             ),
             (
                 79,
                 true,
                 SortField::Tokens,
-                "│Session           Client       Turn      Msgs      Tokens ▼      Cost        │",
-                "│A fairly long ses OpenCode     137       428       49.5M         $12.35      │",
+                "|Session           Client       Turn      Msgs      Tokens ▾      Cost        |",
+                "|A fairly long ses OpenCode     137       428       49.5M         $12.35      |",
             ),
             (
                 79,
                 false,
                 SortField::Date,
-                "│Session               Client         Msgs      Tokens         Cost           │",
-                "│A fairly long session OpenCode       428       49.5M          $12.35         │",
+                "|Session               Client         Msgs      Tokens         Cost           |",
+                "|A fairly long session OpenCode       428       49.5M          $12.35         |",
             ),
         ] {
             let mut s = fat_session();
@@ -1788,7 +1790,7 @@ mod tests {
                     "Output",
                     "Cache R",
                     "Cache W",
-                    "Cache×",
+                    "Cache✕",
                     "Total",
                     "Cost/1M",
                     "Duration",
@@ -1926,7 +1928,7 @@ mod tests {
         let body = render_body(&mut app, 70, 12);
         assert!(body.contains("abc-123"), "expected session id\n{body}");
         assert!(
-            !body.contains("Cache×"),
+            !body.contains("Cache✕"),
             "cache hit rate should be dropped in narrow mode\n{body}"
         );
     }
@@ -1953,7 +1955,7 @@ mod tests {
             app.sort_field = SortField::Tokens;
             let header = header_line(&mut app, 200);
             assert!(
-                header.contains("Total ▼"),
+                header.contains("Total ▾"),
                 "tokens sort indicator misplaced (turn={has_turn})\n{header}"
             );
 
@@ -1961,7 +1963,7 @@ mod tests {
             app.sort_field = SortField::Date;
             let header = header_line(&mut app, 200);
             assert!(
-                header.contains("Last Active ▼"),
+                header.contains("Last Active ▾"),
                 "date sort indicator misplaced (turn={has_turn})\n{header}"
             );
         }
@@ -1976,18 +1978,54 @@ mod tests {
 
     /// `unicode-width` resolves East-Asian-Ambiguous characters to one cell by
     /// default and to two under `width_cjk`, which is what a terminal in a CJK
-    /// locale does. Inside the table border, a row whose only non-ASCII
-    /// character is the truncation marker measures the same in both ambients
-    /// exactly when that marker is not ambiguous; U+2026 fails this, U+22EF
-    /// passes it. The border itself (U+2502) is ambiguous and is trimmed off.
-    fn assert_row_measures_the_same_in_a_cjk_locale(app: &mut App, width: u16) {
-        let row = first_row_line(app, width);
-        let interior = row.trim_matches('\u{2502}');
-        assert_eq!(
-            UnicodeWidthStr::width_cjk(interior),
-            display_width(interior),
-            "the row must measure the same in a CJK locale\n{row:?}"
-        );
+    /// locale does. Ratatui's crossterm backend streams adjacent cells without
+    /// repositioning between them, so any row whose glyphs measure wider under
+    /// `width_cjk` than under `width` overflows the terminal edge when drawn.
+    /// Every row of the rendered frame is asserted whole — borders, corners,
+    /// header, scrollbar column and all, nothing trimmed — so the top and
+    /// bottom edges, the sort indicator, an active scrollbar, and the cell
+    /// contents (truncation marker included: U+2026 fails this, U+22EF passes)
+    /// are all held to the same invariant: the frame measures identically in
+    /// both ambients.
+    fn assert_frame_measures_the_same_in_a_cjk_locale(app: &mut App, width: u16, height: u16) {
+        let frame = render_body(app, width, height);
+        for row in frame.lines() {
+            assert_eq!(
+                UnicodeWidthStr::width_cjk(row),
+                display_width(row),
+                "every row must measure the same in a CJK locale\n{row:?}\n{frame}"
+            );
+        }
+    }
+
+    /// The frame stays width-stable while scrolled: with more sessions than
+    /// fit, the scrollbar overlays the outermost right column — endpoints on
+    /// the first and last inner rows, thumb and track between — which is
+    /// exactly where a glyph that streams two cells wide in a CJK locale
+    /// wraps into the next row, or scrolls the screen when it lands near the
+    /// bottom. A CJK session title exercises the content path too: W-class
+    /// glyphs are two cells in both ambients, so they keep the equality.
+    #[test]
+    fn scrolled_frame_measures_the_same_in_a_cjk_locale() {
+        let width = MODEL_WIDTH_22_TERMINAL;
+        let sessions: Vec<SessionUsage> = (0..30)
+            .map(|i| {
+                let mut s = session(
+                    &format!("session-{i}"),
+                    "opencode",
+                    i as f64,
+                    1_736_000_000_000 + i as i64 * 60_000,
+                );
+                if i == 29 {
+                    // Sorted by cost descending, so the CJK title is on the
+                    // first visible row.
+                    s.title = Some("한국어 세션 제목".to_string());
+                }
+                s
+            })
+            .collect();
+        let mut app = app_with(width, sessions);
+        assert_frame_measures_the_same_in_a_cjk_locale(&mut app, width, 8);
     }
 
     /// A session that switched models must never render as a single-model
@@ -2016,7 +2054,7 @@ mod tests {
             body.contains("gemini-2-5-flash-lite⋯"),
             "expected a truncation marker after the model that did fit\n{body}"
         );
-        assert_row_measures_the_same_in_a_cjk_locale(&mut app, width);
+        assert_frame_measures_the_same_in_a_cjk_locale(&mut app, width, 12);
         assert!(
             !body.contains("claude"),
             "second model was not supposed to fit at width {width}\n{body}"
@@ -2045,7 +2083,7 @@ mod tests {
             !body.contains("⋯⋯"),
             "truncated name must not pick up a second ellipsis\n{body}"
         );
-        assert_row_measures_the_same_in_a_cjk_locale(&mut app, width);
+        assert_frame_measures_the_same_in_a_cjk_locale(&mut app, width, 12);
     }
 
     #[test]

@@ -1,17 +1,17 @@
 use chrono::{Local, Timelike};
 use ratatui::prelude::*;
-use ratatui::widgets::{
-    Block, Borders, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, Table,
-};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
 use super::widgets::{
-    format_cache_hit_rate, format_cost, format_tokens, total_tokens_cell, viewport_scrollbar_state,
+    ambient_stable_scrollbar, format_cache_hit_rate, format_cost, format_tokens, total_tokens_cell,
+    viewport_scrollbar_state, AMBIENT_STABLE_BORDER_SET,
 };
 use crate::tui::app::{App, SortDirection, SortField};
 
 pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_set(AMBIENT_STABLE_BORDER_SET)
         .border_style(Style::default().fg(app.theme.border))
         .title(Span::styled(
             " Minutely Usage ",
@@ -67,12 +67,12 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     } else if has_turn_data {
         vec![
-            "Minute", "Source", "Turn", "Msgs", "Input", "Output", "Cache R", "Cache W", "Cache×",
+            "Minute", "Source", "Turn", "Msgs", "Input", "Output", "Cache R", "Cache W", "Cache✕",
             "Total", "Cost",
         ]
     } else {
         vec![
-            "Minute", "Source", "Msgs", "Input", "Output", "Cache R", "Cache W", "Cache×", "Total",
+            "Minute", "Source", "Msgs", "Input", "Output", "Cache R", "Cache W", "Cache✕", "Total",
             "Cost",
         ]
     };
@@ -80,8 +80,8 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let sort_indicator = |field: SortField| -> &'static str {
         if sort_field == field {
             match sort_direction {
-                SortDirection::Ascending => " ▲",
-                SortDirection::Descending => " ▼",
+                SortDirection::Ascending => " ▴",
+                SortDirection::Descending => " ▾",
             }
         } else {
             ""
@@ -284,9 +284,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(table, inner);
 
     if minutely_len > visible_height {
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(Some("▲"))
-            .end_symbol(Some("▼"));
+        let scrollbar = ambient_stable_scrollbar();
 
         let mut scrollbar_state =
             viewport_scrollbar_state(minutely_len, scroll_offset, visible_height);

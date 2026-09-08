@@ -10,7 +10,7 @@
 //! The clients differ only in *policy* (which tables exist, how duplicates
 //! collapse, whether epochs are seconds or milliseconds, which fallbacks
 //! apply). Every such difference is an explicit field on
-//! [`OpenCodeSchemaConfig`], which is `Copy` and built from a per-client
+//! `OpenCodeSchemaConfig`, which is `Copy` and built from a per-client
 //! `const fn` constructor. The driver is a plain `fn` taking that config by
 //! value rather than a generic over the message type or the row callback:
 //! generics would monomorphize per client and *grow* the binary, which is the
@@ -24,6 +24,19 @@ use super::{
     normalize_opencode_agent_name, normalize_workspace_key, workspace_label_from_key,
     UnifiedMessage,
 };
+
+/// Shared base parser version for the OpenCode SQLite session-schema driver.
+///
+/// OpenCode, MiMo Code, and Kilo all read their SQLite stores through
+/// [`parse_opencode_schema_sqlite`], so a change to this driver (or to the
+/// shared `Deserialize` types it ingests) alters what byte-identical
+/// databases parse to for every adopter at once. Bump this base when that
+/// happens; `message_cache::parser_version()` derives each member's version
+/// from it (base plus a per-client offset that preserves independent history)
+/// so no member can be left serving stale cache entries. Per-client policy
+/// differences live in [`OpenCodeSchemaConfig`]; a change scoped to one
+/// client's config belongs in that client's offset instead.
+pub(crate) const OPENCODE_SCHEMA_PARSER_BASE_VERSION: u32 = 1;
 use crate::{provider_identity, TokenBreakdown};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -39,7 +52,7 @@ use std::path::Path;
 /// The shape is the permissive union of every variant the OpenCode-schema
 /// clients emit: a field that is mandatory for one client is optional here, and
 /// the per-client strictness is re-applied at parse time from
-/// [`OpenCodeSchemaConfig`]. Keeping the strictness in the config rather than in
+/// `OpenCodeSchemaConfig`. Keeping the strictness in the config rather than in
 /// the type is what lets one `Deserialize` impl serve all three clients without
 /// changing what any of them accept.
 #[derive(Debug, Deserialize)]
@@ -145,7 +158,7 @@ pub struct OpenCodeSchemaTokens {
     pub output: i64,
     pub reasoning: Option<i64>,
     /// Optional in the union type. Clients that require a well-formed cache
-    /// object set [`OpenCodeSchemaConfig::strict_cache`], which restores the
+    /// object set `OpenCodeSchemaConfig::strict_cache`, which restores the
     /// drop-the-message behaviour their own derive used to produce.
     #[serde(default)]
     pub cache: Option<OpenCodeSchemaCache>,

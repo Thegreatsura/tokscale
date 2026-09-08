@@ -1,13 +1,11 @@
 use chrono::Local;
 use ratatui::prelude::*;
-use ratatui::widgets::{
-    Block, Borders, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, Table,
-};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
 use super::widgets::{
-    format_cache_hit_rate, format_cost, format_cost_per_million, format_tokens,
-    get_client_display_name, get_provider_display_name, total_tokens_cell, truncate_text,
-    viewport_scrollbar_state,
+    ambient_stable_scrollbar, format_cache_hit_rate, format_cost, format_cost_per_million,
+    format_tokens, get_client_display_name, get_provider_display_name, total_tokens_cell,
+    truncate_text, viewport_scrollbar_state, AMBIENT_STABLE_BORDER_SET,
 };
 use crate::tui::app::{App, SortDirection, SortField};
 
@@ -19,6 +17,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_set(AMBIENT_STABLE_BORDER_SET)
         .border_style(Style::default().fg(app.theme.border))
         .title(Span::styled(
             " Daily Usage ",
@@ -88,12 +87,12 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     } else if has_turn_data {
         vec![
-            "Date", "Turn", "Msgs", "Input", "Output", "Cache R", "Cache W", "Cache×", "Total",
+            "Date", "Turn", "Msgs", "Input", "Output", "Cache R", "Cache W", "Cache✕", "Total",
             "Cost", "Cost/1M",
         ]
     } else {
         vec![
-            "Date", "Msgs", "Input", "Output", "Cache R", "Cache W", "Cache×", "Total", "Cost",
+            "Date", "Msgs", "Input", "Output", "Cache R", "Cache W", "Cache✕", "Total", "Cost",
             "Cost/1M",
         ]
     };
@@ -101,8 +100,8 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let sort_indicator = |field: SortField| -> &'static str {
         if sort_field == field {
             match sort_direction {
-                SortDirection::Ascending => " ▲",
-                SortDirection::Descending => " ▼",
+                SortDirection::Ascending => " ▴",
+                SortDirection::Descending => " ▾",
             }
         } else {
             ""
@@ -292,9 +291,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(table, inner);
 
     if daily_len > visible_height {
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(Some("▲"))
-            .end_symbol(Some("▼"));
+        let scrollbar = ambient_stable_scrollbar();
 
         let mut scrollbar_state =
             viewport_scrollbar_state(daily_len, scroll_offset, visible_height);
@@ -318,6 +315,7 @@ fn render_detail(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_set(AMBIENT_STABLE_BORDER_SET)
         .border_style(Style::default().fg(app.theme.border))
         .title(Span::styled(
             title,
@@ -365,15 +363,15 @@ fn render_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         vec![
             "#", "Model", "Provider", "Source", "Msgs", "Input", "Output", "Cache R", "Cache W",
-            "Cache×", "Total", "Cost",
+            "Cache✕", "Total", "Cost",
         ]
     };
 
     let sort_indicator = |field: SortField| -> &'static str {
         if sort_field == field {
             match sort_direction {
-                SortDirection::Ascending => " ▲",
-                SortDirection::Descending => " ▼",
+                SortDirection::Ascending => " ▴",
+                SortDirection::Descending => " ▾",
             }
         } else {
             ""
@@ -517,9 +515,7 @@ fn render_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(table, inner);
 
     if detail_len > visible_height {
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(Some("▲"))
-            .end_symbol(Some("▼"));
+        let scrollbar = ambient_stable_scrollbar();
 
         let mut scrollbar_state =
             viewport_scrollbar_state(detail_len, scroll_offset, visible_height);

@@ -1,13 +1,12 @@
 use chrono::{Local, NaiveDateTime, TimeZone};
 use ratatui::prelude::*;
-use ratatui::widgets::{
-    Block, Borders, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, Table,
-};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
 use super::widgets::{
-    display_width, fit_workspace_label_to_width, format_cost, format_tokens,
-    get_compact_client_display_name, prefix_to_width, total_tokens_cell, truncate_text,
-    truncate_to_width, viewport_scrollbar_state, MIDDLE_ELLIPSIS,
+    ambient_stable_scrollbar, display_width, fit_workspace_label_to_width, format_cost,
+    format_tokens, get_compact_client_display_name, prefix_to_width, total_tokens_cell,
+    truncate_text, truncate_to_width, viewport_scrollbar_state, AMBIENT_STABLE_BORDER_SET,
+    MIDDLE_ELLIPSIS,
 };
 use crate::tui::app::{App, SortDirection, SortField};
 use crate::tui::data::{ProjectUsage, SessionModel};
@@ -210,6 +209,7 @@ fn sources_label(p: &ProjectUsage) -> String {
 pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_set(AMBIENT_STABLE_BORDER_SET)
         .border_style(Style::default().fg(app.theme.border))
         .title(Span::styled(
             " Projects ",
@@ -246,8 +246,8 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let sort_indicator = |field: SortField| -> &'static str {
         if sort_field == field {
             match sort_direction {
-                SortDirection::Ascending => " ▲",
-                SortDirection::Descending => " ▼",
+                SortDirection::Ascending => " ▴",
+                SortDirection::Descending => " ▾",
             }
         } else {
             ""
@@ -385,9 +385,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(table, inner);
 
     if projects_len > visible_height {
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(Some("▲"))
-            .end_symbol(Some("▼"));
+        let scrollbar = ambient_stable_scrollbar();
 
         let mut scrollbar_state =
             viewport_scrollbar_state(projects_len, scroll_offset, visible_height);
@@ -614,7 +612,7 @@ mod tests {
             let body = render_body(&mut app, width, 6);
             let header = body.lines().nth(1).unwrap();
             let row = body.lines().nth(2).unwrap();
-            for label in ["Project", "Sessions", "Total", "Cost ▼"] {
+            for label in ["Project", "Sessions", "Total", "Cost ▾"] {
                 assert!(header.contains(label), "at {width} columns: {header}");
             }
             assert!(!header.contains("Models"), "at {width} columns: {header}");

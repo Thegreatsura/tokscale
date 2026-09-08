@@ -1,5 +1,6 @@
 use ratatui::prelude::*;
-use ratatui::widgets::{Cell, ScrollbarState};
+use ratatui::symbols::border::Set as BorderSet;
+use ratatui::widgets::{Cell, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use tokscale_core::sessions::WORKTREE_SEPARATOR;
 use tokscale_core::ClientId;
 use unicode_segmentation::UnicodeSegmentation;
@@ -91,6 +92,24 @@ pub fn format_ms_per_1k(ms_per_1k_tokens: Option<f64>) -> String {
     }
 }
 
+/// Vertical scrollbar drawn only from width-stable glyphs, for the same
+/// reason as [`AMBIENT_STABLE_BORDER_SET`]: ratatui's defaults — `║` track,
+/// `█` thumb, `▲`/`▼` endpoints — are all East-Asian-Ambiguous, and the
+/// scrollbar overlays the frame's outermost right column, exactly where a
+/// glyph that streams two cells wide in a CJK locale wraps into the next row
+/// (or scrolls the screen from the bottom row). The endpoints and thumb are
+/// East-Asian-Neutral (U+25B4/U+25BE/U+25AE) — one cell under both `width`
+/// and `width_cjk`, the same class as the U+22EF truncation marker — and the
+/// track is ASCII. Every scrollbar goes through here so no caller
+/// reintroduces a default symbol.
+pub fn ambient_stable_scrollbar() -> Scrollbar<'static> {
+    Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(Some("\u{25B4}")) // ▴
+        .end_symbol(Some("\u{25BE}")) // ▾
+        .track_symbol(Some("|"))
+        .thumb_symbol("\u{25AE}") // ▮
+}
+
 pub fn viewport_scrollbar_state(
     content_len: usize,
     scroll_offset: usize,
@@ -133,6 +152,36 @@ pub fn truncate_text(s: &str, max_chars: usize) -> String {
 pub fn display_width(s: &str) -> usize {
     UnicodeWidthStr::width(s)
 }
+
+/// Box-drawing border for every framed block, built entirely from ASCII.
+///
+/// Every code point in ratatui's default sets (PLAIN, ROUNDED, DOUBLE, …) is
+/// East-Asian-Ambiguous: one cell to `unicode-width` — and to ratatui's own
+/// cell math — but two cells in a terminal running a CJK locale. Ratatui's
+/// crossterm backend streams adjacent buffer cells without repositioning
+/// between them, so every ambiguous glyph makes the emitted row one physical
+/// cell wider than the buffer believes; the overflow pushes the rest of the
+/// row past the terminal edge, wrapping onto — or, on the last row, scrolling
+/// — the line below while the diff buffer still thinks nothing moved. `│` `─`
+/// `┌` are exactly the same class of bug as the U+2026 ellipsis fixed in
+/// #1304, just drawn by the frame instead of the content. That includes the
+/// horizontals: a top or bottom edge drawn with `─` emits at roughly twice
+/// the row width, and the footer's bottom border sits on the terminal's last
+/// row where the wrap becomes a scroll. Unicode assigns no unambiguous light
+/// horizontal — the dashes U+2010..U+2015 are all Ambiguous as well — so the
+/// horizontal is ASCII `-` like every other member: one cell in every
+/// terminal, so a frame measures the same in both ambients and the table's
+/// width budget holds.
+pub const AMBIENT_STABLE_BORDER_SET: BorderSet = BorderSet {
+    vertical_left: "|",
+    vertical_right: "|",
+    horizontal_top: "-",
+    horizontal_bottom: "-",
+    top_left: "+",
+    top_right: "+",
+    bottom_left: "+",
+    bottom_right: "+",
+};
 
 /// Longest prefix of `s` that fits in `max_cells` terminal cells. Never splits
 /// a grapheme, so the result can come in one cell short of the budget rather

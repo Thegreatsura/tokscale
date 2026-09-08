@@ -1,12 +1,11 @@
 use ratatui::prelude::*;
-use ratatui::widgets::{
-    Block, Borders, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, Table,
-};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
 use super::widgets::{
-    fit_workspace_label_to_width, format_cache_hit_rate, format_cost, format_cost_per_million,
-    format_ms_per_1k, format_tokens, get_client_display_name, get_provider_display_name,
-    total_tokens_cell, truncate_text, truncate_to_width, viewport_scrollbar_state,
+    ambient_stable_scrollbar, fit_workspace_label_to_width, format_cache_hit_rate, format_cost,
+    format_cost_per_million, format_ms_per_1k, format_tokens, get_client_display_name,
+    get_provider_display_name, total_tokens_cell, truncate_text, truncate_to_width,
+    viewport_scrollbar_state, AMBIENT_STABLE_BORDER_SET,
 };
 use crate::tui::app::{App, SortDirection, SortField};
 use tokscale_core::GroupBy;
@@ -114,6 +113,7 @@ fn model_display_name(model: &crate::tui::data::ModelUsage, group_by: &GroupBy) 
 pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_set(AMBIENT_STABLE_BORDER_SET)
         .border_style(Style::default().fg(app.theme.border))
         .title(Span::styled(
             " Models ",
@@ -178,7 +178,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         ]
     } else {
         vec![
-            "#", "Model", "Provider", "Source", "Input", "Output", "Cache R", "Cache W", "Cache×",
+            "#", "Model", "Provider", "Source", "Input", "Output", "Cache R", "Cache W", "Cache✕",
             "Total", "ms/1K", "Cost", "Cost/1M",
         ]
     };
@@ -186,8 +186,8 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let sort_indicator = |field: SortField| -> &'static str {
         if sort_field == field {
             match sort_direction {
-                SortDirection::Ascending => " ▲",
-                SortDirection::Descending => " ▼",
+                SortDirection::Ascending => " ▴",
+                SortDirection::Descending => " ▾",
             }
         } else {
             ""
@@ -391,9 +391,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(table, inner);
 
     if models_len > visible_height {
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(Some("▲"))
-            .end_symbol(Some("▼"));
+        let scrollbar = ambient_stable_scrollbar();
 
         let mut scrollbar_state =
             viewport_scrollbar_state(models_len, scroll_offset, visible_height);
