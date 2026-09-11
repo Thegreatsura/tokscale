@@ -1527,3 +1527,106 @@ describe("droid parser high-water", () => {
     expect(plan.increments).toEqual({});
   });
 });
+
+describe("unverified retention floor", () => {
+  function floored(
+    state: ParserClientHighWaterState,
+    incomingDays: Record<string, ClientBreakdownData>,
+    retentionFloor?: string
+  ) {
+    return planParserHighWaterSubmission({
+      client: "copilot",
+      incomingVersion: 2,
+      fullHistory: true,
+      retentionFloor,
+      existingLegacyDays: {},
+      incomingDays,
+      state,
+    });
+  }
+
+  const credited = baseline(
+    {},
+    snapshot(contribution("2026-07-01", 100), contribution("2026-07-02", 200))
+  ).nextState!;
+
+  it("keeps the lifetime bound when an unverified floor advances with a re-dated snapshot", () => {
+    const plan = floored(
+      credited,
+      snapshot(contribution("2026-08-01", 300)),
+      "2026-08-01"
+    );
+
+    expect(plan.mode).toBe("incremental");
+    expectCreditedNothing(plan);
+    expect(plan.nextState?.aggregate.tokens).toBe(300);
+  });
+
+  it("does not let an unverified floor erase a token deficit", () => {
+    const plan = floored(
+      credited,
+      snapshot(contribution("2026-08-01", 50)),
+      "2026-08-01"
+    );
+
+    expect(plan.mode).toBe("incremental");
+    expectCreditedNothing(plan);
+    expect(plan.highWaterDeficit).toBe(250);
+  });
+
+  it("does not let a floor remove a subset of credited days from the baseline", () => {
+    const plan = floored(
+      credited,
+      snapshot(contribution("2026-07-02", 200), contribution("2026-08-01", 50)),
+      "2026-07-02"
+    );
+
+    expectCreditedNothing(plan);
+    expect(plan.nextState?.aggregate.tokens).toBe(300);
+  });
+
+  it("does not re-credit a known day under an unverified floor", () => {
+    const plan = floored(
+      credited,
+      snapshot(contribution("2026-07-01", 100), contribution("2026-07-02", 200)),
+      "2026-08-01"
+    );
+
+    expectCreditedNothing(plan);
+    expect(plan.nextState?.aggregate.tokens).toBe(300);
+  });
+
+  it("keeps the lifetime bound for a re-dated snapshot with an unverified floor", () => {
+    const plan = floored(
+      credited,
+      snapshot(contribution("2026-07-01", 100), contribution("2026-08-01", 200)),
+      "2026-07-02"
+    );
+    expectCreditedNothing(plan);
+    expect(plan.nextState?.aggregate.tokens).toBe(300);
+  });
+
+  it("keeps the lifetime bound at a legacy transition with an unverified floor", () => {
+    const plan = planParserHighWaterSubmission({
+      client: "copilot",
+      incomingVersion: 2,
+      fullHistory: true,
+      retentionFloor: "2026-07-02",
+      existingLegacyDays: credited.days,
+      incomingDays: snapshot(contribution("2026-07-01", 100), contribution("2026-08-01", 200)),
+    });
+    expect(plan.mode).toBe("baseline-legacy");
+    expectCreditedNothing(plan);
+    expect(plan.nextState?.aggregate.tokens).toBe(300);
+  });
+
+  it("does not let an unverified floor unfreeze a partial snapshot", () => {
+    const plan = planParserHighWaterSubmission({
+      client: "copilot", incomingVersion: 2, fullHistory: false,
+      retentionFloor: "2026-09-01", existingLegacyDays: {},
+      incomingDays: snapshot(contribution("2026-09-01", 50)), state: credited,
+    });
+    expect(plan.mode).toBe("freeze");
+    expect(plan.increments).toEqual({});
+  });
+});

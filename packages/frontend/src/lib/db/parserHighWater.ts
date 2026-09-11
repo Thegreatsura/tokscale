@@ -128,10 +128,9 @@ export interface ParserHighWaterPlan {
   layoutDays?: Record<string, ClientBreakdownData>;
   nextState?: ParserClientHighWaterState;
   /**
-   * Lifetime tokens the credited ledger holds beyond what this snapshot
-   * reports. Positive means no growth was allocatable and none can be until
-   * the parser reports at least this much more, which is indistinguishable
-   * from a re-attribution and so is never credited.
+   * Tokens the credited lifetime baseline holds beyond this snapshot. Positive
+   * means no token growth is allocatable; messages have an independent budget
+   * and can still advance.
    */
   highWaterDeficit?: number;
 }
@@ -457,16 +456,25 @@ function allocateIncrements(
   previousAggregate: ParserAggregateHighWater,
   incomingAggregate: ParserAggregateHighWater
 ): Record<string, ClientBreakdownData> {
+  // Keep the complete credited lifetime in the budget. A client-reported
+  // retention boundary cannot prove that a missing old cell was pruned rather
+  // than re-dated into this snapshot, so excluding it could credit it twice.
   let tokenBudget = positive(incomingAggregate.tokens - previousAggregate.tokens);
   let messageBudget = positive(
     incomingAggregate.messages - previousAggregate.messages
   );
+  // Per-cell capacity below still reads the FULL credited ledger, so a
+  // re-reported day cannot be credited twice.
   const previousObservedAggregate = aggregateSnapshot(previousObservedDays);
   const inclusiveInputBudget = positive(
     incomingAggregate.inputIncludingCacheRead -
       previousObservedAggregate.inputIncludingCacheRead
   );
-  const dates = Object.keys(incomingDays).sort((a, b) => b.localeCompare(a));
+  // Residual allocation is intentionally newest-first. ISO day keys sort by
+  // code point, avoiding a host's default locale changing which cell wins.
+  const dates = Object.keys(incomingDays).sort((a, b) =>
+    a === b ? 0 : a < b ? 1 : -1
+  );
   const cells = dates.flatMap((date) => {
     const incoming = incomingDays[date];
     const creditedModels = modelsForHighWater(
@@ -695,6 +703,12 @@ export function planParserHighWaterSubmission(args: {
   client: string;
   incomingVersion?: number;
   fullHistory: boolean;
+  /**
+   * Client-reported earliest `YYYY-MM-DD` still retained locally. It is
+   * preserved for the submission protocol but cannot relax the high-water
+   * without server-verifiable evidence of that retention transition.
+   */
+  retentionFloor?: string;
   existingLegacyDays: Record<string, ClientBreakdownData>;
   incomingDays: Record<string, ClientBreakdownData>;
   state?: ParserClientHighWaterState;
