@@ -2652,7 +2652,11 @@ fn parse_all_messages_streaming<S: MessageSink>(
         }
     }
 
-    parse_cached_lane(
+    // Pi branch/fork copies prior assistant records into a new session file
+    // (#1306). The parser stamps cross-session keys (`responseId` preferred);
+    // this lane drops the copies — first-wins in scan order, same key survives
+    // warm cache hits.
+    parse_cached_lane_deduped(
         &scan_result,
         &mut source_cache,
         pricing,
@@ -2733,7 +2737,9 @@ fn parse_all_messages_streaming<S: MessageSink>(
         }
     }
 
-    parse_cached_lane(
+    // Senpi and Omp share the Pi record format and its fork-copy behavior
+    // (#1306); dedup the same way as the Pi lane.
+    parse_cached_lane_deduped(
         &scan_result,
         &mut source_cache,
         pricing,
@@ -2742,7 +2748,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         sessions::senpi::parse_senpi_file,
     );
 
-    parse_cached_lane(
+    parse_cached_lane_deduped(
         &scan_result,
         &mut source_cache,
         pricing,
@@ -5594,15 +5600,19 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     counts.set(ClientId::OpenClaw, openclaw_count);
     messages.extend(openclaw_msgs);
 
-    let pi_msgs: Vec<ParsedMessage> = scan_result
+    // Pi branch/fork copies prior assistant records into a new session file
+    // (#1306); the parser stamps cross-session keys, drop the copies here too
+    // so the export/submission totals match the live scan.
+    let pi_msgs_raw: Vec<UnifiedMessage> = scan_result
         .get(ClientId::Pi)
         .par_iter()
-        .flat_map(|path| {
-            sessions::pi::parse_pi_file(path)
-                .into_iter()
-                .map(|msg| unified_to_parsed(&msg))
-                .collect::<Vec<_>>()
-        })
+        .flat_map(|path| sessions::pi::parse_pi_file(path))
+        .collect();
+    let mut pi_seen: HashSet<String> = HashSet::new();
+    let pi_msgs: Vec<ParsedMessage> = pi_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut pi_seen, message))
+        .map(|message| unified_to_parsed(&message))
         .collect();
     let pi_count = pi_msgs.len() as i32;
     counts.set(ClientId::Pi, pi_count);
@@ -5665,29 +5675,31 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     counts.set(ClientId::Reasonix, reasonix_count);
     messages.extend(reasonix_msgs);
 
-    let senpi_msgs: Vec<ParsedMessage> = scan_result
+    let senpi_msgs_raw: Vec<UnifiedMessage> = scan_result
         .get(ClientId::Senpi)
         .par_iter()
-        .flat_map(|path| {
-            sessions::senpi::parse_senpi_file(path)
-                .into_iter()
-                .map(|msg| unified_to_parsed(&msg))
-                .collect::<Vec<_>>()
-        })
+        .flat_map(|path| sessions::senpi::parse_senpi_file(path))
+        .collect();
+    let mut senpi_seen: HashSet<String> = HashSet::new();
+    let senpi_msgs: Vec<ParsedMessage> = senpi_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut senpi_seen, message))
+        .map(|message| unified_to_parsed(&message))
         .collect();
     let senpi_count = senpi_msgs.len() as i32;
     counts.set(ClientId::Senpi, senpi_count);
     messages.extend(senpi_msgs);
 
-    let omp_msgs: Vec<ParsedMessage> = scan_result
+    let omp_msgs_raw: Vec<UnifiedMessage> = scan_result
         .get(ClientId::Omp)
         .par_iter()
-        .flat_map(|path| {
-            sessions::omp::parse_omp_file(path)
-                .into_iter()
-                .map(|msg| unified_to_parsed(&msg))
-                .collect::<Vec<_>>()
-        })
+        .flat_map(|path| sessions::omp::parse_omp_file(path))
+        .collect();
+    let mut omp_seen: HashSet<String> = HashSet::new();
+    let omp_msgs: Vec<ParsedMessage> = omp_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut omp_seen, message))
+        .map(|message| unified_to_parsed(&message))
         .collect();
     let omp_count = omp_msgs.len() as i32;
     counts.set(ClientId::Omp, omp_count);
@@ -10053,6 +10065,68 @@ mod tests {
             assert_eq!(messages.len(), 4);
             assert_eq!(messages.iter().map(|m| m.tokens.input).sum::<i64>(), 40);
             assert_eq!(messages.iter().map(|m| m.tokens.output).sum::<i64>(), 5);
+        }
+    }
+
+    /// Regression for the PR #1323 review question: when two Pi session files
+    /// carry the same `responseId` with CONFLICTING usage (a fork copy that
+    /// drifted), the surviving copy must be the first one in scan-path order,
+    /// deterministically — not an arbitrary one. The scanner sorts paths
+    /// (`scanner.rs` "Sort for deterministic ordering"), rayon
+    /// `par_iter().flat_map().collect()` preserves that order (doc-tested
+    /// upstream; `ListReducer` appends right after left), and the dedup filter
+    /// runs sequentially over the result. This test would flake if any of
+    /// those three legs were unordered.
+    #[test]
+    #[serial_test::serial]
+    fn test_parse_local_clients_pi_conflicting_fork_copies_first_wins() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+
+        let sessions_dir = source_home.path().join(".pi/agent/sessions/--fixture--");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let record = |session: &str, input: i64, output: i64| {
+            let total = input + output;
+            format!(
+                r#"{{"type":"session","id":"{session}","timestamp":"2026-09-06T12:00:00.000Z","cwd":"/tmp/demo"}}"#,
+            ) + "\n"
+                + &format!(
+                    r#"{{"type":"message","id":"entry-fork-copy","parentId":"{session}","timestamp":"2026-09-06T12:00:00.000Z","message":{{"role":"assistant","provider":"openai-codex","model":"gpt-6-astra","responseId":"resp-demo-fork","usage":{{"input":{input},"output":{output},"cacheRead":0,"cacheWrite":0,"totalTokens":{total}}}}}}}"#
+                )
+                + "\n"
+        };
+        // Sorted scan order: session-a.jsonl (input 100) before
+        // session-b.jsonl (input 999, conflicting usage, same responseId).
+        std::fs::write(
+            sessions_dir.join("session-a.jsonl"),
+            record("session-a", 100, 20),
+        )
+        .unwrap();
+        std::fs::write(
+            sessions_dir.join("session-b.jsonl"),
+            record("session-b", 999, 999),
+        )
+        .unwrap();
+
+        // Repeat to smoke out any order nondeterminism in the parallel
+        // parse + flatten: every run must keep session-a's copy.
+        for _ in 0..25 {
+            let parsed = parse_local_clients(LocalParseOptions {
+                home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+                use_env_roots: false,
+                clients: Some(vec!["pi".to_string()]),
+                since: None,
+                until: None,
+                year: None,
+                scanner_settings: scanner::ScannerSettings::default(),
+            })
+            .unwrap();
+
+            assert_eq!(parsed.counts.get(ClientId::Pi), 1);
+            assert_eq!(parsed.messages.len(), 1);
+            assert_eq!(parsed.messages[0].input, 100);
+            assert_eq!(parsed.messages[0].output, 20);
         }
     }
 
