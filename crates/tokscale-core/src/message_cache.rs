@@ -1281,7 +1281,13 @@ fn parser_version(client: ClientId) -> u32 {
         // the openclaw lane matches OpenClaw's per-turn mirror rows against;
         // an entry without it would let a mirror row count beside the
         // rollout's own record of the same turn.
-        ClientId::Codex => 8,
+        // v8->v9: agent attribution no longer carries the per-thread random
+        // `agent_nickname`; messages bucket into "Codex" / "Codex Subagent" /
+        // "Codex Guardian" / "Codex Headless", and the cached parse state gained
+        // `session_is_subagent` and `session_is_guardian`. A v8 entry would keep
+        // replaying one Agents row per nickname (or no agent at all), and its
+        // parse state predates the new layout.
+        ClientId::Codex => 9,
         // v4->v5: jcode's assistant-message timestamp is now back-calculated
         // to the turn start (timestamp - tool_duration_ms) instead of using
         // the recorded (end-anchored) timestamp directly. Follow-up to #890.
@@ -1363,7 +1369,12 @@ fn parser_version(client: ClientId) -> u32 {
         // anchoring the message in a pre-epoch bucket.
         // Workspace indexes are applied after the cache read and do not
         // change the persisted parser output.
-        ClientId::Kimi => 4,
+        // v4->v5: kimi-code messages now carry `duration_ms` derived from the
+        // preceding llm.request timestamp and, when paired, are anchored at that
+        // request's start. Untouched wire files keep valid fingerprints, so a
+        // warm v4 entry would keep replaying rows with no duration sample and
+        // the ms/1K column would stay empty for them.
+        ClientId::Kimi => 5,
         // v1->v2: cache-write now maps directly from `Input (w/ Cache Write)`
         // instead of subtracting `Input (w/o Cache Write)`, and a numeric CSV
         // `Cost` (including explicit zero) is retained as provider-reported so
@@ -3514,10 +3525,13 @@ mod tests {
     #[test]
     fn test_codex_duration_parser_version_invalidates_v4_entries() {
         // v6->v7 splits `reasoning_output_tokens` out of the Codex output
-        // bucket, and v7->v8 retags rollouts OpenClaw originated as openclaw.
+        // bucket, v7->v8 retags rollouts OpenClaw originated as openclaw, and
+        // v8->v9 buckets agent attribution into "Codex" / "Codex Subagent" /
+        // "Codex Guardian" / "Codex Headless" instead of the per-thread random
+        // nickname.
         // Each bump is what stops an existing cache from replaying the old
         // rows, so it has to be asserted rather than assumed.
-        assert_eq!(parser_version(ClientId::Codex), 8);
+        assert_eq!(parser_version(ClientId::Codex), 9);
         assert_eq!(parser_version(ClientId::Claude), 2);
     }
 
@@ -3549,13 +3563,13 @@ mod tests {
     }
 
     #[test]
-    fn test_kimi_parser_version_invalidates_v3_entries() {
-        assert_eq!(parser_version(ClientId::Kimi), 4);
+    fn test_kimi_parser_version_invalidates_v4_entries() {
+        assert_eq!(parser_version(ClientId::Kimi), 5);
     }
 
     #[test]
     #[serial_test::serial]
-    fn test_kimi_v4_cache_reused_with_current_workspace_metadata() {
+    fn test_kimi_v5_cache_reused_with_current_workspace_metadata() {
         let cache_home = TempDir::new().unwrap();
         let source_home = TempDir::new().unwrap();
         let _cache_env = sandbox_cache_env(cache_home.path());
@@ -3580,7 +3594,7 @@ mod tests {
         cached_messages[0].session_id = "cache-hit-marker".to_string();
         let identity = CacheIdentity {
             namespace: "kimi",
-            parser_version: 4,
+            parser_version: 5,
         };
         let fingerprint = SourceFingerprint::from_kimi_path(&wire_path).unwrap();
         let mut cache = SourceMessageCache::default();
