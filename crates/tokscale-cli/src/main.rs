@@ -1129,6 +1129,9 @@ pub enum ClientFilter {
     LmStudio,
     Unsloth,
     Hindsight,
+    #[value(name = "micode-desktop")]
+    MicodeDesktop,
+    Muse,
     Synthetic,
 }
 
@@ -1192,6 +1195,8 @@ impl ClientFilter {
             Self::LmStudio => "lmstudio",
             Self::Unsloth => "unsloth",
             Self::Hindsight => "hindsight",
+            Self::MicodeDesktop => "micode-desktop",
+            Self::Muse => "muse",
             Self::Synthetic => "synthetic",
         }
     }
@@ -1258,6 +1263,8 @@ impl ClientFilter {
             Self::LmStudio => Some(ClientId::LmStudio),
             Self::Unsloth => Some(ClientId::Unsloth),
             Self::Hindsight => Some(ClientId::Hindsight),
+            Self::MicodeDesktop => Some(ClientId::MiMoDesktop),
+            Self::Muse => Some(ClientId::Muse),
             Self::Synthetic => None,
         }
     }
@@ -1320,6 +1327,8 @@ impl ClientFilter {
             ClientId::LmStudio => Self::LmStudio,
             ClientId::Unsloth => Self::Unsloth,
             ClientId::Hindsight => Self::Hindsight,
+            ClientId::MiMoDesktop => Self::MicodeDesktop,
+            ClientId::Muse => Self::Muse,
         }
     }
 
@@ -4841,6 +4850,10 @@ struct TsTimeMetrics {
 
 const SUBMISSION_PARSER_VERSION: u32 = 1;
 const COPILOT_SUBMISSION_PARSER_VERSION: u32 = 2;
+// The receiver admits the MiMo CLI/desktop split atomically only when both
+// selected surfaces declare this generation and cover the credited history.
+// This is a submission contract, independent of the on-disk parser cache version.
+const MICODE_SUBMISSION_PARSER_VERSION: u32 = 2;
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -4979,10 +4992,10 @@ fn submit_scan_scope(clients: Option<&[String]>, full_history: bool) -> Option<T
     let parser_versions = clients?
         .iter()
         .map(|client| {
-            let version = if client == "copilot" {
-                COPILOT_SUBMISSION_PARSER_VERSION
-            } else {
-                SUBMISSION_PARSER_VERSION
+            let version = match client.as_str() {
+                "copilot" => COPILOT_SUBMISSION_PARSER_VERSION,
+                "micode" | "micode-desktop" => MICODE_SUBMISSION_PARSER_VERSION,
+                _ => SUBMISSION_PARSER_VERSION,
             };
             (client.clone(), version)
         })
@@ -8502,6 +8515,11 @@ mod tests {
     }
 
     #[test]
+    fn test_capitalize_client_muse() {
+        assert_eq!(capitalize_client("muse"), "Muse Code");
+    }
+
+    #[test]
     fn test_capitalize_client_covers_every_registered_client() {
         for client in tokscale_core::ClientId::iter() {
             assert_eq!(capitalize_client(client.as_str()), client.display_name());
@@ -8915,6 +8933,30 @@ mod tests {
             scope.parser_versions,
             std::collections::BTreeMap::from([("codex".to_string(), SUBMISSION_PARSER_VERSION)])
         );
+    }
+
+    #[test]
+    fn submit_scan_scope_declares_micode_family_without_expanding_selection() {
+        let clients = vec!["micode".to_string(), "micode-desktop".to_string()];
+        for full_history in [true, false] {
+            let scope = submit_scan_scope(Some(&clients), full_history).unwrap();
+            let json = serde_json::to_value(&scope).unwrap();
+            assert_eq!(json["parserVersions"]["micode"], 2);
+            assert_eq!(json["parserVersions"]["micode-desktop"], 2);
+            assert_eq!(json["fullHistory"], full_history);
+            assert_eq!(scope.parser_versions.len(), 2);
+        }
+
+        for selected in ["micode", "micode-desktop"] {
+            let scope = submit_scan_scope(Some(&[selected.to_string()]), true).unwrap();
+            assert_eq!(
+                scope.parser_versions,
+                std::collections::BTreeMap::from([(
+                    selected.to_string(),
+                    MICODE_SUBMISSION_PARSER_VERSION,
+                )])
+            );
+        }
     }
 
     /// Droid is bounded by the server's device/client lifetime high-water
