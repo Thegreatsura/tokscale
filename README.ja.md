@@ -84,6 +84,7 @@
 | <img width="48px" src=".github/assets/client-goose.png" alt="Goose" /> | [Goose](https://github.com/aaif-goose/goose) | `~/.local/share/goose/sessions/sessions.db` (+ macOS Application Support、レガシー Block/goose パス; `GOOSE_PATH_ROOT` でオーバーライド可能) |
 | <img width="48px" src=".github/assets/client-antigravity.png" alt="Antigravity" /> | [Google Antigravity](https://antigravity.google/) | `tokscale antigravity sync` で `~/.config/tokscale/antigravity-cache/sessions/*.jsonl` にキャッシュ（ローカル言語サーバ RPC を使用） |
 | <img width="48px" src=".github/assets/client-antigravity.png" alt="Antigravity CLI" /> | [Antigravity CLI](https://antigravity.google/) | `~/.gemini/antigravity-cli/conversations/*.db`（Gemini ホームは `GEMINI_CLI_HOME` でオーバーライド可能；ローカル SQLite を直接読み取るため `antigravity sync` は不要） |
+| <img width="48px" src=".github/assets/client-antigravity.png" alt="Antigravity IDE Extension" /> | [Antigravity IDE Extension](https://www.antigravity.google/docs/ide/extensions/) | `~/.gemini/antigravity/conversations/*.db`（ローカル SQLite を直接読み取り） |
 | <img width="48px" src=".github/assets/client-trae.png" alt="Trae" /> | [Trae IDE](https://www.trae.ai/) / [Trae Solo](https://www.trae.ai/solo)（国際版） | `tokscale trae sync` で `~/.config/tokscale/trae-cache/sessions/*.json` にキャッシュ（公式 API のアカウント単位使用量） |
 | <img width="48px" src="https://github.com/warpdotdev.png" alt="Warp" /> | [Warp](https://www.warp.dev/) / Oz | `tokscale warp sync` で `~/.config/tokscale/warp-cache/usage.json` にキャッシュ（集計リクエスト数と使用金額のみ。トークントランスクリプトは含まない） |
 | <img width="48px" src="https://github.com/xai-org.png" alt="Grok Build" /> | Grok Build | `$GROK_HOME/sessions/*/*/updates.jsonl`（フォールバック: `~/.grok/sessions/*/*/updates.jsonl`） |
@@ -185,7 +186,7 @@ AI支援開発の時代において、**トークンは新しいエネルギー*
   - 設定可能なカラーテーマのGitHubスタイル貢献グラフ
   - リアルタイムフィルタリングとソート
   - ゼロフリッカーレンダリング
-- **マルチプラットフォームサポート** - OpenCode、Claude Code、Codex CLI、Prime Agent、Copilot CLI、Cursor IDE、Gemini CLI、Amp、Codebuff、Droid、OpenClaw、Hermes Agent、Pi、Kimchi Coding、Reasonix、Kimi CLI、Kimi Work、Qwen CLI、Roo Code、Kilo、Mux、Kilo CLI、Crush、Goose、Antigravity、Antigravity CLI、Zed、Kiro、Trae、Warp/Oz、Cline、Gajae-Code、Grok Build、Jcode、MiMo Code、Xiaomi MiMo AI、Command Code、Junie、ZCode、OpenCodeReview、CodeBuddy、WorkBuddy、Devin CLI、Devin Desktop、Augment Code、Synthetic、Cherry Studio、LM Studio、Unsloth Studio、Hindsight、fx、Oh My Pi、Muse Codeの使用量を追跡
+- **マルチプラットフォームサポート** - OpenCode、Claude Code、Codex CLI、Prime Agent、Copilot CLI、Cursor IDE、Gemini CLI、Amp、Codebuff、Droid、OpenClaw、Hermes Agent、Pi、Kimchi Coding、Reasonix、Kimi CLI、Kimi Work、Qwen CLI、Roo Code、Kilo、Mux、Kilo CLI、Crush、Goose、Antigravity、Antigravity CLI、Antigravity IDE Extension、Zed、Kiro、Trae、Warp/Oz、Cline、Gajae-Code、Grok Build、Jcode、MiMo Code、Xiaomi MiMo AI、Command Code、Junie、ZCode、OpenCodeReview、CodeBuddy、WorkBuddy、Devin CLI、Devin Desktop、Augment Code、Synthetic、Cherry Studio、LM Studio、Unsloth Studio、Hindsight、fx、Oh My Pi、Muse Codeの使用量を追跡
 - **リアルタイム価格** - 1時間ディスクキャッシュ付きでLiteLLMから現在の価格を取得；OpenRouter自動フォールバックと新規モデル向けCursor価格サポート
 - **詳細な内訳** - 入力、出力、キャッシュ読み書き、推論トークン追跡
 - **ネイティブRustコア** - 10倍高速な処理のため、すべての解析と集計をRustで実行
@@ -421,7 +422,7 @@ tokscale --client synthetic
 tokscale --client opencode,claude --week --json
 ```
 
-利用可能な値: `opencode`, `claude`, `codex`, `copilot`, `gemini`, `cursor`, `amp`, `codebuff`, `droid`, `openclaw`, `hermes`, `pi`, `prime-agent`, `kimchi`, `kimi`, `qwen`, `roocode`, `kilocode`, `kilo`, `mux`, `crush`, `goose`, `antigravity`, `antigravity-cli`, `zed`, `kiro`, `trae`, `warp`, `cline`, `gjc`, `grok`, `jcode`, `micode`, `micode-desktop`, `commandcode`, `junie`, `zcode`, `opencodereview`, `codebuddy`, `augment`, `synthetic`, `cherrystudio`, `lmstudio`, `unsloth`, `hindsight`, `muse`。
+利用可能な値: `opencode`, `claude`, `codex`, `copilot`, `gemini`, `cursor`, `amp`, `codebuff`, `droid`, `openclaw`, `hermes`, `pi`, `prime-agent`, `kimchi`, `kimi`, `qwen`, `roocode`, `kilocode`, `kilo`, `mux`, `crush`, `goose`, `antigravity`, `antigravity-cli`, `antigravity-extension`, `zed`, `kiro`, `trae`, `warp`, `cline`, `gjc`, `grok`, `jcode`, `micode`, `micode-desktop`, `commandcode`, `junie`, `zcode`, `opencodereview`, `codebuddy`, `augment`, `synthetic`, `cherrystudio`, `lmstudio`, `unsloth`, `hindsight`, `muse`。
 
 > **破壊的変更 (v4.0.0)**: クライアント単位のブール型フラグ（`--opencode`、`--claude`、`--codex` など）は削除され、現在はエラーになります。代わりに正規の `--client`/`-c` フラグを使用してください — 例: `tokscale --client opencode,claude`。
 
@@ -1095,7 +1096,7 @@ tokscale sources --json
 - **インタラクティブツールチップ**: ホバーで詳細な日別内訳を表示
 - **日別内訳パネル**: クリックでソース別、モデル別の詳細を確認
 - **年別フィルタリング**: 年間を移動
-- **ソースフィルタリング**: プラットフォーム別フィルター（OpenCode、Claude、Codex、Copilot、Cursor、Gemini、Amp、Codebuff、Droid、OpenClaw、Hermes Agent、Pi、Prime Agent、Kimi、Qwen、Roo Code、Kilo、Mux、Kilo CLI、Crush、Goose、Antigravity、Antigravity CLI、Zed、Kiro、Trae、Warp、Cline、Gajae-Code、Grok Build、Jcode、MiMo Code、Xiaomi MiMo AI、Command Code、Junie、ZCode、OpenCodeReview、CodeBuddy、WorkBuddy、Devin CLI、Devin Desktop、Augment Code、Synthetic、Cherry Studio、LM Studio、Unsloth、Hindsight、Muse Code）
+- **ソースフィルタリング**: プラットフォーム別フィルター（OpenCode、Claude、Codex、Copilot、Cursor、Gemini、Amp、Codebuff、Droid、OpenClaw、Hermes Agent、Pi、Prime Agent、Kimi、Qwen、Roo Code、Kilo、Mux、Kilo CLI、Crush、Goose、Antigravity、Antigravity CLI、Antigravity IDE Extension、Zed、Kiro、Trae、Warp、Cline、Gajae-Code、Grok Build、Jcode、MiMo Code、Xiaomi MiMo AI、Command Code、Junie、ZCode、OpenCodeReview、CodeBuddy、WorkBuddy、Devin CLI、Devin Desktop、Augment Code、Synthetic、Cherry Studio、LM Studio、Unsloth、Hindsight、Muse Code）
 - **統計パネル**: 総コスト、トークン、活動日数、連続記録
 - **FOUC防止**: Reactハイドレーション前にテーマを適用（フラッシュなし）
 
@@ -1496,6 +1497,8 @@ AIコーディングツールはクロスプラットフォームの場所にセ
 | Crush | `$XDG_DATA_HOME/crush/`（フォールバック: `~/.local/share/crush/`） | `%USERPROFILE%\.local\share\crush\`（設定されていれば `%XDG_DATA_HOME%\crush\`） | フォールバック付きでXDGデータディレクトリを使用 |
 | Goose | `~/.local/share/goose/sessions/` (+ macOS Application Support、レガシー Block パス) | `%USERPROFILE%\.local\share\goose\sessions\` | `GOOSE_PATH_ROOT` 環境変数で設定可能 |
 | Antigravity | `~/.config/tokscale/antigravity-cache/sessions/` | — | `tokscale antigravity sync` は現在 macOS / Linux でのみサポート |
+| Antigravity CLI | `~/.gemini/antigravity-cli/conversations/` | `%USERPROFILE%\.gemini\antigravity-cli\conversations\` | `GEMINI_CLI_HOME` 環境変数で設定可能 |
+| Antigravity IDE Extension | `~/.gemini/antigravity/conversations/` | `%USERPROFILE%\.gemini\antigravity\conversations\` | すべてのプラットフォームで同じパス |
 | Zed Agent | `~/.local/share/zed/threads/threads.db` | `%LOCALAPPDATA%\Zed\threads\threads.db` | ホスティング済み Zed モデルの使用量のみ；外部 ACP エージェントは対象外 |
 | Kiro | `~/.kiro/sessions/cli/` および `~/.local/share/kiro-cli/data.sqlite3` | `%USERPROFILE%\.kiro\sessions\cli\` および `%USERPROFILE%\.local\share\kiro-cli\data.sqlite3` | Kiro セッションファイルに加え、存在する場合は Kiro CLI の SQLite データベースを解析 |
 | Trae | `~/.config/tokscale/trae-cache/sessions/` | `%APPDATA%\tokscale\trae-cache\sessions\` | `tokscale trae sync` で 1 回だけ同期。インストール済みの Trae IDE または Trae Solo デスクトップアプリから資格情報を自動検出 |

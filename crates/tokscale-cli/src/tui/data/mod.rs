@@ -892,7 +892,9 @@ impl DataLoader {
             // Hourly aggregation: derive hour from timestamp (Unix ms),
             // falling back to msg.date 00:00 when timestamp is missing/zero
             // so we don't silently drop messages (matches CLI bucketing).
-            if let Some(hour_dt) = hour_bucket_with_fallback(msg.timestamp, &msg.date) {
+            if let Some(hour_dt) = hour_bucket_with_fallback(msg.timestamp, &msg.date)
+                .filter(|_| !tokscale_core::recovery::is_daily(msg))
+            {
                 let hourly_entry = hourly_map.entry(hour_dt).or_insert_with(|| HourlyUsage {
                     datetime: hour_dt,
                     tokens: TokenBreakdown::default(),
@@ -980,6 +982,7 @@ impl DataLoader {
             // the tab do not pay the per-minute bucketing cost.
             let minute_bucket = if self.minutely_enabled {
                 minute_bucket_with_fallback(msg.timestamp, &msg.date)
+                    .filter(|_| !tokscale_core::recovery::is_daily(msg))
             } else {
                 None
             };
@@ -1886,6 +1889,7 @@ mod tests {
         assert_eq!(clients[52], ClientId::Hindsight);
         assert_eq!(clients[53], ClientId::MiMoDesktop);
         assert_eq!(clients[54], ClientId::Muse);
+        assert_eq!(clients[55], ClientId::AntigravityExtension);
     }
 
     #[test]
@@ -1946,6 +1950,7 @@ mod tests {
             "Hindsight",
             "Xiaomi MiMo AI",
             "Muse Code",
+            "Antigravity IDE Extension",
         ];
 
         assert_eq!(expected.len(), ClientId::COUNT);
@@ -1998,6 +2003,10 @@ mod tests {
         assert_eq!(crate::tui::client_ui::hotkey(ClientId::Hindsight), 'H');
         assert_eq!(crate::tui::client_ui::hotkey(ClientId::MiMoDesktop), 'W');
         assert_eq!(crate::tui::client_ui::hotkey(ClientId::Muse), 'N');
+        assert_eq!(
+            crate::tui::client_ui::hotkey(ClientId::AntigravityExtension),
+            'I'
+        );
     }
 
     #[test]

@@ -85,6 +85,7 @@
 | <img width="48px" src=".github/assets/client-goose.png" alt="Goose" /> | [Goose](https://github.com/aaif-goose/goose) | `~/.local/share/goose/sessions/sessions.db`（+ macOS Application Support、旧版 Block/goose 路径；可通过 `GOOSE_PATH_ROOT` 覆盖） |
 | <img width="48px" src=".github/assets/client-antigravity.png" alt="Antigravity" /> | [Google Antigravity](https://antigravity.google/) | 通过 `tokscale antigravity sync` 缓存到 `~/.config/tokscale/antigravity-cache/sessions/*.jsonl`（使用本地语言服务器 RPC） |
 | <img width="48px" src=".github/assets/client-antigravity.png" alt="Antigravity CLI" /> | [Antigravity CLI](https://antigravity.google/) | `~/.gemini/antigravity-cli/conversations/*.db`（可通过 `GEMINI_CLI_HOME` 覆盖 Gemini 主目录；本地 SQLite，直接读取 — 无需 `antigravity sync`） |
+| <img width="48px" src=".github/assets/client-antigravity.png" alt="Antigravity IDE Extension" /> | [Antigravity IDE Extension](https://www.antigravity.google/docs/ide/extensions/) | `~/.gemini/antigravity/conversations/*.db`（直接读取本地 SQLite） |
 | <img width="48px" src=".github/assets/client-trae.png" alt="Trae" /> | [Trae IDE](https://www.trae.ai/) / [Trae Solo](https://www.trae.ai/solo)（国际版） | 通过 `tokscale trae sync` 缓存到 `~/.config/tokscale/trae-cache/sessions/*.json`（来自官方 API 的账号级使用量） |
 | <img width="48px" src="https://github.com/warpdotdev.png" alt="Warp" /> | [Warp](https://www.warp.dev/) / Oz | 通过 `tokscale warp sync` 缓存到 `~/.config/tokscale/warp-cache/usage.json`（仅汇总请求数和消费金额，不含 token 转录） |
 | <img width="48px" src="https://github.com/xai-org.png" alt="Grok Build" /> | Grok Build | `$GROK_HOME/sessions/*/*/updates.jsonl`（回退：`~/.grok/sessions/*/*/updates.jsonl`） |
@@ -183,7 +184,7 @@
   - 支持可配置颜色主题的 GitHub 风格贡献图
   - 实时筛选和排序
   - 零闪烁渲染
-- **多平台支持** - 跟踪 OpenCode、Claude Code、Codex CLI、Prime Agent、Copilot CLI、Cursor IDE、Gemini CLI、Amp、Codebuff、Droid、OpenClaw、Hermes Agent、Pi、Kimchi Coding、Reasonix、Kimi CLI、Kimi Work、Qwen CLI、Roo Code、Kilo、Mux、Kilo CLI、Crush、Goose、Antigravity、Antigravity CLI、Zed、Kiro、Trae、Warp/Oz、Cline、Gajae-Code、Grok Build、Jcode、MiMo Code、Xiaomi MiMo AI、Command Code、Junie、ZCode、OpenCodeReview、CodeBuddy、WorkBuddy、Devin CLI、Devin Desktop、Augment Code、Synthetic、Cherry Studio、LM Studio、Unsloth Studio、Hindsight、fx、Oh My Pi 和 Muse Code 的使用情况
+- **多平台支持** - 跟踪 OpenCode、Claude Code、Codex CLI、Prime Agent、Copilot CLI、Cursor IDE、Gemini CLI、Amp、Codebuff、Droid、OpenClaw、Hermes Agent、Pi、Kimchi Coding、Reasonix、Kimi CLI、Kimi Work、Qwen CLI、Roo Code、Kilo、Mux、Kilo CLI、Crush、Goose、Antigravity、Antigravity CLI、Antigravity IDE Extension、Zed、Kiro、Trae、Warp/Oz、Cline、Gajae-Code、Grok Build、Jcode、MiMo Code、Xiaomi MiMo AI、Command Code、Junie、ZCode、OpenCodeReview、CodeBuddy、WorkBuddy、Devin CLI、Devin Desktop、Augment Code、Synthetic、Cherry Studio、LM Studio、Unsloth Studio、Hindsight、fx、Oh My Pi 和 Muse Code 的使用情况
 - **实时定价** - 从 LiteLLM 获取当前价格，带 1 小时磁盘缓存；OpenRouter 自动回退和新模型的 Cursor 定价支持
 - **详细分解** - 输入、输出、缓存读写和推理 Token 跟踪
 - **原生 Rust 核心** - 所有解析和聚合在 Rust 中完成，处理速度提升 10 倍
@@ -418,7 +419,7 @@ tokscale --client synthetic
 tokscale --client opencode,claude --week --json
 ```
 
-可用值：`opencode`、`claude`、`codex`、`copilot`、`gemini`、`cursor`、`amp`、`codebuff`、`droid`、`openclaw`、`hermes`、`pi`、`prime-agent`、`kimchi`、`kimi`、`qwen`、`roocode`、`kilocode`、`kilo`、`mux`、`crush`、`goose`、`antigravity`、`antigravity-cli`、`zed`、`kiro`、`trae`、`warp`、`cline`、`gjc`、`grok`、`jcode`、`micode`、`micode-desktop`、`commandcode`、`junie`、`zcode`、`opencodereview`、`codebuddy`、`augment`、`synthetic`、`cherrystudio`、`lmstudio`、`unsloth`、`hindsight`、`muse`。
+可用值：`opencode`、`claude`、`codex`、`copilot`、`gemini`、`cursor`、`amp`、`codebuff`、`droid`、`openclaw`、`hermes`、`pi`、`prime-agent`、`kimchi`、`kimi`、`qwen`、`roocode`、`kilocode`、`kilo`、`mux`、`crush`、`goose`、`antigravity`、`antigravity-cli`、`antigravity-extension`、`zed`、`kiro`、`trae`、`warp`、`cline`、`gjc`、`grok`、`jcode`、`micode`、`micode-desktop`、`commandcode`、`junie`、`zcode`、`opencodereview`、`codebuddy`、`augment`、`synthetic`、`cherrystudio`、`lmstudio`、`unsloth`、`hindsight`、`muse`。
 
 > **破坏性变更（v4.0.0）**：单客户端布尔选项（`--opencode`、`--claude`、`--codex` 等）已被移除，现在会直接报错。请改用规范的 `--client`/`-c` 选项——例如 `tokscale --client opencode,claude`。
 
@@ -1097,7 +1098,7 @@ tokscale sources --json
 - **交互式提示**：悬停查看详细的每日分解
 - **每日分解面板**：点击查看每个来源和模型的详情
 - **年份筛选**：在年份之间导航
-- **来源筛选**：按平台筛选（OpenCode、Claude、Codex、Copilot、Cursor、Gemini、Amp、Codebuff、Droid、OpenClaw、Hermes Agent、Pi、Prime Agent、Kimi、Qwen、Roo Code、Kilo、Mux、Kilo CLI、Crush、Goose、Antigravity、Antigravity CLI、Zed、Kiro、Trae、Warp、Cline、Gajae-Code、Grok Build、Jcode、MiMo Code、Xiaomi MiMo AI、Command Code、Junie、ZCode、OpenCodeReview、CodeBuddy、WorkBuddy、Devin CLI、Devin Desktop、Augment Code、Synthetic、Cherry Studio、LM Studio、Unsloth、Hindsight、Muse Code）
+- **来源筛选**：按平台筛选（OpenCode、Claude、Codex、Copilot、Cursor、Gemini、Amp、Codebuff、Droid、OpenClaw、Hermes Agent、Pi、Prime Agent、Kimi、Qwen、Roo Code、Kilo、Mux、Kilo CLI、Crush、Goose、Antigravity、Antigravity CLI、Antigravity IDE Extension、Zed、Kiro、Trae、Warp、Cline、Gajae-Code、Grok Build、Jcode、MiMo Code、Xiaomi MiMo AI、Command Code、Junie、ZCode、OpenCodeReview、CodeBuddy、WorkBuddy、Devin CLI、Devin Desktop、Augment Code、Synthetic、Cherry Studio、LM Studio、Unsloth、Hindsight、Muse Code）
 - **统计面板**：总成本、Token、活跃天数、连续记录
 - **FOUC 防护**：在 React 水合前应用主题（无闪烁）
 
@@ -1496,6 +1497,7 @@ AI 编程工具将会话数据存储在跨平台位置。大多数工具在所�
 | Crush | `$XDG_DATA_HOME/crush/`（回退路径：`~/.local/share/crush/`） | `%USERPROFILE%\.local\share\crush\`（如果设置了 `%XDG_DATA_HOME%`，则为 `%XDG_DATA_HOME%\crush\`） | 使用带回退路径的 XDG 数据目录 |
 | Goose | `~/.local/share/goose/sessions/`（+ macOS Application Support、旧版 Block 路径） | `%USERPROFILE%\.local\share\goose\sessions\` | 可通过 `GOOSE_PATH_ROOT` 环境变量配置 |
 | Antigravity | `~/.config/tokscale/antigravity-cache/sessions/` | — | `tokscale antigravity sync` 目前仅支持 macOS / Linux |
+| Antigravity IDE Extension | `~/.gemini/antigravity/conversations/` | `%USERPROFILE%\.gemini\antigravity\conversations\` | 所有平台使用相同路径 |
 | Zed Agent | `~/.local/share/zed/threads/threads.db` | `%LOCALAPPDATA%\Zed\threads\threads.db` | 仅限托管 Zed 模型的使用量；不含外部 ACP 代理 |
 | Kiro | `~/.kiro/sessions/cli/` 和 `~/.local/share/kiro-cli/data.sqlite3` | `%USERPROFILE%\.kiro\sessions\cli\` 和 `%USERPROFILE%\.local\share\kiro-cli\data.sqlite3` | 解析 Kiro 会话文件，以及存在时的 Kiro CLI SQLite 数据库 |
 | Trae | `~/.config/tokscale/trae-cache/sessions/` | `%APPDATA%\tokscale\trae-cache\sessions\` | 通过 `tokscale trae sync` 同步一次；凭据会从已安装的任意 Trae IDE 或 Trae Solo 桌面端自动发现 |
