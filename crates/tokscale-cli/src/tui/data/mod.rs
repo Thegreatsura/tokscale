@@ -588,6 +588,15 @@ impl DataLoader {
         }
 
         for msg in &messages {
+            // Recovered daily-floor rows are day-level aggregates with a
+            // synthetic session/agent identity; they must not appear as fake
+            // sessions in the Sessions tab or fake agents in the Agents tab.
+            // Their tokens and cost still count toward the model, daily and
+            // project aggregates below (hourly and minutely skip them, since a
+            // day-level fill has no intra-day shape), so this is filtered per
+            // aggregation rather than by dropping the message from the loop.
+            // Their synthetic session id is also kept out of session counts.
+            let is_recovery_floor = tokscale_core::recovery::is_daily(msg);
             let normalized_model =
                 model_name_for_grouping(&msg.client, &msg.provider_id, &msg.model_id);
             let model_key = normalize_model_for_grouping(&msg.model_id);
@@ -712,59 +721,66 @@ impl DataLoader {
                 .performance
                 .record_message(positive_unified_token_total(&msg.tokens), msg.duration_ms);
 
-            let session_key = format!("{}:{}", msg.client, msg.session_id);
-            let model_sessions = model_session_ids.entry(key).or_default();
-            if model_sessions.insert(session_key) {
-                model_entry.session_count += 1;
+            // A recovered daily floor has a synthetic session id; it adds usage
+            // but is not a session, so it must not raise session counts.
+            if !is_recovery_floor {
+                let session_key = format!("{}:{}", msg.client, msg.session_id);
+                let model_sessions = model_session_ids.entry(key).or_default();
+                if model_sessions.insert(session_key) {
+                    model_entry.session_count += 1;
+                }
             }
 
-            if let Some(agent) = msg.agent.as_ref() {
-                let normalized_agent = if msg.client == "opencode" {
-                    sessions::normalize_opencode_agent_name(agent)
-                } else if msg.client == "copilot" {
-                    sessions::normalize_copilot_agent_name(agent)
-                } else {
-                    sessions::normalize_agent_name(agent)
-                };
-                let agent_entry = agent_map
-                    .entry(normalized_agent.clone())
-                    .or_insert_with(|| AgentUsage {
-                        agent: normalized_agent.clone(),
-                        clients: String::new(),
-                        tokens: TokenBreakdown::default(),
-                        cost: 0.0,
-                        message_count: 0,
-                    });
+            if !is_recovery_floor {
+                if let Some(agent) = msg.agent.as_ref() {
+                    let normalized_agent = if msg.client == "opencode" {
+                        sessions::normalize_opencode_agent_name(agent)
+                    } else if msg.client == "copilot" {
+                        sessions::normalize_copilot_agent_name(agent)
+                    } else {
+                        sessions::normalize_agent_name(agent)
+                    };
+                    let agent_entry =
+                        agent_map
+                            .entry(normalized_agent.clone())
+                            .or_insert_with(|| AgentUsage {
+                                agent: normalized_agent.clone(),
+                                clients: String::new(),
+                                tokens: TokenBreakdown::default(),
+                                cost: 0.0,
+                                message_count: 0,
+                            });
 
-                agent_entry.tokens.input = agent_entry
-                    .tokens
-                    .input
-                    .saturating_add(msg.tokens.input.max(0) as u64);
-                agent_entry.tokens.output = agent_entry
-                    .tokens
-                    .output
-                    .saturating_add(msg.tokens.output.max(0) as u64);
-                agent_entry.tokens.cache_read = agent_entry
-                    .tokens
-                    .cache_read
-                    .saturating_add(msg.tokens.cache_read.max(0) as u64);
-                agent_entry.tokens.cache_write = agent_entry
-                    .tokens
-                    .cache_write
-                    .saturating_add(msg.tokens.cache_write.max(0) as u64);
-                agent_entry.tokens.reasoning = agent_entry
-                    .tokens
-                    .reasoning
-                    .saturating_add(msg.tokens.reasoning.max(0) as u64);
-                agent_entry.cost += msg_cost;
-                agent_entry.message_count = agent_entry
-                    .message_count
-                    .saturating_add(msg.message_count.max(0) as u32);
+                    agent_entry.tokens.input = agent_entry
+                        .tokens
+                        .input
+                        .saturating_add(msg.tokens.input.max(0) as u64);
+                    agent_entry.tokens.output = agent_entry
+                        .tokens
+                        .output
+                        .saturating_add(msg.tokens.output.max(0) as u64);
+                    agent_entry.tokens.cache_read = agent_entry
+                        .tokens
+                        .cache_read
+                        .saturating_add(msg.tokens.cache_read.max(0) as u64);
+                    agent_entry.tokens.cache_write = agent_entry
+                        .tokens
+                        .cache_write
+                        .saturating_add(msg.tokens.cache_write.max(0) as u64);
+                    agent_entry.tokens.reasoning = agent_entry
+                        .tokens
+                        .reasoning
+                        .saturating_add(msg.tokens.reasoning.max(0) as u64);
+                    agent_entry.cost += msg_cost;
+                    agent_entry.message_count = agent_entry
+                        .message_count
+                        .saturating_add(msg.message_count.max(0) as u32);
 
-                agent_clients
-                    .entry(normalized_agent)
-                    .or_default()
-                    .insert(msg.client.clone());
+                    agent_clients
+                        .entry(normalized_agent)
+                        .or_default()
+                        .insert(msg.client.clone());
+                }
             }
 
             if let Some(date) = parse_date(&msg.date) {
@@ -1076,7 +1092,7 @@ impl DataLoader {
             // Skips messages with an empty session_id (some legacy/scanner
             // records lack one) rather than lumping them into a single bogus
             // "no-session" row.
-            if !msg.session_id.is_empty() {
+            if !is_recovery_floor && !msg.session_id.is_empty() {
                 let session_key = format!("{}:{}", msg.client, msg.session_id);
                 let session_entry =
                     session_map
@@ -1234,7 +1250,7 @@ impl DataLoader {
                     });
                 }
 
-                if !msg.session_id.is_empty() {
+                if !is_recovery_floor && !msg.session_id.is_empty() {
                     let session_key = format!("{}:{}", msg.client, msg.session_id);
                     let project_sessions = project_session_ids
                         .entry(project_group_key.clone())
@@ -3894,6 +3910,54 @@ after"#,
         assert_eq!(usage.monthly[0].month, "2025-01");
         assert_eq!(usage.monthly[0].tokens.input, 300);
         assert_eq!(usage.monthly[0].cost, 3.0);
+    }
+
+    /// A recovered daily floor keeps its tokens in every day-level view (Daily,
+    /// Monthly, Models, Projects) so rollups agree, but it is not a session or
+    /// an agent and has no intra-day shape.
+    #[test]
+    fn test_recovery_floor_counts_toward_day_views_but_not_sessions_agents_or_hours() {
+        let mut loader = DataLoader::new(None);
+        loader.minutely_enabled = true;
+        loader.projects_enabled = true;
+        let base_ms = 1_736_899_200_000_i64; // 2025-01-15 00:00 UTC
+        let mut native = make_msg(base_ms + 3_600_000, 100, 50, 1.0);
+        native.agent = Some("build".into());
+        let mut floor = make_msg(0, 400, 200, 4.0);
+        let floor_key = "local-recovery:daily:claude:2025-01-15".to_string();
+        floor.session_id = floor_key.clone();
+        floor.dedup_key = Some(floor_key);
+        floor.date = native.date.clone();
+        floor.agent = Some("Recovered daily aggregate (component split estimated)".into());
+        assert!(tokscale_core::recovery::is_daily(&floor));
+
+        let usage = loader
+            .aggregate_messages(vec![native, floor], &GroupBy::Model)
+            .unwrap();
+
+        let daily_input: u64 = usage.daily.iter().map(|d| d.tokens.input).sum();
+        assert_eq!(daily_input, 500, "Daily must include the floor");
+        assert_eq!(
+            usage.monthly[0].tokens.input, 500,
+            "Monthly derives from Daily"
+        );
+        let model_input: u64 = usage.models.iter().map(|m| m.tokens.input).sum();
+        assert_eq!(model_input, 500, "Models must agree with Daily");
+        let project_input: u64 = usage.projects.iter().map(|p| p.tokens.input).sum();
+        assert_eq!(project_input, 500, "Projects must agree with Daily");
+        assert_eq!(usage.models.iter().map(|m| m.session_count).sum::<u32>(), 1);
+        assert_eq!(
+            usage.projects.iter().map(|p| p.session_count).sum::<u32>(),
+            1
+        );
+
+        assert_eq!(usage.sessions.len(), 1, "the floor is not a session");
+        assert_eq!(usage.agents.len(), 1, "the floor is not an agent");
+        assert_eq!(usage.agents[0].agent, "Build");
+        let hourly_input: u64 = usage.hourly.iter().map(|h| h.tokens.input).sum();
+        assert_eq!(hourly_input, 100, "a day-level fill has no hour");
+        let minutely_input: u64 = usage.minutely.iter().map(|m| m.tokens.input).sum();
+        assert_eq!(minutely_input, 100, "a day-level fill has no minute");
     }
 
     #[test]
