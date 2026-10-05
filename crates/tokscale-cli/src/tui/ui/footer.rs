@@ -4,7 +4,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use super::spinner::{get_phase_message, get_scanner_spans};
 use super::widgets::{format_cost, format_tokens, AMBIENT_STABLE_BORDER_SET};
 use crate::tui::app::{App, ClickAction, SortField, Tab};
-use crate::tui::i18n::{tr, MessageKey, TuiLanguage};
+use crate::tui::i18n::{format_count, tr, MessageKey, TuiLanguage};
 
 pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
@@ -164,33 +164,32 @@ fn render_main_row(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn current_count_label(app: &App) -> String {
     let lang = app.settings.tui_language;
-    let format_count = |n: usize, key: MessageKey| -> String {
-        match lang {
-            TuiLanguage::Ko | TuiLanguage::Ja | TuiLanguage::ZhCn => {
-                format!(" ({}{})", n, tr(lang, key))
-            }
-            TuiLanguage::En | TuiLanguage::Fr => {
-                format!(" ({} {})", n, tr(lang, key))
-            }
-        }
-    };
     match app.current_tab {
-        Tab::Overview | Tab::Models => format_count(app.data.models.len(), MessageKey::CountModels),
-        Tab::Agents => format_count(app.data.agents.len(), MessageKey::CountAgents),
+        Tab::Models if app.is_model_trend_active() => format_count(
+            lang,
+            app.get_sorted_model_trend_rows().len(),
+            MessageKey::CountDays,
+        ),
+        Tab::Overview | Tab::Models => {
+            format_count(lang, app.data.models.len(), MessageKey::CountModels)
+        }
+        Tab::Agents => format_count(lang, app.data.agents.len(), MessageKey::CountAgents),
         Tab::Daily if app.is_daily_detail_active() => format_count(
+            lang,
             app.get_sorted_daily_detail_rows().len(),
             MessageKey::CountModels,
         ),
-        Tab::Daily => format_count(app.data.daily.len(), MessageKey::CountDays),
-        Tab::Hourly => format_count(app.data.hourly.len(), MessageKey::CountHours),
-        Tab::Minutely => format_count(app.data.minutely.len(), MessageKey::CountMinutes),
+        Tab::Daily => format_count(lang, app.data.daily.len(), MessageKey::CountDays),
+        Tab::Hourly => format_count(lang, app.data.hourly.len(), MessageKey::CountHours),
+        Tab::Minutely => format_count(lang, app.data.minutely.len(), MessageKey::CountMinutes),
         Tab::Monthly if app.is_monthly_detail_active() => format_count(
+            lang,
             app.get_sorted_monthly_detail_days().len(),
             MessageKey::CountDays,
         ),
-        Tab::Monthly => format_count(app.data.monthly.len(), MessageKey::CountMonths),
-        Tab::Sessions => format_count(app.data.sessions.len(), MessageKey::CountSessions),
-        Tab::Projects => format_count(app.data.projects.len(), MessageKey::CountProjects),
+        Tab::Monthly => format_count(lang, app.data.monthly.len(), MessageKey::CountMonths),
+        Tab::Sessions => format_count(lang, app.active_sessions().len(), MessageKey::CountSessions),
+        Tab::Projects => format_count(lang, app.data.projects.len(), MessageKey::CountProjects),
         Tab::Stats | Tab::Usage => String::new(),
     }
 }
@@ -236,9 +235,21 @@ fn render_help_row(frame: &mut Frame, app: &App, area: Rect) {
                 spans.push(Span::styled("↵", hint_style));
             }
         }
+        if app.current_tab == Tab::Models {
+            spans.push(Span::styled("·", Style::default().fg(app.theme.muted)));
+            if app.is_model_trend_active() {
+                spans.push(Span::styled("esc", hint_style));
+            } else {
+                spans.push(Span::styled("↵", hint_style));
+            }
+        }
         if app.current_tab == Tab::Hourly {
             spans.push(Span::styled("·", Style::default().fg(app.theme.muted)));
             spans.push(Span::styled("v", hint_style));
+        }
+        if app.current_tab == Tab::Sessions {
+            spans.push(Span::styled("·", Style::default().fg(app.theme.muted)));
+            spans.push(Span::styled("b", hint_style));
         }
         spans
     } else {
@@ -272,8 +283,27 @@ fn render_help_row(frame: &mut Frame, app: &App, area: Rect) {
             }
             spans.push(Span::styled(" • ", Style::default().fg(app.theme.muted)));
         }
+        if app.current_tab == Tab::Models {
+            if app.is_model_trend_active() {
+                spans.push(Span::styled(tr(lang, MessageKey::HelpBack), hint_style));
+            } else {
+                spans.push(Span::styled(tr(lang, MessageKey::HelpDetails), hint_style));
+            }
+            spans.push(Span::styled(" • ", Style::default().fg(app.theme.muted)));
+        }
         if app.current_tab == Tab::Hourly {
             spans.push(Span::styled(tr(lang, MessageKey::HelpProfile), hint_style));
+            spans.push(Span::styled(" • ", Style::default().fg(app.theme.muted)));
+        }
+        if app.current_tab == Tab::Sessions {
+            spans.push(Span::styled(
+                if app.roll_up_subagents {
+                    tr(lang, MessageKey::HelpRollupOn)
+                } else {
+                    tr(lang, MessageKey::HelpRollupOff)
+                },
+                count_style,
+            ));
             spans.push(Span::styled(" • ", Style::default().fg(app.theme.muted)));
         }
         spans.push(Span::styled(tr(lang, MessageKey::HelpSources), count_style));

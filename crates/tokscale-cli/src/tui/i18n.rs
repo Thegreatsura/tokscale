@@ -134,6 +134,7 @@ pub enum MessageKey {
     // Empty state messages
     EmptyNoUsageData,
     EmptyNoModelDetailsDay,
+    EmptyNoModelTrendData,
 
     // Footer counts & labels
     FooterTokens,
@@ -164,6 +165,8 @@ pub enum MessageKey {
     HelpLanguage,
     HelpRefresh,
     HelpQuit,
+    HelpRollupOn,
+    HelpRollupOff,
 
     // Dialogs: Common
     DialogCloseHint,
@@ -203,6 +206,8 @@ pub enum MessageKey {
     StatusLoadedFromCache,
     StatusRefreshInProgress,
     StatusLanguageChanged,
+    StatusSubagentRollupOn,
+    StatusSubagentRollupOff,
 
     ColCacheHit,
 
@@ -219,6 +224,7 @@ pub enum MessageKey {
     TitleDayBreakdown,
     TitleDailyDetail,
     TitleDailyDetailPrefix,
+    TitleModelTrendPrefix,
     TitleDailyBreakdown,
     TitleDailyBreakdownPrefix,
 
@@ -261,6 +267,8 @@ pub enum MessageKey {
     StatsLongestStreakShort,
     StatsActiveDays,
     StatsActiveShort,
+    StatsPeakHour,
+    StatsPeakHourShort,
     StatsLess,
     StatsMore,
 
@@ -480,6 +488,23 @@ pub fn tr(lang: TuiLanguage, key: MessageKey) -> &'static str {
     }
 }
 
+/// Formats a count with its noun in the language's word order: Korean,
+/// Japanese and Chinese drop the space between the number and the noun
+/// ("(2세션)"), while English and French keep it ("(2 sessions)").
+///
+/// The leading space is part of the label so callers can append it to a
+/// longer line, and `key` is normally one of the `Count*` keys.
+pub fn format_count(lang: TuiLanguage, n: usize, key: MessageKey) -> String {
+    match lang {
+        TuiLanguage::Ko | TuiLanguage::Ja | TuiLanguage::ZhCn => {
+            format!(" ({}{})", n, tr(lang, key))
+        }
+        TuiLanguage::En | TuiLanguage::Fr => {
+            format!(" ({} {})", n, tr(lang, key))
+        }
+    }
+}
+
 const fn tr_en(key: MessageKey) -> &'static str {
     match key {
         MessageKey::TabOverview => "Overview",
@@ -550,6 +575,7 @@ const fn tr_en(key: MessageKey) -> &'static str {
         MessageKey::EmptyNoModelDetailsDay => {
             "No model details found for this day. Press Esc to go back."
         }
+        MessageKey::EmptyNoModelTrendData => "No daily data for this model yet. Press Esc to go back.",
 
         MessageKey::FooterTokens => " tokens",
         MessageKey::CountModels => "models",
@@ -577,6 +603,8 @@ const fn tr_en(key: MessageKey) -> &'static str {
         MessageKey::HelpLanguage => "[k:lang]",
         MessageKey::HelpRefresh => "[r:refresh]",
         MessageKey::HelpQuit => "q",
+        MessageKey::HelpRollupOn => "[b:rollup]",
+        MessageKey::HelpRollupOff => "[b:subs]",
 
         MessageKey::DialogCloseHint => "Esc close",
         MessageKey::DialogFilterPlaceholder => "Type to filter...",
@@ -612,6 +640,8 @@ const fn tr_en(key: MessageKey) -> &'static str {
         MessageKey::StatusLoadedFromCache => "Loaded from cache",
         MessageKey::StatusRefreshInProgress => "Refresh already in progress",
         MessageKey::StatusLanguageChanged => "Language changed to",
+        MessageKey::StatusSubagentRollupOn => "Subagent sessions rolled into parents",
+        MessageKey::StatusSubagentRollupOff => "Subagent sessions shown separately",
 
         MessageKey::ColCacheHit => "Cache✕",
 
@@ -627,6 +657,7 @@ const fn tr_en(key: MessageKey) -> &'static str {
         MessageKey::TitleDayBreakdown => " Day Breakdown (ESC to close) ",
         MessageKey::TitleDailyDetail => " Daily Detail ",
         MessageKey::TitleDailyDetailPrefix => " Daily Detail: ",
+        MessageKey::TitleModelTrendPrefix => " Daily Trend: ",
         MessageKey::TitleDailyBreakdown => " Daily Breakdown ",
         MessageKey::TitleDailyBreakdownPrefix => " Daily Breakdown: ",
 
@@ -665,6 +696,8 @@ const fn tr_en(key: MessageKey) -> &'static str {
         MessageKey::StatsLongestStreakShort => "Max streak:",
         MessageKey::StatsActiveDays => "Active days:",
         MessageKey::StatsActiveShort => "Active:",
+        MessageKey::StatsPeakHour => "Peak hour:",
+        MessageKey::StatsPeakHourShort => "Peak:",
         MessageKey::StatsLess => "Less",
         MessageKey::StatsMore => "More",
 
@@ -949,6 +982,7 @@ const fn tr_ko(key: MessageKey) -> Option<&'static str> {
         MessageKey::EmptyNoModelDetailsDay => {
             "이 날짜의 모델 상세 내역이 없습니다. Esc를 눌러 돌아가기."
         }
+        MessageKey::EmptyNoModelTrendData => "이 모델의 일별 데이터가 아직 없습니다. Esc를 눌러 돌아가기.",
 
         MessageKey::FooterTokens => " 토큰",
         MessageKey::CountModels => "개 모델",
@@ -976,6 +1010,8 @@ const fn tr_ko(key: MessageKey) -> Option<&'static str> {
         MessageKey::HelpLanguage => "[k:언어]",
         MessageKey::HelpRefresh => "[r:새로고침]",
         MessageKey::HelpQuit => "q",
+        MessageKey::HelpRollupOn => "[b:롤업]",
+        MessageKey::HelpRollupOff => "[b:서브]",
 
         MessageKey::DialogCloseHint => "Esc 닫기",
         MessageKey::DialogFilterPlaceholder => "검색어 입력...",
@@ -1009,6 +1045,8 @@ const fn tr_ko(key: MessageKey) -> Option<&'static str> {
         MessageKey::StatusLoadedFromCache => "캐시에서 불러옴",
         MessageKey::StatusRefreshInProgress => "새로고침이 이미 진행 중입니다",
         MessageKey::StatusLanguageChanged => "언어가 다음으로 변경되었습니다:",
+        MessageKey::StatusSubagentRollupOn => "서브에이전트 세션을 부모 세션에 롤업",
+        MessageKey::StatusSubagentRollupOff => "서브에이전트 세션을 개별 표시",
 
         MessageKey::ColCacheHit => "캐시✕",
 
@@ -1024,6 +1062,7 @@ const fn tr_ko(key: MessageKey) -> Option<&'static str> {
         MessageKey::TitleDayBreakdown => " 일별 상세 (ESC: 닫기) ",
         MessageKey::TitleDailyDetail => " 일별 상세 ",
         MessageKey::TitleDailyDetailPrefix => " 일별 상세: ",
+        MessageKey::TitleModelTrendPrefix => " 일별 추이: ",
         MessageKey::TitleDailyBreakdown => " 일별 내역 ",
         MessageKey::TitleDailyBreakdownPrefix => " 일별 내역: ",
 
@@ -1062,6 +1101,8 @@ const fn tr_ko(key: MessageKey) -> Option<&'static str> {
         MessageKey::StatsLongestStreakShort => "최대 연속:",
         MessageKey::StatsActiveDays => "활동일:",
         MessageKey::StatsActiveShort => "활동:",
+        MessageKey::StatsPeakHour => "피크 시간:",
+        MessageKey::StatsPeakHourShort => "피크:",
         MessageKey::StatsLess => "적음",
         MessageKey::StatsMore => "많음",
 
@@ -1353,6 +1394,7 @@ const fn tr_ja(key: MessageKey) -> Option<&'static str> {
             "使用量データが見つかりません。'r': 再読み込み, 's': ソース, 'g': グループ化。"
         }
         MessageKey::EmptyNoModelDetailsDay => "この日のモデル詳細がありません。Escで戻る。",
+        MessageKey::EmptyNoModelTrendData => "このモデルの日別データはまだありません。Escで戻る。",
 
         MessageKey::FooterTokens => " トークン",
         MessageKey::CountModels => "モデル",
@@ -1380,6 +1422,8 @@ const fn tr_ja(key: MessageKey) -> Option<&'static str> {
         MessageKey::HelpLanguage => "[k:言語]",
         MessageKey::HelpRefresh => "[r:更新]",
         MessageKey::HelpQuit => "q",
+        MessageKey::HelpRollupOn => "[b:ロールアップ]",
+        MessageKey::HelpRollupOff => "[b:サブ]",
 
         MessageKey::DialogCloseHint => "Esc 閉じる",
         MessageKey::DialogFilterPlaceholder => "検索語を入力...",
@@ -1413,6 +1457,8 @@ const fn tr_ja(key: MessageKey) -> Option<&'static str> {
         MessageKey::StatusLoadedFromCache => "キャッシュから読み込みました",
         MessageKey::StatusRefreshInProgress => "更新はすでに処理中です",
         MessageKey::StatusLanguageChanged => "言語を変更しました:",
+        MessageKey::StatusSubagentRollupOn => "サブエージェントセッションを親にロールアップ",
+        MessageKey::StatusSubagentRollupOff => "サブエージェントセッションを個別表示",
 
         MessageKey::ColCacheHit => "Hit率",
 
@@ -1428,6 +1474,7 @@ const fn tr_ja(key: MessageKey) -> Option<&'static str> {
         MessageKey::TitleDayBreakdown => " 日別内訳 (ESCで閉じる) ",
         MessageKey::TitleDailyDetail => " 日別詳細 ",
         MessageKey::TitleDailyDetailPrefix => " 日別詳細: ",
+        MessageKey::TitleModelTrendPrefix => " 日別推移: ",
         MessageKey::TitleDailyBreakdown => " 日別内訳 ",
         MessageKey::TitleDailyBreakdownPrefix => " 日別内訳: ",
 
@@ -1466,6 +1513,8 @@ const fn tr_ja(key: MessageKey) -> Option<&'static str> {
         MessageKey::StatsLongestStreakShort => "最大連続:",
         MessageKey::StatsActiveDays => "アクティブ日数:",
         MessageKey::StatsActiveShort => "アクティブ:",
+        MessageKey::StatsPeakHour => "ピーク時間:",
+        MessageKey::StatsPeakHourShort => "ピーク:",
         MessageKey::StatsLess => "少",
         MessageKey::StatsMore => "多",
 
@@ -1748,6 +1797,7 @@ const fn tr_zh_cn(key: MessageKey) -> Option<&'static str> {
 
         MessageKey::EmptyNoUsageData => "未找到使用量数据。按 'r' 刷新，'s' 查看来源，'g' 分组。",
         MessageKey::EmptyNoModelDetailsDay => "当天未找到模型详细信息。按 Esc 返回。",
+        MessageKey::EmptyNoModelTrendData => "该模型暂无每日数据。按 Esc 返回。",
 
         MessageKey::FooterTokens => " Token",
         MessageKey::CountModels => "个模型",
@@ -1775,6 +1825,8 @@ const fn tr_zh_cn(key: MessageKey) -> Option<&'static str> {
         MessageKey::HelpLanguage => "[k:语言]",
         MessageKey::HelpRefresh => "[r:刷新]",
         MessageKey::HelpQuit => "q",
+        MessageKey::HelpRollupOn => "[b:汇总]",
+        MessageKey::HelpRollupOff => "[b:子代理]",
 
         MessageKey::DialogCloseHint => "Esc 关闭",
         MessageKey::DialogFilterPlaceholder => "输入以过滤...",
@@ -1808,6 +1860,8 @@ const fn tr_zh_cn(key: MessageKey) -> Option<&'static str> {
         MessageKey::StatusLoadedFromCache => "已从缓存载入",
         MessageKey::StatusRefreshInProgress => "刷新已在进行中",
         MessageKey::StatusLanguageChanged => "语言已更改为",
+        MessageKey::StatusSubagentRollupOn => "子代理会话已汇总到父会话",
+        MessageKey::StatusSubagentRollupOff => "子代理会话单独显示",
 
         MessageKey::ColCacheHit => "缓存✕",
 
@@ -1823,6 +1877,7 @@ const fn tr_zh_cn(key: MessageKey) -> Option<&'static str> {
         MessageKey::TitleDayBreakdown => " 每日明细 (ESC关闭) ",
         MessageKey::TitleDailyDetail => " 每日详情 ",
         MessageKey::TitleDailyDetailPrefix => " 每日详情: ",
+        MessageKey::TitleModelTrendPrefix => " 每日趋势: ",
         MessageKey::TitleDailyBreakdown => " 每日明细 ",
         MessageKey::TitleDailyBreakdownPrefix => " 每日明细: ",
 
@@ -1861,6 +1916,8 @@ const fn tr_zh_cn(key: MessageKey) -> Option<&'static str> {
         MessageKey::StatsLongestStreakShort => "最大连续:",
         MessageKey::StatsActiveDays => "活跃天数:",
         MessageKey::StatsActiveShort => "活跃:",
+        MessageKey::StatsPeakHour => "高峰时段:",
+        MessageKey::StatsPeakHourShort => "高峰:",
         MessageKey::StatsLess => "少",
         MessageKey::StatsMore => "多",
 
@@ -2135,6 +2192,7 @@ const fn tr_fr(key: MessageKey) -> Option<&'static str> {
         MessageKey::EmptyNoModelDetailsDay => {
             "Aucun détail de modèle pour ce jour. Appuyez sur Échap pour revenir."
         }
+        MessageKey::EmptyNoModelTrendData => "Pas encore de données quotidiennes pour ce modèle. Appuyez sur Échap pour revenir.",
 
         MessageKey::FooterTokens => " jetons",
         MessageKey::CountModels => "modèles",
@@ -2162,6 +2220,8 @@ const fn tr_fr(key: MessageKey) -> Option<&'static str> {
         MessageKey::HelpLanguage => "[k:langue]",
         MessageKey::HelpRefresh => "[r:rafraîchir]",
         MessageKey::HelpQuit => "q",
+        MessageKey::HelpRollupOn => "[b:agrégation]",
+        MessageKey::HelpRollupOff => "[b:sous-agents]",
 
         MessageKey::DialogCloseHint => "Esc fermer",
         MessageKey::DialogFilterPlaceholder => "Filtrer...",
@@ -2195,6 +2255,8 @@ const fn tr_fr(key: MessageKey) -> Option<&'static str> {
         MessageKey::StatusLoadedFromCache => "Chargé depuis le cache",
         MessageKey::StatusRefreshInProgress => "Actualisation déjà en cours",
         MessageKey::StatusLanguageChanged => "Langue changée en",
+        MessageKey::StatusSubagentRollupOn => "Sessions de sous-agents agrégées aux parents",
+        MessageKey::StatusSubagentRollupOff => "Sessions de sous-agents affichées séparément",
 
         MessageKey::ColCacheHit => "Cache✕",
 
@@ -2210,6 +2272,7 @@ const fn tr_fr(key: MessageKey) -> Option<&'static str> {
         MessageKey::TitleDayBreakdown => " Détail du jour (Échap pour fermer) ",
         MessageKey::TitleDailyDetail => " Détail quotidien ",
         MessageKey::TitleDailyDetailPrefix => " Détail quotidien : ",
+        MessageKey::TitleModelTrendPrefix => " Tendance quotidienne : ",
         MessageKey::TitleDailyBreakdown => " Détail quotidien ",
         MessageKey::TitleDailyBreakdownPrefix => " Détail quotidien : ",
 
@@ -2248,6 +2311,8 @@ const fn tr_fr(key: MessageKey) -> Option<&'static str> {
         MessageKey::StatsLongestStreakShort => "Série max :",
         MessageKey::StatsActiveDays => "Jours actifs :",
         MessageKey::StatsActiveShort => "Actif :",
+        MessageKey::StatsPeakHour => "Pic :",
+        MessageKey::StatsPeakHourShort => "Pic :",
         MessageKey::StatsLess => "Moins",
         MessageKey::StatsMore => "Plus",
 
@@ -2660,6 +2725,7 @@ mod tests {
             MessageKey::OverviewTotal,
             MessageKey::EmptyNoUsageData,
             MessageKey::EmptyNoModelDetailsDay,
+            MessageKey::EmptyNoModelTrendData,
             MessageKey::FooterTokens,
             MessageKey::CountModels,
             MessageKey::CountAgents,
@@ -2684,6 +2750,8 @@ mod tests {
             MessageKey::HelpLanguage,
             MessageKey::HelpRefresh,
             MessageKey::HelpQuit,
+            MessageKey::HelpRollupOn,
+            MessageKey::HelpRollupOff,
             MessageKey::DialogCloseHint,
             MessageKey::DialogFilterPlaceholder,
             MessageKey::DialogFilterLabel,
@@ -2711,6 +2779,8 @@ mod tests {
             MessageKey::StatusLoadedFromCache,
             MessageKey::StatusRefreshInProgress,
             MessageKey::StatusLanguageChanged,
+            MessageKey::StatusSubagentRollupOn,
+            MessageKey::StatusSubagentRollupOff,
             MessageKey::ColCacheHit,
             MessageKey::TitleDailyUsage,
             MessageKey::TitleMonthlyUsage,
@@ -2724,6 +2794,7 @@ mod tests {
             MessageKey::TitleDayBreakdown,
             MessageKey::TitleDailyDetail,
             MessageKey::TitleDailyDetailPrefix,
+            MessageKey::TitleModelTrendPrefix,
             MessageKey::TitleDailyBreakdown,
             MessageKey::TitleDailyBreakdownPrefix,
             MessageKey::ChartTokensPerDay,
@@ -2758,6 +2829,8 @@ mod tests {
             MessageKey::StatsLongestStreakShort,
             MessageKey::StatsActiveDays,
             MessageKey::StatsActiveShort,
+            MessageKey::StatsPeakHour,
+            MessageKey::StatsPeakHourShort,
             MessageKey::StatsLess,
             MessageKey::StatsMore,
             MessageKey::DialogCurrentLabel,

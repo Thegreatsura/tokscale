@@ -93,7 +93,7 @@
 | <img width="48px" src="https://github.com/kirodotdev.png" alt="Kiro" /> | Kiro | `~/.kiro/sessions/cli/*.json`（+ `*.jsonl`）、`~/.local/share/kiro-cli/data.sqlite3`（macOS: `~/Library/Application Support/kiro-cli/data.sqlite3`），以及 Kiro IDE globalStorage 快照（`Kiro/User/globalStorage/kiro.kiroagent`；macOS Application Support、Linux `~/.config/Kiro`、Windows `%APPDATA%\Kiro`） |
 | <img width="48px" src="https://github.com/cline.png" alt="Cline" /> | [Cline](https://github.com/cline/cline) | VS Code globalStorage 任务（Linux: `~/.config/Code/...`；macOS: `~/Library/Application Support/Code/...`；Windows: `%APPDATA%\Code\...`；server: `~/.vscode-server/data/User/globalStorage/saoudrizwan.claude-dev/tasks/`）+ Cline CLI 会话（按顺序选择第一个可用根目录：`$CLINE_SESSION_DATA_DIR`、`$CLINE_DATA_DIR/sessions/`、`$CLINE_DIR/data/sessions/`、回退 `~/.cline/data/sessions/`；空值或仅包含空白字符的环境变量会被忽略） |
 | <img width="48px" src="https://github.com/user-attachments/assets/7246e920-f3f8-4b6e-847e-030ae04e86c2" alt="Gajae-Code" /> | [gajae-code (gjc)](https://github.com/Yeachan-Heo/gajae-code) | `~/.gjc/agent/sessions/`（可通过 `GJC_CODING_AGENT_DIR`、`GJC_CONFIG_DIR`、`PI_CONFIG_DIR` 覆盖；Linux/macOS 上 `$XDG_DATA_HOME/gjc/sessions/` 亦支持） |
-| <img width="48px" src=".github/assets/client-cherrystudio.png" alt="Cherry Studio" /> | [Cherry Studio](https://cherry-ai.com/) | `%APPDATA%\CherryStudio\Data\Agents\.claude\projects\*.jsonl` 及旧版 `%APPDATA%\CherryStudio\.claude\projects\*.jsonl`（macOS: `~/Library/Application Support/CherryStudio/Data/Agents/.claude/projects/`；Linux: `$XDG_CONFIG_HOME/CherryStudio/Data/Agents/.claude/projects/`；Agent/Claude Code 模式转录，V2 目录优先，旧目录保留未迁移历史） |
+| <img width="48px" src=".github/assets/client-cherrystudio.png" alt="Cherry Studio" /> | [Cherry Studio](https://cherry-ai.com/) | `%APPDATA%\CherryStudio\Data\Agents\.claude\projects\*.jsonl` 及旧版 `%APPDATA%\CherryStudio\.claude\projects\*.jsonl`（macOS: `~/Library/Application Support/CherryStudio/Data/Agents/.claude/projects/`；Linux: `$XDG_CONFIG_HOME/CherryStudio/Data/Agents/.claude/projects/`；Agent/Claude Code 模式转录，V2 目录优先，旧目录保留未迁移历史），外加对话模式账本 `%APPDATA%\CherryStudio\Data\cherrystudio.sqlite`（macOS: `~/Library/Application Support/CherryStudio/Data/cherrystudio.sqlite`；Linux: `$XDG_CONFIG_HOME/CherryStudio/Data/cherrystudio.sqlite`；读取内置对话与助手等不写转录的界面所产生的 `ai_usage_record` 行；该表中 Agent 模式的行会被跳过，因为转录侧已经记录过它们，两套账本计入同一个客户端） |
 | <img width="48px" src="https://github.com/lmstudio-ai.png" alt="LM Studio" /> | [LM Studio](https://lmstudio.ai/) | `~/.lmstudio/server-logs/**/*.log`（支持 `LM_STUDIO_HOME`；仅读取 Chat Completions 和 Responses API 最终响应的 usage，不保存提示词或响应正文；本地推理成本为 $0） |
 | <img width="48px" src="https://github.com/unslothai.png" alt="Unsloth Studio" /> | [Unsloth Studio](https://github.com/unslothai/unsloth) | `$UNSLOTH_STUDIO_HOME/studio.db`（回退：`~/.unsloth/studio/studio.db`；精确读取内部聊天和已认证 API 的推理用量；不读取消息正文；排除训练指标；本地推理成本为 $0） |
 | <img width="48px" src=".github/assets/client-hindsight.png" alt="Hindsight" /> | [Hindsight](https://github.com/vectorize-io/hindsight) | `$HINDSIGHT_HOME/usage/*.jsonl`（回退：`~/.hindsight/usage/*.jsonl`；通过 `tokscale hindsight sync` 同步） |
@@ -292,7 +292,7 @@ tokscale models --json > report.json   # 保存到文件
 - **键盘导航**：
   - `←/→/Tab/BackTab`：切换视图
   - `↑/↓` 或 `Home/End`：导航列表
-  - `Enter`：打开每日详情（Daily 标签）/ 选择图表单元格（Stats 标签）
+  - `Enter`：打开每日详情（Daily 标签）/ 含 ms/1K 与 Cost/1M 的每日趋势（Models 标签）/ 选择图表单元格（Stats 标签）
   - `Esc` 或 `Backspace`：关闭对话框 / 退出详情视图
   - `c/d/t`：按成本/日期/Token 排序
   - `j`：跳转到今天
@@ -300,6 +300,7 @@ tokscale models --json > report.json   # 保存到文件
   - `g`：打开分组方式选择对话框（模型、客户端+模型、客户端+提供商+模型、工作区+模型、会话+模型、客户端+会话+模型）
   - `h`：切换日/时图表粒度（Overview 标签）
   - `v`：切换表格/Profile 视图（Hourly 标签）
+  - `b`：切换将子代理会话汇总到父会话显示（Sessions 标签）
   - `y`：复制选中行到剪贴板
   - `p`：循环颜色主题
   - `L`：切换浅色模式（白色背景）
@@ -1509,7 +1510,7 @@ AI 编程工具将会话数据存储在跨平台位置。大多数工具在所�
 | MiMo Code | `~/.local/share/mimocode/` | `%USERPROFILE%\.local\share\mimocode\` | 使用 XDG 数据目录；SQLite 数据库 `mimocode.db` |
 | Xiaomi MiMo AI | `~/.local/share/mimocode/` | `%USERPROFILE%\.local\share\mimocode\` | 与 MiMo Code 共用引擎数据目录；桌面会话按 `session.version` 前缀 `desktop-` 标为 `micode-desktop` |
 | Gajae-Code | `~/.gjc/agent/sessions/` | `%USERPROFILE%\.gjc\agent\sessions\` | 可通过 `GJC_CODING_AGENT_DIR`（也可用 `GJC_CONFIG_DIR`/`PI_CONFIG_DIR`；Linux/macOS 上 `$XDG_DATA_HOME/gjc/sessions/` 亦支持）配置 |
-| Cherry Studio | V2：`$XDG_CONFIG_HOME/CherryStudio/Data/Agents/.claude/projects/`（默认 `~/.config/CherryStudio/Data/Agents/.claude/projects/`；macOS: `~/Library/Application Support/CherryStudio/Data/Agents/.claude/projects/`）；V1：`$XDG_CONFIG_HOME/CherryStudio/.claude/projects/`（默认 `~/.config/CherryStudio/.claude/projects/`；macOS: `~/Library/Application Support/CherryStudio/.claude/projects/`） | V2：`%APPDATA%\CherryStudio\Data\Agents\.claude\projects\`；V1：`%APPDATA%\CherryStudio\.claude\projects\` | Agent/Claude Code 模式转录；同名会话优先使用 V2，V1 保留未迁移的历史记录 |
+| Cherry Studio | V2：`$XDG_CONFIG_HOME/CherryStudio/Data/Agents/.claude/projects/`（默认 `~/.config/CherryStudio/Data/Agents/.claude/projects/`；macOS: `~/Library/Application Support/CherryStudio/Data/Agents/.claude/projects/`）；V1：`$XDG_CONFIG_HOME/CherryStudio/.claude/projects/`（默认 `~/.config/CherryStudio/.claude/projects/`；macOS: `~/Library/Application Support/CherryStudio/.claude/projects/`）；对话模式账本：`$XDG_CONFIG_HOME/CherryStudio/Data/cherrystudio.sqlite`（默认 `~/.config/CherryStudio/Data/cherrystudio.sqlite`；macOS: `~/Library/Application Support/CherryStudio/Data/cherrystudio.sqlite`） | V2：`%APPDATA%\CherryStudio\Data\Agents\.claude\projects\`；V1：`%APPDATA%\CherryStudio\.claude\projects\`；对话模式账本：`%APPDATA%\CherryStudio\Data\cherrystudio.sqlite` | Agent/Claude Code 模式转录；同名会话优先使用 V2，V1 保留未迁移的历史记录。对话模式账本提供 `ai_usage_record` 中对话与助手调用的用量，Agent 模式的行由转录侧负责，避免重复计数 |
 | Junie | `~/.junie/sessions/` | `%USERPROFILE%\.junie\sessions\` | 所有平台使用相同的 home 相对路径；解析 `events.jsonl` 使用事件 |
 | ZCode | `~/.zcode/cli/db/db.sqlite` 和 `~/.zcode/projects/` | `%USERPROFILE%\.zcode\cli\db\db.sqlite` 和 `%USERPROFILE%\.zcode\projects\` | 解析 v2 SQLite 模型用量和旧版 `*.jsonl` 会话记录；Z.ai 的 GLM 模型专用 ADE |
 | OpenCodeReview | `~/.opencodereview/sessions/` | `%USERPROFILE%\.opencodereview\sessions\` | 解析 `*.jsonl` 会话记录；阿里巴巴的 AI 代码审查工具 |
