@@ -1017,6 +1017,37 @@ fn sandbox_config_dir(tmp: &Path) -> std::path::PathBuf {
     tmp.join(".config").join("tokscale")
 }
 
+/// Keep submit fixtures from enumerating real desktop processes. `submit` now
+/// refreshes Antigravity before scanning; HOME alone cannot contain `ps` or
+/// PowerShell discovery. The child executes only this fixture-owned shim, which
+/// reports no candidate processes on every supported platform.
+fn discovery_shim_path(tmp: &Path) -> std::ffi::OsString {
+    let bin = tmp.join(".tokscale-test-bin");
+    fs::create_dir_all(&bin).unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let ps = bin.join("ps");
+        fs::write(&ps, "#!/bin/sh\nprintf 'PID PPID COMMAND\\n'\n").unwrap();
+        fs::set_permissions(&ps, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(windows)]
+    {
+        // `Command::new("powershell")` resolves this through PATHEXT before
+        // the host PowerShell. Its JSON is the empty process collection expected
+        // by `parse_windows_process_candidates`.
+        fs::write(bin.join("powershell.cmd"), "@echo []\r\n").unwrap();
+    }
+
+    let mut paths = vec![bin];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    std::env::join_paths(paths).unwrap()
+}
+
 fn cmd_with_home(tmp: &Path) -> Command {
     let mut cmd = cargo_bin_cmd!("tokscale");
     cmd.env("HOME", tmp)
@@ -1024,6 +1055,7 @@ fn cmd_with_home(tmp: &Path) -> Command {
         .env("XDG_DATA_HOME", tmp.join(".local/share"))
         .env("XDG_CACHE_HOME", tmp.join(".cache"))
         .env("TOKSCALE_CONFIG_DIR", sandbox_config_dir(tmp))
+        .env("PATH", discovery_shim_path(tmp))
         // `pricing` intentionally bypasses TOKSCALE_PRICING_CACHE_ONLY; the
         // loopback proxies below are the offline guarantee for every command.
         .env("TOKSCALE_PRICING_CACHE_ONLY", "1")
@@ -3480,6 +3512,7 @@ fn test_submit_tip_recommends_only_the_client_filter() {
         .stdout(predicate::str::contains(
             "Tip: narrow the scan with `--client <id>` for a faster submit.",
         ))
+        .stdout(predicate::str::contains("Syncing Antigravity usage data...").not())
         .stdout(predicate::str::is_match(r"Tip:.*--since").unwrap().not());
 }
 
@@ -3613,6 +3646,14 @@ fn test_models_json_output() {
         .unwrap();
     assert!(output.status.success());
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert_eq!(
+        json["undatedTokens"],
+        serde_json::json!({
+            "input":0, "output":0, "cacheRead":0, "cacheWrite":0,
+            "cacheWrite1h":0, "reasoning":0,
+        })
+    );
 
     assert!(json.get("groupBy").is_some(), "Missing groupBy field");
     assert!(json.get("entries").is_some(), "Missing entries field");
@@ -5198,7 +5239,7 @@ fn test_clients_json_includes_claude_desktop_diagnostic() {
     let diagnostics = claude["diagnostics"].as_array().unwrap();
 
     assert!(diagnostics.iter().any(|item| {
-        item["code"] == "claude_desktop_not_scanned"
+        item["code"] == "claude_desktop_partial_history"
             && item["severity"] == "warning"
             && item["message"]
                 .as_str()
@@ -5332,8 +5373,8 @@ fn test_clients_home_override_ignores_conflicting_claude_config_dir_env() {
     let diagnostics = claude["diagnostics"].as_array().unwrap();
     let desktop_diagnostic = diagnostics
         .iter()
-        .find(|item| item["code"] == "claude_desktop_not_scanned")
-        .expect("claude_desktop_not_scanned diagnostic should be present");
+        .find(|item| item["code"] == "claude_desktop_partial_history")
+        .expect("claude_desktop_partial_history diagnostic should be present");
     let paths = desktop_diagnostic["paths"].as_array().unwrap();
 
     for label in ["claudeCodeProjects", "claudeCodeTranscripts"] {
@@ -5367,7 +5408,7 @@ fn test_clients_command_includes_claude_desktop_diagnostic_text() {
             "Claude Desktop app data was detected",
         ))
         .stdout(predicate::str::contains(
-            "Claude Code JSONL transcripts only",
+            "Local transcripts and available conversation-cache counters",
         ));
 }
 
@@ -5386,11 +5427,11 @@ fn test_models_json_includes_claude_desktop_diagnostic_for_empty_explicit_claude
     let diagnostics = json["diagnostics"].as_array().unwrap();
 
     assert!(diagnostics.iter().any(|item| {
-        item["code"] == "claude_desktop_not_scanned"
+        item["code"] == "claude_desktop_partial_history"
             && item["message"]
                 .as_str()
                 .unwrap()
-                .contains("Tokscale counts Claude Code JSONL transcripts")
+                .contains("Local transcripts and available conversation-cache counters")
     }));
 }
 
