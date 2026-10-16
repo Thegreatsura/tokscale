@@ -1,3 +1,4 @@
+mod amp;
 mod antigravity;
 mod auth;
 mod claude_diagnostics;
@@ -348,6 +349,11 @@ enum Commands {
         #[command(subcommand)]
         subcommand: CodexSubcommand,
     },
+    #[command(about = "Amp thread sync commands (exports threads via the amp CLI)")]
+    Amp {
+        #[command(subcommand)]
+        subcommand: AmpSubcommand,
+    },
     #[command(about = "Cursor API cache integration commands")]
     Cursor {
         #[command(subcommand)]
@@ -451,6 +457,17 @@ enum ConfigSubcommand {
     Unset {
         #[arg(help = "Setting name (timezone)")]
         key: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AmpSubcommand {
+    #[command(about = "Export Amp threads into the local cache via the amp CLI")]
+    Sync {
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(long, help = "Total sync timeout in seconds (default: 60)")]
+        timeout: Option<u64>,
     },
 }
 
@@ -926,6 +943,12 @@ fn main() -> Result<()> {
                 show_clients,
                 disable_pinned,
             )
+        }
+        Some(Commands::Amp { subcommand }) => {
+            reject_unsupported_home_override(&cli.home, "amp")?;
+            match subcommand {
+                AmpSubcommand::Sync { json, timeout } => amp::run_amp_sync(json, timeout),
+            }
         }
         Some(Commands::Cursor { subcommand }) => {
             reject_unsupported_home_override(&cli.home, "cursor")?;
@@ -1507,6 +1530,12 @@ fn client_filter_includes_cursor(clients: &Option<Vec<String>>) -> bool {
         .is_none_or(|sources| sources.iter().any(|source| source == "cursor"))
 }
 
+fn client_filter_includes_amp(clients: &Option<Vec<String>>) -> bool {
+    clients
+        .as_ref()
+        .is_none_or(|sources| sources.iter().any(|source| source == "amp"))
+}
+
 fn client_filter_explicitly_requests_cursor(clients: &Option<Vec<String>>) -> bool {
     clients
         .as_ref()
@@ -1729,6 +1758,23 @@ fn should_auto_sync_cursor_for_local_report(
     clients: &Option<Vec<String>>,
 ) -> bool {
     home_dir.is_none() && client_filter_includes_cursor(clients)
+}
+
+fn auto_sync_amp_for_local_report(
+    home_dir: &Option<String>,
+    clients: &Option<Vec<String>>,
+) -> Option<amp::AutoSyncAmpResult> {
+    if home_dir.is_some() || !client_filter_includes_amp(clients) {
+        return None;
+    }
+    Some(amp::auto_sync_status())
+}
+
+fn emit_amp_sync_warning(warning: Option<&str>) {
+    if let Some(warning) = warning {
+        use colored::Colorize;
+        eprintln!("{}", warning.yellow());
+    }
 }
 
 fn auto_sync_cursor_for_local_report(
@@ -4934,6 +4980,10 @@ struct TsTimeMetrics {
 
 const SUBMISSION_PARSER_VERSION: u32 = 1;
 const COPILOT_SUBMISSION_PARSER_VERSION: u32 = 2;
+// Amp v2 moves existing exported messages from synthesized creation-time dates
+// to the server-provided usage timestamp. The receiver replaces the complete
+// Amp daily layout at this generation, preserving lifetime totals.
+const AMP_SUBMISSION_PARSER_VERSION: u32 = 2;
 // The receiver admits the MiMo CLI/desktop split atomically only when both
 // selected surfaces declare this generation and cover the credited history.
 // This is a submission contract, independent of the on-disk parser cache version.
@@ -4944,6 +4994,7 @@ const MICODE_SUBMISSION_PARSER_VERSION: u32 = 2;
 struct TsScanScope {
     parser_versions: std::collections::BTreeMap<String, u32>,
     full_history: bool,
+    full_history_clients: Vec<String>,
 }
 
 /// Submission-level provenance (#888): history recovered from an aggregate
@@ -5086,11 +5137,17 @@ fn to_ts_token_contribution_data(
 /// Parser identity is declared for every scanned client, even for a partial
 /// date range. `full_history` is a separate capability bit: only an unbounded
 /// scan can establish or advance a cumulative rollout high-water.
-fn submit_scan_scope(clients: Option<&[String]>, full_history: bool) -> Option<TsScanScope> {
-    let parser_versions = clients?
+fn submit_scan_scope(
+    clients: Option<&[String]>,
+    full_history: bool,
+    amp_full_history_safe: bool,
+) -> Option<TsScanScope> {
+    let clients = clients?;
+    let parser_versions = clients
         .iter()
         .map(|client| {
             let version = match client.as_str() {
+                "amp" => AMP_SUBMISSION_PARSER_VERSION,
                 "copilot" => COPILOT_SUBMISSION_PARSER_VERSION,
                 "micode" | "micode-desktop" => MICODE_SUBMISSION_PARSER_VERSION,
                 _ => SUBMISSION_PARSER_VERSION,
@@ -5098,9 +5155,21 @@ fn submit_scan_scope(clients: Option<&[String]>, full_history: bool) -> Option<T
             (client.clone(), version)
         })
         .collect();
+    let full_history_clients = if full_history {
+        clients
+            .iter()
+            .filter(|client| client.as_str() != "amp" || amp_full_history_safe)
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let every_client_complete = full_history_clients.len() == clients.len();
     Some(TsScanScope {
         parser_versions,
-        full_history,
+        // Fail closed for receivers predating `fullHistoryClients`.
+        full_history: full_history && every_client_complete,
+        full_history_clients,
     })
 }
 
@@ -6467,7 +6536,6 @@ fn run_submit_command(
     let full_history_scan = since.is_none() && until.is_none() && year.is_none();
     let explicit_client_filter = clients.is_some();
     let clients = clients.or_else(|| Some(default_submit_clients()));
-    let scan_scope = submit_scan_scope(clients.as_deref(), full_history_scan);
 
     let include_cursor = clients
         .as_ref()
@@ -6563,6 +6631,19 @@ fn run_submit_command(
             }
         }
     }
+    let amp_sync = auto_sync_amp_for_local_report(&report_home, &clients);
+    emit_amp_sync_warning(
+        amp_sync
+            .as_ref()
+            .and_then(|result| result.warning.as_deref()),
+    );
+    let scan_scope = submit_scan_scope(
+        clients.as_deref(),
+        full_history_scan,
+        amp_sync
+            .as_ref()
+            .is_none_or(amp::AutoSyncAmpResult::allows_full_history),
+    );
     if explicit_cursor_filter || explicit_warp_filter || explicit_hindsight_filter {
         let cursor_setup_warnings = setup_warnings_for_report(&report_home, &clients);
         emit_cursor_setup_warnings(&cursor_setup_warnings);
@@ -9511,8 +9592,8 @@ mod tests {
     #[test]
     fn submit_scan_scope_separates_parser_identity_from_full_history() {
         let clients = vec!["codex".to_string(), "copilot".to_string()];
-        let full = submit_scan_scope(Some(&clients), true).expect("full scope");
-        let partial = submit_scan_scope(Some(&clients), false).expect("partial scope");
+        let full = submit_scan_scope(Some(&clients), true, true).expect("full scope");
+        let partial = submit_scan_scope(Some(&clients), false, true).expect("partial scope");
 
         assert!(full.full_history);
         assert!(!partial.full_history);
@@ -9526,9 +9607,28 @@ mod tests {
     }
 
     #[test]
+    fn submit_scan_scope_gates_amp_full_history_on_cache_completeness() {
+        let clients = vec!["amp".to_string(), "codex".to_string()];
+        let incomplete = submit_scan_scope(Some(&clients), true, false).expect("scope");
+        let complete = submit_scan_scope(Some(&clients), true, true).expect("scope");
+
+        assert_eq!(
+            incomplete.parser_versions.get("amp"),
+            Some(&AMP_SUBMISSION_PARSER_VERSION)
+        );
+        assert!(!incomplete.full_history);
+        assert!(!incomplete.full_history_clients.contains(&"amp".to_string()));
+        assert!(incomplete
+            .full_history_clients
+            .contains(&"codex".to_string()));
+        assert!(complete.full_history);
+        assert!(complete.full_history_clients.contains(&"amp".to_string()));
+    }
+
+    #[test]
     fn submit_scan_scope_keeps_a_partial_client_filter_narrow() {
         let clients = vec!["codex".to_string()];
-        let scope = submit_scan_scope(Some(&clients), true).expect("codex scope");
+        let scope = submit_scan_scope(Some(&clients), true, true).expect("codex scope");
 
         assert_eq!(
             scope.parser_versions,
@@ -9540,7 +9640,7 @@ mod tests {
     fn submit_scan_scope_declares_micode_family_without_expanding_selection() {
         let clients = vec!["micode".to_string(), "micode-desktop".to_string()];
         for full_history in [true, false] {
-            let scope = submit_scan_scope(Some(&clients), full_history).unwrap();
+            let scope = submit_scan_scope(Some(&clients), full_history, true).unwrap();
             let json = serde_json::to_value(&scope).unwrap();
             assert_eq!(json["parserVersions"]["micode"], 2);
             assert_eq!(json["parserVersions"]["micode-desktop"], 2);
@@ -9549,7 +9649,7 @@ mod tests {
         }
 
         for selected in ["micode", "micode-desktop"] {
-            let scope = submit_scan_scope(Some(&[selected.to_string()]), true).unwrap();
+            let scope = submit_scan_scope(Some(&[selected.to_string()]), true, true).unwrap();
             assert_eq!(
                 scope.parser_versions,
                 std::collections::BTreeMap::from([(
@@ -9570,7 +9670,7 @@ mod tests {
     #[test]
     fn submit_scan_scope_declares_the_droid_generation_the_server_registers() {
         let clients = vec!["droid".to_string()];
-        let scope = submit_scan_scope(Some(&clients), true).expect("droid scope");
+        let scope = submit_scan_scope(Some(&clients), true, true).expect("droid scope");
 
         assert_eq!(scope.parser_versions.get("droid"), Some(&1));
     }

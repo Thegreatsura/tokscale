@@ -54,6 +54,13 @@ const CACHE_FORMAT_VERSION: u32 = 10;
 // version moves too because those entries also serialize UnifiedMessage, so
 // it stays one ahead of CACHE_FORMAT_VERSION as both move together.
 const MICODE_CACHE_FORMAT_VERSION: u32 = 11;
+// Claude stores the point a grown transcript resumes from beside each cached
+// entry, in its own envelope for the same reason MiMo does: a new field on
+// CachedSourceEntry would need a CACHE_FORMAT_VERSION bump, and Claude entries
+// hold retained history a reparse cannot rebuild. A Claude shard written at
+// CACHE_FORMAT_VERSION still loads, without checkpoints. It stays above
+// MICODE_CACHE_FORMAT_VERSION and moves with it.
+const CLAUDE_CACHE_FORMAT_VERSION: u32 = 12;
 const LEGACY_CACHE_FORMAT_VERSION_V4: u32 = 4;
 const LEGACY_CACHE_FORMAT_VERSION_V5: u32 = 5;
 const LEGACY_CACHE_FORMAT_VERSION_V6: u32 = 6;
@@ -1397,14 +1404,16 @@ fn parser_version(client: ClientId) -> u32 {
         // Codex sessions and archives.
         // v14->v15: assign stable cross-copy dedup keys to usage rows that use
         // the file-mtime fallback timestamp, and persist their event ordinal.
-        // v15->v16: a `token_usage_record` that no token_count confirms (a
-        // context compaction request, or a response whose turn ended before
-        // its token_count) is now counted from the record, and the parse state
-        // carries the pending and settled records beside v15's event ordinal.
-        // A finished rollout never changes, so a v15 entry would keep serving
-        // the totals without those responses. OpenClaw's codex-home rollouts
-        // share this identity.
-        ClientId::Codex => 16,
+        // v15->v16: count token_usage_record rows that no token_count confirms,
+        // including context compaction requests, and retain the pending/settled
+        // record state needed to do so.
+        // v16->v17: safely skip oversized JSONL records while retaining later
+        // usage in large compressed rollouts. v16 cache entries predate this
+        // bounded parser behavior and must be reparsed.
+        // v17->v18: settle pending token_usage_record rows when turn_aborted or
+        // task_complete ends their turn. Completed v17 rollouts keep the same
+        // fingerprint, so their undercounted entries must be reparsed.
+        ClientId::Codex => 18,
         // v4->v5: jcode's assistant-message timestamp is now back-calculated
         // to the turn start (timestamp - tool_duration_ms) instead of using
         // the recorded (end-anchored) timestamp directly. Follow-up to #890.
@@ -1512,7 +1521,12 @@ fn parser_version(client: ClientId) -> u32 {
         // v1->v2: per-model token attribution now comes from
         // session_model_usage instead of crediting the whole session to
         // sessions.model, and dedup keys are namespaced per (session, model).
-        ClientId::Hermes => 2,
+        // v2->v3: a session's buckets are split across the days its logged
+        // API calls fall in, so timestamps, per-day rows, and dedup keys all
+        // change shape; cached aggregates from before the split must miss.
+        // v3->v4: parser-owned key markers distinguish logged evidence from a
+        // residual start-day share and from user-controlled date-like suffixes.
+        ClientId::Hermes => 4,
         // v1->v2: Unsloth Studio now reads the responding model and provider
         // route from scalar responseDetails fields. Reparse cached rows so
         // local usage stays authoritatively free, metered providers receive
@@ -1585,7 +1599,11 @@ fn parser_version(client: ClientId) -> u32 {
         // v6->v7: attempt sequence numbers restart in each transcript, so
         // fallback attempt keys now include the session id to avoid merging
         // unrelated sessions in the shared parse lane.
-        ClientId::Dsh => 7,
+        // v7->v8: a settlement now measures its own call against the
+        // `step/start` clock of its `(turn, step)` and carries `duration_ms`.
+        // Transcripts are append-only, so every cached row predates that field
+        // and would keep the client reporting zero throughput until reparsed.
+        ClientId::Dsh => 8,
         // First version of the fx (vercel-labs) usage-v2.json parser. Entries
         // are versioned from the start so later parser changes have an
         // obvious local counter to bump, like every other client here.
@@ -1595,6 +1613,10 @@ fn parser_version(client: ClientId) -> u32 {
         // byte-identical before and after, so only this bump discards the v1
         // rows still holding a provider-reported zero.
         ClientId::Fx => 2,
+        // v1->v2: `amp threads export` payloads carry a per-message
+        // `usage.timestamp`. Reparse old rows so those messages move off the
+        // synthesized `created + messageId * 1000` time onto their real day.
+        ClientId::Amp => 2,
         // The remaining clients parse their own formats and have never
         // shipped a parser-only change that leaves byte-identical input
         // parsing differently, so all of them are at version 1. Repeating
@@ -1609,7 +1631,6 @@ fn parser_version(client: ClientId) -> u32 {
         // either added to a shared family (its version then derives from
         // the family's driver base) or given an explicit independent arm.
         ClientId::Gemini => 1,
-        ClientId::Amp => 1,
         ClientId::Qwen => 1,
         ClientId::Mux => 1,
         ClientId::Crush => 1,
@@ -1756,6 +1777,12 @@ pub(crate) struct CachedSourceEntry {
     /// field: the namespace-specific envelope serializes it beside that entry.
     #[serde(skip)]
     pub micode_metadata: Option<Vec<crate::sessions::micode::MiMoRowMetadata>>,
+    /// Claude-only point a later scan of a grown transcript continues from.
+    /// Like MiMo's provenance it is serialized beside the entry in a Claude
+    /// envelope, so the positional layout of Claude entries, which hold
+    /// retained history, does not change.
+    #[serde(skip)]
+    pub claude_checkpoint: Option<crate::sessions::claudecode::ClaudeCheckpoint>,
 }
 
 /// TokenBreakdown wire layout used by cache formats 4 through 8, before
@@ -2119,6 +2146,7 @@ impl From<LegacyCachedSourceEntryV7> for CachedSourceEntry {
             prime_accounting: entry.prime_accounting,
             opencode_incremental: entry.opencode_incremental,
             micode_metadata: None,
+            claude_checkpoint: None,
         }
     }
 }
@@ -2152,6 +2180,7 @@ impl From<LegacyCachedSourceEntryV8> for CachedSourceEntry {
             prime_accounting: entry.prime_accounting,
             opencode_incremental: entry.opencode_incremental,
             micode_metadata: None,
+            claude_checkpoint: None,
         }
     }
 }
@@ -2185,6 +2214,7 @@ impl From<LegacyCachedSourceEntryV9> for CachedSourceEntry {
             prime_accounting: entry.prime_accounting,
             opencode_incremental: entry.opencode_incremental,
             micode_metadata: None,
+            claude_checkpoint: None,
         }
     }
 }
@@ -2217,6 +2247,7 @@ impl From<LegacyCachedSourceEntryV4> for CachedSourceEntry {
             prime_accounting: None,
             opencode_incremental: None,
             micode_metadata: None,
+            claude_checkpoint: None,
         }
     }
 }
@@ -2249,6 +2280,7 @@ impl From<LegacyCachedSourceEntryV5> for CachedSourceEntry {
             prime_accounting: entry.prime_accounting,
             opencode_incremental: None,
             micode_metadata: None,
+            claude_checkpoint: None,
         }
     }
 }
@@ -2298,6 +2330,7 @@ impl From<LegacyCachedSourceEntryV6> for CachedSourceEntry {
             prime_accounting: entry.prime_accounting,
             opencode_incremental: None,
             micode_metadata: None,
+            claude_checkpoint: None,
         }
     }
 }
@@ -2322,6 +2355,7 @@ impl CachedSourceEntry {
             prime_accounting: None,
             opencode_incremental: None,
             micode_metadata: None,
+            claude_checkpoint: None,
         }
     }
 
@@ -2330,6 +2364,17 @@ impl CachedSourceEntry {
         metadata: Vec<crate::sessions::micode::MiMoRowMetadata>,
     ) -> Self {
         self.micode_metadata = Some(metadata);
+        self
+    }
+
+    /// Attach the point a later Claude scan resumes from. It describes the
+    /// first `message_count` messages of this entry, which are the live parse;
+    /// retained history follows them.
+    pub(crate) fn with_claude_checkpoint(
+        mut self,
+        checkpoint: Option<crate::sessions::claudecode::ClaudeCheckpoint>,
+    ) -> Self {
+        self.claude_checkpoint = checkpoint;
         self
     }
 
@@ -2386,6 +2431,7 @@ impl CachedSourceEntry {
             prime_accounting: self.prime_accounting.take(),
             opencode_incremental: self.opencode_incremental.take(),
             micode_metadata: self.micode_metadata.take(),
+            claude_checkpoint: self.claude_checkpoint.take(),
         }
     }
 
@@ -3325,6 +3371,32 @@ fn read_shard_with_limit(
         };
     }
 
+    if envelope.format_version == CLAUDE_CACHE_FORMAT_VERSION {
+        if identity.namespace != ClientId::Claude.as_str() {
+            return ShardReadStatus::Stale;
+        }
+        type ClaudeWireEntry = (
+            CachedSourceEntry,
+            Option<crate::sessions::claudecode::ClaudeCheckpoint>,
+        );
+        return match bincode::options()
+            .with_limit(max_shard_bytes)
+            .deserialize::<Vec<ClaudeWireEntry>>(&envelope.payload)
+        {
+            Ok(entries) => ShardReadStatus::Loaded(
+                entries
+                    .into_iter()
+                    .map(|(entry, checkpoint)| {
+                        let checkpoint =
+                            checkpoint.filter(|checkpoint| checkpoint.has_valid_integrity());
+                        entry.with_claude_checkpoint(checkpoint)
+                    })
+                    .collect(),
+            ),
+            Err(error) => ShardReadStatus::Invalid(error.to_string()),
+        };
+    }
+
     if envelope.format_version == LEGACY_MICODE_CACHE_FORMAT_VERSION_V10
         && identity.namespace == ClientId::MiMoCode.as_str()
     {
@@ -3489,10 +3561,19 @@ fn write_shard_with_limit(
     max_shard_bytes: u64,
 ) -> std::io::Result<()> {
     let is_micode = identity.namespace == ClientId::MiMoCode.as_str();
+    let is_claude = identity.namespace == ClientId::Claude.as_str();
     let payload = if is_micode {
         let entries: Vec<_> = entries
             .iter()
             .map(|entry| (entry, &entry.micode_metadata))
+            .collect();
+        bincode::options()
+            .with_limit(max_shard_bytes)
+            .serialize(&entries)
+    } else if is_claude {
+        let entries: Vec<_> = entries
+            .iter()
+            .map(|entry| (entry, &entry.claude_checkpoint))
             .collect();
         bincode::options()
             .with_limit(max_shard_bytes)
@@ -3506,6 +3587,8 @@ fn write_shard_with_limit(
     let envelope = CachedShardEnvelope {
         format_version: if is_micode {
             MICODE_CACHE_FORMAT_VERSION
+        } else if is_claude {
+            CLAUDE_CACHE_FORMAT_VERSION
         } else {
             CACHE_FORMAT_VERSION
         },
@@ -4734,10 +4817,12 @@ mod tests {
         // v11->v13 retains source completeness and gateway activity for empty
         // results, v13->v14 decodes compressed archives (.jsonl.zst),
         // v14->v15 stabilizes fallback-timestamp dedup across rollout copies,
-        // and v15->v16 counts usage records no token_count confirms.
+        // v15->v16 counts usage records no token_count confirms, v16->v17
+        // skips oversized records while preserving later usage, and v17->v18
+        // settles pending usage when terminal events end a turn.
         // Each bump is what stops an existing cache from replaying the old
         // rows, so it has to be asserted rather than assumed.
-        assert_eq!(parser_version(ClientId::Codex), 16);
+        assert_eq!(parser_version(ClientId::Codex), 18);
         assert_eq!(parser_version(ClientId::Claude), 2);
     }
 
@@ -4867,8 +4952,49 @@ mod tests {
 
     #[test]
     fn test_lossy_jsonl_parser_versions_invalidate_v3_entries() {
-        assert_eq!(parser_version(ClientId::PrimeAgent), 6);
+        assert_eq!(parser_version(ClientId::PrimeAgent), 7);
         assert_eq!(parser_version(ClientId::Reasonix), 4);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pi_duration_parser_versions_reject_unchanged_untimed_shards() {
+        let temp_home = TempDir::new().unwrap();
+        let _cache_env = sandbox_cache_env(temp_home.path());
+        let source = write_temp_file(
+            b"{\"type\":\"session\",\"id\":\"timed\"}\n{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-5\",\"durationMs\":2500,\"usage\":{\"output\":50}}}\n",
+        );
+        let fingerprint = SourceFingerprint::from_path(source.path()).unwrap();
+        for (client, previous_version) in [
+            (ClientId::Pi, 4),
+            (ClientId::Kimchi, 3),
+            (ClientId::Omp, 3),
+            (ClientId::Senpi, 3),
+            (ClientId::PrimeAgent, 6),
+        ] {
+            let current = CacheIdentity::for_client(client);
+            assert_eq!(current.parser_version, previous_version + 1, "{client:?}");
+            let previous = CacheIdentity {
+                namespace: current.namespace,
+                parser_version: previous_version,
+            };
+            let shard = cache_shard_path(current, source.path());
+            ensure_cache_dir(shard.parent().unwrap()).unwrap();
+            write_shard_with_limit(
+                &shard,
+                previous,
+                &[test_entry(previous, source.path(), "untimed")],
+                MAX_CACHE_SHARD_BYTES,
+            )
+            .unwrap();
+            assert!(SourceMessageCache::load()
+                .get(current, source.path())
+                .is_none());
+            assert_eq!(
+                SourceFingerprint::from_path(source.path()).unwrap(),
+                fingerprint
+            );
+        }
     }
 
     #[test]
@@ -4880,7 +5006,7 @@ mod tests {
                 b"{\"type\":\"session\",\"version\":3,\"id\":\"root\",\"cwd\":\"/tmp/project\"}\n{\"type\":\"message\",\"id\":\"valid\",\"message\":{\"role\":\"assistant\",\"provider\":\"anthropic\",\"model\":\"claude-opus-5\",\"usage\":{\"input\":20,\"output\":8}}}\n".as_slice(),
                 "stale-prime-v3",
                 "anthropic",
-                6,
+                7,
             ),
             (
                 ClientId::Reasonix,
@@ -4963,8 +5089,80 @@ mod tests {
     }
 
     #[test]
-    fn test_hermes_parser_version_invalidates_v1_entries() {
-        assert_eq!(parser_version(ClientId::Hermes), 2);
+    fn test_hermes_parser_version_invalidates_ambiguous_day_keys() {
+        assert_eq!(parser_version(ClientId::Hermes), 4);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn hermes_v3_shard_misses_and_is_rebuilt_under_v4_identity() {
+        let cache_home = TempDir::new().unwrap();
+        let _cache_env = sandbox_cache_env(cache_home.path());
+        let source = write_temp_file(b"unchanged Hermes source");
+        let fingerprint = SourceFingerprint::from_path(source.path()).unwrap();
+        let current_identity = CacheIdentity::for_client(ClientId::Hermes);
+        assert_eq!(current_identity.parser_version, 4);
+        let stale_identity = CacheIdentity {
+            namespace: current_identity.namespace,
+            parser_version: 3,
+        };
+        let stale_message = UnifiedMessage::new(
+            "hermes",
+            "glm-5.2",
+            "zai",
+            "session",
+            1_775_100_000_000,
+            TokenBreakdown {
+                input: 999,
+                ..Default::default()
+            },
+            0.99,
+        );
+        let mut stale_cache = SourceMessageCache::default();
+        stale_cache.insert(CachedSourceEntry::new(
+            stale_identity,
+            source.path(),
+            fingerprint.clone(),
+            vec![stale_message],
+            Vec::new(),
+            None,
+        ));
+        stale_cache.save_if_dirty();
+
+        let mut current_cache = SourceMessageCache::load();
+        assert!(
+            current_cache.get(current_identity, source.path()).is_none(),
+            "an unchanged v3 Hermes shard must miss under the v4 identity"
+        );
+
+        let mut rebuilt = UnifiedMessage::new(
+            "hermes",
+            "glm-5.2",
+            "zai",
+            "session",
+            1_775_100_000_000,
+            TokenBreakdown {
+                input: 10,
+                ..Default::default()
+            },
+            0.01,
+        );
+        rebuilt.dedup_key =
+            Some("hermes:session:glm-5.2:zai:__hermes_logged_day_v1__:2026-04-01".to_string());
+        current_cache.insert(CachedSourceEntry::new(
+            current_identity,
+            source.path(),
+            fingerprint,
+            vec![rebuilt.clone()],
+            Vec::new(),
+            None,
+        ));
+        current_cache.save_if_dirty();
+
+        let warm = SourceMessageCache::load();
+        let entry = warm.get(current_identity, source.path()).unwrap();
+        assert_eq!(entry.parser_version, 4);
+        assert_eq!(entry.messages, vec![rebuilt]);
     }
 
     #[test]
@@ -5260,8 +5458,133 @@ mod tests {
         cache.save_if_dirty();
         let warm = SourceMessageCache::load();
         let cached = warm.get(identity, &source).unwrap();
-        assert_eq!(cached.parser_version, 16);
+        assert_eq!(cached.parser_version, 18);
         assert_eq!(cached.messages, parsed);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn codex_v17_shards_are_reparsed_with_terminal_usage_records() {
+        // A response cut off before token_count leaves its usage only in a
+        // `token_usage_record`; turn_aborted proves that no confirmation can
+        // follow. A finished rollout keeps its fingerprint, and the loader
+        // serves a nonempty entry for an unchanged file without calling the
+        // parser, so only the version bump can retire the undercounted v17
+        // entry and include the terminal turn's usage.
+        let temp_home = TempDir::new().unwrap();
+        let _cache_env = sandbox_cache_env(temp_home.path());
+        let sessions = temp_home.path().join(".codex/sessions/2026/10/01");
+        fs::create_dir_all(&sessions).unwrap();
+        let source =
+            sessions.join("rollout-2026-10-01T00-00-00-01a0f000-0000-7000-8000-000000000001.jsonl");
+        fs::write(
+            &source,
+            br#"{"timestamp":"2026-10-01T00:00:00Z","type":"session_meta","payload":{"id":"01a0f000-0000-7000-8000-000000000001","originator":"codex_vscode","source":"vscode","model_provider":"openai"}}
+{"timestamp":"2026-10-01T00:01:00Z","type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-5.5"}}
+{"timestamp":"2026-10-01T00:01:05Z","type":"token_usage_record","payload":{"turn_id":"turn-1","response_id":"resp-1","usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":10,"total_tokens":110}}}
+{"timestamp":"2026-10-01T00:01:05.005Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":10,"total_tokens":110},"last_token_usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":10,"total_tokens":110}}}}
+{"timestamp":"2026-10-01T00:02:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}
+{"timestamp":"2026-10-01T00:02:00.005Z","type":"token_usage_record","payload":{"turn_id":"turn-2","response_id":"resp-2","usage":{"input_tokens":500,"cached_input_tokens":200,"output_tokens":40,"total_tokens":540}}}
+{"timestamp":"2026-10-01T00:02:00.010Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-2"}}
+"#,
+        )
+        .unwrap();
+
+        let identity = CacheIdentity::for_client(ClientId::Codex);
+        let stale_identity = CacheIdentity {
+            parser_version: 17,
+            ..identity
+        };
+        let fingerprint = SourceFingerprint::from_path(&source).unwrap();
+        // What v17 cached: the token_count row of turn 1 only. Its incremental
+        // metadata is valid for the unchanged file, so generation v17 would
+        // reuse this undercounted row instead of reparsing.
+        let stale_entry = CachedSourceEntry::new(
+            stale_identity,
+            &source,
+            fingerprint.clone(),
+            vec![UnifiedMessage::new(
+                identity.namespace,
+                "gpt-5.5",
+                "openai",
+                "01a0f000-0000-7000-8000-000000000001",
+                1790812865000,
+                TokenBreakdown {
+                    input: 20,
+                    output: 10,
+                    cache_read: 80,
+                    cache_write: 0,
+                    cache_write_1h: 0,
+                    reasoning: 0,
+                },
+                0.0,
+            )],
+            Vec::new(),
+            Some(CodexIncrementalCache {
+                state: CodexParseState::default(),
+                consumed_offset: fingerprint.size,
+                ends_with_newline: true,
+                prefix_hash: fingerprint.content_hash,
+            }),
+        );
+        assert!(codex_cache_entry_matches_fingerprint(
+            &stale_entry,
+            &fingerprint
+        ));
+        let shard = cache_shard_path(identity, &source);
+        ensure_cache_dir(shard.parent().unwrap()).unwrap();
+        write_shard_with_limit(
+            &shard,
+            stale_identity,
+            &[stale_entry],
+            MAX_CACHE_SHARD_BYTES,
+        )
+        .unwrap();
+
+        assert_eq!(SourceFingerprint::from_path(&source).unwrap(), fingerprint);
+        let options = crate::LocalParseOptions {
+            home_dir: Some(temp_home.path().to_string_lossy().into_owned()),
+            use_env_roots: false,
+            clients: Some(vec!["codex".to_string()]),
+            ..crate::LocalParseOptions::default()
+        };
+
+        // Drive the complete production scanner/cache path. It must reject
+        // the unchanged v17 entry and fully parse the terminal turn.
+        let reparsed = crate::parse_local_unified_messages_with_pricing(options.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(reparsed.len(), 2);
+        assert_eq!(
+            reparsed
+                .iter()
+                .map(|message| message.tokens.total())
+                .sum::<i64>(),
+            110 + 540
+        );
+
+        let fresh_cache = SourceMessageCache::load();
+        let fresh_entry = fresh_cache
+            .get(identity, &source)
+            .expect("the production scan must persist a v18 replacement");
+        assert_eq!(fresh_entry.parser_version, 18);
+        assert!(
+            codex_cache_entry_matches_fingerprint(&fresh_entry, &fingerprint),
+            "the v18 replacement must carry valid incremental metadata"
+        );
+
+        // Scan again through the same production path and verify that the
+        // valid warm entry preserves the reparsed result.
+        let cached = crate::parse_local_unified_messages_with_pricing(options, None)
+            .await
+            .unwrap();
+        assert_eq!(cached, reparsed);
+        let warm_cache = SourceMessageCache::load();
+        let warm_entry = warm_cache.get(identity, &source).unwrap();
+        assert!(codex_cache_entry_matches_fingerprint(
+            &warm_entry,
+            &fingerprint
+        ));
     }
 
     #[test]
@@ -5486,8 +5809,9 @@ mod tests {
     #[test]
     fn test_dsh_attempt_identity_parser_version_invalidates_v6_entries() {
         // DSH transcript files are append-only, so v6 cache entries keep the
-        // old cross-session attempt keys unless the source is reparsed.
-        assert_eq!(parser_version(ClientId::Dsh), 7);
+        // old cross-session attempt keys unless the source is reparsed. The
+        // v7->v8 bump retires rows parsed without generation durations.
+        assert_eq!(parser_version(ClientId::Dsh), 8);
     }
 
     /// Names the row that only a served cache can put in a report. No DSH
@@ -5743,6 +6067,83 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn dsh_v7_shards_are_reparsed_with_generation_duration() {
+        let temp_home = TempDir::new().unwrap();
+        let _cache_env = sandbox_cache_env(temp_home.path());
+        let source_home = TempDir::new().unwrap();
+        let source = write_dsh_transcript(
+            source_home.path(),
+            "session-duration",
+            br#"{"type":"session","id":"session-duration","createdAt":1,"cwd":"/work"}
+{"type":"step/start","seq":1,"time":1786669450000,"data":{"turn":1,"step":1}}
+{"type":"assistant/message","seq":2,"time":1786669451200,"data":{"turn":1,"step":1,"message":{"source":{"provider":"irix","model":"deepseek-v4-flash"}},"usage":{"inputTokens":130,"outputTokens":159}}}
+"#,
+        );
+        let current_identity = CacheIdentity::for_client(ClientId::Dsh);
+        assert_eq!(current_identity.parser_version, 8);
+        let stale_identity = CacheIdentity {
+            namespace: current_identity.namespace,
+            parser_version: 7,
+        };
+        let fingerprint = SourceFingerprint::from_path(&source).unwrap();
+        let stale_entry = CachedSourceEntry::new(
+            stale_identity,
+            &source,
+            fingerprint.clone(),
+            vec![UnifiedMessage::new(
+                current_identity.namespace,
+                "deepseek-v4-flash",
+                "irix",
+                "session-duration",
+                1786669451200,
+                crate::TokenBreakdown {
+                    input: 130,
+                    output: 159,
+                    cache_read: 0,
+                    cache_write: 0,
+                    cache_write_1h: 0,
+                    reasoning: 0,
+                },
+                0.0,
+            )],
+            Vec::new(),
+            None,
+        );
+        let stale_path = cache_shard_path(current_identity, &source);
+        ensure_cache_dir(stale_path.parent().unwrap()).unwrap();
+        write_shard_with_limit(
+            &stale_path,
+            stale_identity,
+            &[stale_entry],
+            MAX_CACHE_SHARD_BYTES,
+        )
+        .unwrap();
+
+        let scanned = scan_dsh(source_home.path());
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].timestamp, 1786669450000);
+        assert_eq!(scanned[0].duration_ms, Some(1_200));
+        assert_eq!(
+            SourceFingerprint::from_path(&source).unwrap(),
+            fingerprint,
+            "parser-version invalidation must not require a source rewrite"
+        );
+
+        let persisted = SourceMessageCache::load();
+        let cached = persisted
+            .get(current_identity, &source)
+            .expect("the scan must persist the entry it reparsed");
+        assert_eq!(cached.parser_version, 8);
+        assert_eq!(cached.messages.len(), 1);
+        assert_eq!(cached.messages[0].timestamp, 1786669450000);
+        assert_eq!(cached.messages[0].duration_ms, Some(1_200));
+
+        let warm = scan_dsh(source_home.path());
+        assert_eq!(warm, scanned, "the warm scan must retain the rebuilt span");
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn dsh_v3_shards_are_reparsed_with_the_concrete_served_model() {
         let temp_home = TempDir::new().unwrap();
         let _cache_env = sandbox_cache_env(temp_home.path());
@@ -5755,7 +6156,7 @@ mod tests {
 "#,
         );
         let current_identity = CacheIdentity::for_client(ClientId::Dsh);
-        assert_eq!(current_identity.parser_version, 7);
+        assert_eq!(current_identity.parser_version, 8);
         // Pinned at 3, the identity 4.14.0 cached under, rather than derived
         // from the running version: this is the row that release left on disk.
         let stale_identity = CacheIdentity {
@@ -5816,7 +6217,7 @@ mod tests {
         let cached = persisted
             .get(current_identity, &source)
             .expect("the scan must persist the entry it reparsed");
-        assert_eq!(cached.parser_version, 7);
+        assert_eq!(cached.parser_version, 8);
         assert_eq!(cached.messages.len(), 1);
         assert_eq!(cached.messages[0].model_id, "glm-5.3");
 
@@ -5843,7 +6244,7 @@ mod tests {
 "#,
         );
         let current_identity = CacheIdentity::for_client(ClientId::Dsh);
-        assert_eq!(current_identity.parser_version, 7);
+        assert_eq!(current_identity.parser_version, 8);
         // Pinned at 4, the identity 4.15.0 cached under; see the v3 test.
         let stale_identity = CacheIdentity {
             namespace: current_identity.namespace,
@@ -5903,7 +6304,7 @@ mod tests {
         let cached = persisted
             .get(current_identity, &source)
             .expect("the scan must persist the entry it reparsed");
-        assert_eq!(cached.parser_version, 7);
+        assert_eq!(cached.parser_version, 8);
         assert_eq!(cached.messages, scanned);
 
         let warm = scan_dsh(source_home.path());
@@ -7367,6 +7768,105 @@ mod tests {
         }
     }
 
+    fn claude_checkpointed_entry(dir: &TempDir) -> CachedSourceEntry {
+        let source = dir.path().join("session.jsonl");
+        std::fs::write(
+            &source,
+            r#"{"type":"assistant","timestamp":"2026-10-01T10:00:01.000Z","requestId":"req_a","message":{"id":"msg_a","model":"claude-sonnet-4-5","usage":{"input_tokens":3,"output_tokens":1}}}
+"#,
+        )
+        .unwrap();
+        let parsed = crate::sessions::claudecode::parse_claude_file_with_checkpoint(&source, None);
+        assert!(parsed.checkpoint.is_some());
+        CachedSourceEntry::new_with_retained_message_keys(
+            CacheIdentity::for_client(ClientId::Claude),
+            &source,
+            SourceFingerprint::from_path(&source).unwrap(),
+            parsed.messages,
+            &HashSet::new(),
+        )
+        .with_claude_checkpoint(parsed.checkpoint)
+    }
+
+    #[test]
+    fn test_claude_envelope_round_trips_the_checkpoint() {
+        let dir = TempDir::new().unwrap();
+        let identity = CacheIdentity::for_client(ClientId::Claude);
+        let entry = claude_checkpointed_entry(&dir);
+        let shard = dir.path().join("shard.bin");
+        write_shard_with_limit(
+            &shard,
+            identity,
+            std::slice::from_ref(&entry),
+            MAX_CACHE_SHARD_BYTES,
+        )
+        .unwrap();
+
+        let envelope: CachedShardEnvelope = bincode::options()
+            .deserialize_from(BufReader::new(File::open(&shard).unwrap()))
+            .unwrap();
+        assert_eq!(envelope.format_version, CLAUDE_CACHE_FORMAT_VERSION);
+        let ShardReadStatus::Loaded(entries) = read_shard(&shard, identity) else {
+            panic!("a Claude envelope loads");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].claude_checkpoint, entry.claude_checkpoint);
+        assert_eq!(entries[0].messages, entry.messages);
+        assert!(!entries[0].needs_retention_provenance_migration());
+
+        // A valid bincode mutation of parser state must discard only the
+        // checkpoint. The cached messages remain available and a changed file
+        // will take the ordinary full-parse path.
+        let mut corrupted = entry.clone();
+        corrupted
+            .claude_checkpoint
+            .as_mut()
+            .unwrap()
+            .corrupt_state_for_test();
+        write_shard_with_limit(&shard, identity, &[corrupted], MAX_CACHE_SHARD_BYTES).unwrap();
+        let ShardReadStatus::Loaded(entries) = read_shard(&shard, identity) else {
+            panic!("a shard with a corrupted checkpoint still loads its messages");
+        };
+        assert!(entries[0].claude_checkpoint.is_none());
+        assert_eq!(entries[0].messages, entry.messages);
+
+        // Only Claude reads it.
+        let other = CacheIdentity::for_client(ClientId::Codex);
+        let mut foreign = envelope;
+        foreign.parser_namespace = other.namespace.to_string();
+        foreign.parser_version = other.parser_version;
+        std::fs::write(&shard, bincode::options().serialize(&foreign).unwrap()).unwrap();
+        assert!(matches!(read_shard(&shard, other), ShardReadStatus::Stale));
+    }
+
+    #[test]
+    fn test_claude_shard_at_the_shared_format_still_loads_without_a_checkpoint() {
+        let dir = TempDir::new().unwrap();
+        let identity = CacheIdentity::for_client(ClientId::Claude);
+        let entry = claude_checkpointed_entry(&dir);
+        // The layout every Claude shard had before the envelope: the entries
+        // alone, at CACHE_FORMAT_VERSION.
+        let envelope = CachedShardEnvelope {
+            format_version: CACHE_FORMAT_VERSION,
+            parser_namespace: identity.namespace.to_string(),
+            parser_version: identity.parser_version,
+            payload: bincode::options().serialize(&vec![&entry]).unwrap(),
+        };
+        let shard = dir.path().join("shard.bin");
+        std::fs::write(&shard, bincode::options().serialize(&envelope).unwrap()).unwrap();
+
+        let ShardReadStatus::Loaded(entries) = read_shard(&shard, identity) else {
+            panic!("a format-{CACHE_FORMAT_VERSION} Claude shard still loads");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].messages, entry.messages);
+        assert_eq!(
+            entries[0].fallback_timestamp_indices, entry.fallback_timestamp_indices,
+            "retention provenance survives"
+        );
+        assert!(entries[0].claude_checkpoint.is_none());
+    }
+
     #[test]
     fn test_micode_metadata_keeps_exact_current_entry_bytes() {
         let source = write_temp_file(b"{}\n");
@@ -7553,7 +8053,7 @@ mod tests {
         let mut envelope: CachedShardEnvelope = bincode::options()
             .deserialize_from(BufReader::new(File::open(&path).unwrap()))
             .unwrap();
-        assert_eq!(envelope.format_version, CACHE_FORMAT_VERSION);
+        assert_eq!(envelope.format_version, CLAUDE_CACHE_FORMAT_VERSION);
         envelope.format_version = MICODE_CACHE_FORMAT_VERSION;
         std::fs::write(&path, bincode::options().serialize(&envelope).unwrap()).unwrap();
         assert!(matches!(

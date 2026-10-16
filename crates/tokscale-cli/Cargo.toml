@@ -27,7 +27,7 @@ tokscale-core = { workspace = true }
 clap = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "process"] }
 anyhow = { workspace = true }
 comfy-table = { workspace = true }
 colored = { workspace = true }
