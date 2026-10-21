@@ -686,6 +686,108 @@ pub struct GraphResultV2 {
     /// not part of local report aggregation or exported historical reports.
     #[serde(skip)]
     pub incomplete_cost_dates: BTreeSet<String>,
+    /// Per-client evidence of what the previous parser generation counted on
+    /// top of this snapshot, computed from the same bytes. Submission-only
+    /// protocol metadata; see [`ClientRecountProof`].
+    #[serde(skip)]
+    pub recount_proofs: BTreeMap<String, ClientRecountProof>,
+    /// How many discovered session sources each client could and could not
+    /// read during this scan. Submission uses it to withhold full-history
+    /// authority from a client whose history was only partially read.
+    #[serde(skip)]
+    pub source_reads: BTreeMap<String, SourceReadSummary>,
+}
+
+/// One (day, model) cell of a recount proof: the usage a parser generation
+/// attributes to that cell.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct RecountProofCell {
+    pub tokens: TokenBreakdown,
+    pub cost: f64,
+    pub messages: i32,
+}
+
+impl RecountProofCell {
+    fn add(&mut self, message: &UnifiedMessage) {
+        self.tokens.input += message.tokens.input.max(0);
+        self.tokens.output += message.tokens.output.max(0);
+        self.tokens.cache_read += message.tokens.cache_read.max(0);
+        self.tokens.cache_write += message.tokens.cache_write.max(0);
+        self.tokens.cache_write_1h += message.tokens.cache_write_1h.max(0);
+        self.tokens.reasoning += message.tokens.reasoning.max(0);
+        self.cost += message.cost.max(0.0);
+        self.messages += message.message_count.max(0);
+    }
+}
+
+/// What two parser generations count for one (day, model) cell when both read
+/// the same bytes.
+///
+/// `corrected` is what this scan submits for the cell. `previous` is what the
+/// generation the receiver may still have stored would have counted from the
+/// same rows, so `previous - corrected` is exactly the usage that older
+/// generation over-counted. A receiver that subtracts only that difference can
+/// heal a stored cell without ever deleting usage it has no evidence about —
+/// a source that failed to open contributes to neither side and so is left
+/// untouched.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct RecountProofEntry {
+    pub previous: RecountProofCell,
+    pub corrected: RecountProofCell,
+}
+
+/// `date -> model id -> proof`, dated and keyed exactly as the contributions
+/// this scan submits (same bucketing timezone, same model normalization).
+pub type ClientRecountProof = BTreeMap<String, BTreeMap<String, RecountProofEntry>>;
+
+/// Discovered-versus-readable session sources for one client in one scan.
+///
+/// Path-free on purpose: the submission protocol only needs to know whether
+/// the client's declared history is complete, never where it lives.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SourceReadSummary {
+    pub discovered: usize,
+    pub unreadable: usize,
+}
+
+impl SourceReadSummary {
+    /// True when every discovered source was read, including when none exists.
+    pub fn complete(self) -> bool {
+        self.unreadable == 0
+    }
+}
+
+/// Accumulates a [`ClientRecountProof`] while a client's rows are deduplicated.
+#[derive(Default)]
+struct RecountProofBuilder {
+    proof: ClientRecountProof,
+}
+
+impl RecountProofBuilder {
+    fn cell(&mut self, date: &str, model_id: &str) -> &mut RecountProofEntry {
+        self.proof
+            .entry(date.to_string())
+            .or_default()
+            .entry(model_id.to_string())
+            .or_default()
+    }
+
+    /// A row the current generation counts. Both generations counted it.
+    fn record_kept(&mut self, date: &str, model_id: &str, message: &UnifiedMessage) {
+        let entry = self.cell(date, model_id);
+        entry.previous.add(message);
+        entry.corrected.add(message);
+    }
+
+    /// A row the current generation drops as a duplicate that the previous
+    /// generation counted.
+    fn record_duplicate(&mut self, date: &str, model_id: &str, message: &UnifiedMessage) {
+        self.cell(date, model_id).previous.add(message);
+    }
+
+    fn finish(self) -> ClientRecountProof {
+        self.proof
+    }
 }
 
 /// Token-bearing usage submitted at zero cost because it cannot be priced
@@ -699,6 +801,32 @@ pub struct UnpricedSubmissionUsage {
     pub total_tokens: i64,
     pub reason: &'static str,
 }
+
+/// Submission clients the receiver only admits from a complete snapshot:
+/// the versioned-parser high-water set (`SUPPORTED_VERSIONED_PARSERS` on the
+/// receiver) plus the atomic MiMo and Antigravity source families. A
+/// date-filtered submission cannot shrink their coverage without freezing
+/// their stored history — a partial window for one of these is not
+/// submittable at all — so the submission graph keeps their messages
+/// regardless of `since`/`until`/`year`, and the scan scope names them in
+/// `fullHistoryClients`.
+///
+/// Devin CLI is in the set since its generation-2 registration: without
+/// full-history authority its submissions freeze, and its recount proof only
+/// rides on a snapshot declared complete. A database that partly failed to
+/// read is handled after the scan, when `source_reads` withholds the
+/// declaration from exactly that client.
+pub const FULL_HISTORY_SUBMIT_CLIENTS: &[&str] = &[
+    "amp",
+    "antigravity",
+    "antigravity-cli",
+    "antigravity-extension",
+    "copilot",
+    "devin-cli",
+    "droid",
+    "micode",
+    "micode-desktop",
+];
 
 #[derive(Debug, Clone, Default)]
 pub struct ReportOptions {
@@ -964,6 +1092,47 @@ fn apply_source_cache_policy(
 struct StreamingParseOutcome {
     coverage: Option<claude_desktop::Coverage>,
     pending_save: Option<PendingSourceCacheSave>,
+    /// See [`GraphResultV2::recount_proofs`].
+    recount_proofs: BTreeMap<String, ClientRecountProof>,
+    /// See [`GraphResultV2::source_reads`].
+    source_reads: BTreeMap<String, SourceReadSummary>,
+}
+
+/// The day key and model id a message will carry once `flush_message` has
+/// applied the parse tail to it, or `None` when that tail drops the message.
+///
+/// A recount proof has to be keyed exactly like the contributions it
+/// accompanies, and those are built after normalization and rebucketing. Rows
+/// dropped before the tail never reach it, so the same steps are replayed on
+/// a copy here.
+fn flushed_message_identity(
+    message: &UnifiedMessage,
+    context: &FlushContext<'_>,
+) -> Option<(String, String)> {
+    if !context.include_all
+        && !retain_for_requested_clients(
+            &message.client,
+            &message.model_id,
+            &message.provider_id,
+            &context.requested,
+        )
+    {
+        return None;
+    }
+    let mut model_id = message.model_id.clone();
+    let mut provider_id = message.provider_id.clone();
+    if context.include_synthetic {
+        sessions::synthetic::normalize_synthetic_gateway_fields(&mut model_id, &mut provider_id);
+    }
+    let date = match &context.timezone {
+        Some(timezone) => {
+            let mut rebucketed = message.clone();
+            rebucketed.rebucket_date(timezone);
+            rebucketed.date
+        }
+        None => message.date.clone(),
+    };
+    Some((date, model_id))
 }
 
 fn parse_all_messages_with_pricing_with_env_strategy(
@@ -4215,6 +4384,8 @@ fn parse_all_messages_streaming<S: MessageSink>(
     // be configured through scanner extra roots, so parse and dedupe all of
     // them instead of silently ignoring non-default databases.
     let mut devin_cli_session_ids: HashSet<String> = HashSet::new();
+    let mut recount_proofs: BTreeMap<String, ClientRecountProof> = BTreeMap::new();
+    let mut source_reads: BTreeMap<String, SourceReadSummary> = BTreeMap::new();
     if include_devin_cli {
         let devin_cli_outcomes: Vec<CachedParseOutcome> = scan_result
             .devin_dbs
@@ -4229,19 +4400,58 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 )
             })
             .collect();
+        // The parser cannot report a failed open or query: both yield an
+        // empty row set, which is indistinguishable from a database with no
+        // usage. Probe each discovered database separately (a warm cache
+        // never calls the parser) so submission can withhold full-history
+        // authority instead of letting a half-read history pass as complete.
+        let unreadable = scan_result
+            .devin_dbs
+            .iter()
+            .filter(|db_path| !sessions::devin::devin_cli_source_is_readable(db_path))
+            .count();
+        source_reads.insert(
+            ClientId::DevinCli.as_str().to_string(),
+            SourceReadSummary {
+                discovered: scan_result.devin_dbs.len(),
+                unreadable,
+            },
+        );
+        // Devin CLI generation 1 keyed these rows by row id and so counted
+        // every persisted copy of an API request; the request_id key collapses
+        // them. Record both views from the same rows so the receiver can
+        // subtract exactly the over-count instead of trusting a lower total.
         let mut devin_cli_seen = HashSet::new();
+        let mut devin_cli_proof = RecountProofBuilder::default();
         for outcome in devin_cli_outcomes {
-            for message in outcome
-                .messages
-                .into_iter()
-                .filter(|message| should_keep_deduped_message(&mut devin_cli_seen, message))
-            {
+            for message in outcome.messages {
+                let kept = should_keep_deduped_message(&mut devin_cli_seen, &message);
+                if let Some((date, model_id)) = flushed_message_identity(&message, &flush_context) {
+                    if kept {
+                        devin_cli_proof.record_kept(&date, &model_id, &message);
+                    } else if sessions::devin::is_devin_cli_request_dedup_key(
+                        message.dedup_key.as_deref(),
+                    ) {
+                        // Only a request_id collision is a generation
+                        // difference. Row keys are unique per database, so a
+                        // row-key collision across databases was dropped by
+                        // generation 1 as well and proves nothing.
+                        devin_cli_proof.record_duplicate(&date, &model_id, &message);
+                    }
+                }
+                if !kept {
+                    continue;
+                }
                 devin_cli_session_ids.insert(message.session_id.clone());
                 all_messages.push(message);
             }
             if let Some(entry) = outcome.cache_entry {
                 source_cache.insert(entry);
             }
+        }
+        let proof = devin_cli_proof.finish();
+        if !proof.is_empty() {
+            recount_proofs.insert(ClientId::DevinCli.as_str().to_string(), proof);
         }
     }
 
@@ -4498,6 +4708,8 @@ fn parse_all_messages_streaming<S: MessageSink>(
     StreamingParseOutcome {
         coverage: desktop_coverage,
         pending_save,
+        recount_proofs,
+        source_reads,
     }
 }
 
@@ -5408,6 +5620,7 @@ async fn generate_graph_with_loaded_pricing(
     options: ReportOptions,
     pricing: Option<&pricing::PricingService>,
     pricing_requirement: GraphPricingRequirement,
+    date_filter_exempt_clients: Option<&BTreeSet<String>>,
 ) -> Result<GraphResultV2, String> {
     let start = Instant::now();
     let captured_pricing = pricing.map(pricing::PricingService::with_cost_provenance_capture);
@@ -5431,8 +5644,13 @@ async fn generate_graph_with_loaded_pricing(
     // is what made this path hold every message at once (#1209); the sink
     // applies the same date filters per message and drops each one after it
     // has landed in the day map and produced its session span.
-    let mut sink = GraphSink::new(Some(&options), pricing, pricing_requirement);
-    if matches!(pricing_requirement, GraphPricingRequirement::Lenient)
+    let mut sink = GraphSink::new(
+        Some(&options),
+        date_filter_exempt_clients,
+        pricing,
+        pricing_requirement,
+    );
+    let parse_outcome = if matches!(pricing_requirement, GraphPricingRequirement::Lenient)
         && recovery::applicable(&home_dir)
     {
         // Local recovery requires native-session reconciliation. Submission
@@ -5440,7 +5658,7 @@ async fn generate_graph_with_loaded_pricing(
         // `LenientSourceOnly`, whose callers compare against what submission
         // sends and must not see the never-submitted overlay.
         let mut collector = GraphMessageCollector::default();
-        parse_all_messages_streaming_with_env_strategy(
+        let outcome = parse_all_messages_streaming_with_env_strategy(
             &home_dir,
             &clients,
             pricing,
@@ -5458,6 +5676,7 @@ async fn generate_graph_with_loaded_pricing(
             let source = collector.cost_estimates.take(&message);
             sink.accept_with_estimate_source(message, source);
         }
+        outcome
     } else {
         parse_all_messages_streaming_with_env_strategy(
             &home_dir,
@@ -5466,10 +5685,13 @@ async fn generate_graph_with_loaded_pricing(
             options.use_env_roots,
             &options.scanner_settings,
             &mut sink,
-        );
-    }
+        )
+    };
 
-    sink.finish(start, &bucket_timezone)
+    let mut result = sink.finish(start, &bucket_timezone)?;
+    result.recount_proofs = parse_outcome.recount_proofs;
+    result.source_reads = parse_outcome.source_reads;
+    Ok(result)
 }
 
 /// Messages buffered before a batch is folded away.
@@ -5495,6 +5717,11 @@ struct GraphSink<'a> {
     /// `Some` when the sink is fed straight from the parse and must apply the
     /// report's date filters itself; `None` when the caller already filtered.
     filter: Option<&'a ReportOptions>,
+    /// Clients exempt from the `filter`'s date bounds: the receiver admits
+    /// them only from a complete snapshot, so a date-bounded submission must
+    /// ship their whole history or freeze them entirely. Set by the
+    /// submission path only; `None` for local reports.
+    date_filter_exempt_clients: Option<&'a BTreeSet<String>>,
     pricing: Option<&'a pricing::PricingService>,
     requirement: GraphPricingRequirement,
     buffer: Vec<(UnifiedMessage, Option<EstimateSource>)>,
@@ -5512,11 +5739,13 @@ struct GraphSink<'a> {
 impl<'a> GraphSink<'a> {
     fn new(
         filter: Option<&'a ReportOptions>,
+        date_filter_exempt_clients: Option<&'a BTreeSet<String>>,
         pricing: Option<&'a pricing::PricingService>,
         requirement: GraphPricingRequirement,
     ) -> Self {
         Self {
             filter,
+            date_filter_exempt_clients,
             pricing,
             requirement,
             buffer: Vec::new(),
@@ -5678,7 +5907,13 @@ impl MessageSink for GraphSink<'_> {
             return;
         }
         if let Some(options) = self.filter {
-            if !message_passes_report_filter(&message, options) {
+            // Exempt clients carry full-history authority: the scan already
+            // read their complete sources, and a partial window for them
+            // freezes rather than scopes. See FULL_HISTORY_SUBMIT_CLIENTS.
+            let exempt = self
+                .date_filter_exempt_clients
+                .is_some_and(|set| set.contains(message.client.as_str()));
+            if !exempt && !message_passes_report_filter(&message, options) {
                 return;
             }
         }
@@ -5696,7 +5931,7 @@ fn parse_all_messages_streaming_with_env_strategy<S: MessageSink>(
     use_env_roots: bool,
     scanner_settings: &scanner::ScannerSettings,
     sink: &mut S,
-) {
+) -> StreamingParseOutcome {
     parse_all_messages_streaming(
         home_dir,
         clients,
@@ -5705,7 +5940,7 @@ fn parse_all_messages_streaming_with_env_strategy<S: MessageSink>(
         scanner_settings,
         SourceCachePolicy::Persistent,
         sink,
-    );
+    )
 }
 
 /// Collecting form of the submit-report build, retained as the test surface for
@@ -5726,7 +5961,7 @@ fn build_graph_from_messages(
     // sink applies none of its own. Delegating rather than duplicating keeps
     // this path and the streaming one on identical aggregation code, and lets
     // this function's tests stand as the sink's correctness proof.
-    let mut sink = GraphSink::new(None, pricing, pricing_requirement);
+    let mut sink = GraphSink::new(None, None, pricing, pricing_requirement);
     for message in filtered {
         sink.accept(message);
     }
@@ -5912,15 +6147,34 @@ pub async fn get_time_metrics_report(options: ReportOptions) -> Result<TimeMetri
 /// Version of [`generate_graph`] that retains cost provenance.
 pub async fn generate_graph_v2(options: ReportOptions) -> Result<GraphResultV2, String> {
     let pricing = pricing::PricingService::get_or_init().await?;
-    generate_graph_with_loaded_pricing(options, Some(&pricing), GraphPricingRequirement::Lenient)
-        .await
+    generate_graph_with_loaded_pricing(
+        options,
+        Some(&pricing),
+        GraphPricingRequirement::Lenient,
+        None,
+    )
+    .await
 }
 
 /// Version of [`generate_submission_graph`] that retains cost provenance.
-pub async fn generate_submission_graph_v2(options: ReportOptions) -> Result<GraphResultV2, String> {
+///
+/// `full_history_clients` is the list the submission declares complete in
+/// `scanScope.fullHistoryClients`: their messages bypass `since`/`until`/`year`
+/// so the payload actually contains the coverage it claims. Passing the same
+/// list the scan scope serializes keeps the declaration and the shipped data
+/// from diverging; see [`FULL_HISTORY_SUBMIT_CLIENTS`].
+pub async fn generate_submission_graph_v2(
+    options: ReportOptions,
+    full_history_clients: &BTreeSet<String>,
+) -> Result<GraphResultV2, String> {
     let pricing = pricing::PricingService::get_or_init().await?;
-    generate_graph_with_loaded_pricing(options, Some(&pricing), GraphPricingRequirement::Submission)
-        .await
+    generate_graph_with_loaded_pricing(
+        options,
+        Some(&pricing),
+        GraphPricingRequirement::Submission,
+        Some(full_history_clients),
+    )
+    .await
 }
 
 /// Version of [`generate_local_graph_report`] that retains cost provenance.
@@ -5932,6 +6186,7 @@ pub async fn generate_local_graph_report_v2(
         options,
         pricing.as_deref(),
         GraphPricingRequirement::Lenient,
+        None,
     )
     .await
 }
@@ -5954,6 +6209,7 @@ pub async fn generate_source_graph_report_v2(
         options,
         pricing.as_deref(),
         GraphPricingRequirement::LenientSourceOnly,
+        None,
     )
     .await
 }
@@ -8879,7 +9135,7 @@ mod tests {
         ] {
             assert!(!message_passes_report_filter(&message, &options));
         }
-        let mut sink = GraphSink::new(None, None, GraphPricingRequirement::Submission);
+        let mut sink = GraphSink::new(None, None, None, GraphPricingRequirement::Submission);
         sink.accept(message.clone());
         assert!(sink.buffer.is_empty());
         assert!(crate::aggregate_by_date(vec![message.clone()]).is_empty());
@@ -8897,7 +9153,7 @@ mod tests {
 
     #[test]
     fn graph_sink_keeps_only_one_bounded_pricing_batch() {
-        let mut sink = GraphSink::new(None, None, GraphPricingRequirement::Lenient);
+        let mut sink = GraphSink::new(None, None, None, GraphPricingRequirement::Lenient);
         for timestamp in 1..=(GRAPH_SINK_BATCH * 2 + 1) {
             sink.accept(UnifiedMessage::new(
                 "copilot",
@@ -9162,6 +9418,65 @@ mod tests {
         assert_eq!(monthly_reasoning, 18);
         assert_eq!(monthly_reasoning, model_reasoning);
         assert_eq!(monthly_reasoning, hourly_reasoning);
+    }
+
+    #[test]
+    fn submission_sink_keeps_exempt_clients_outside_the_date_window() {
+        let message = |client: &str, date: &str| {
+            let mut msg = UnifiedMessage::new(
+                client,
+                "model",
+                "provider",
+                format!("{client}-{date}"),
+                1_767_225_600_000,
+                TokenBreakdown {
+                    input: 10,
+                    output: 5,
+                    ..TokenBreakdown::default()
+                },
+                0.0,
+            );
+            msg.date = date.to_string();
+            msg
+        };
+        let tz = crate::BucketTimezone::default();
+        let options = ReportOptions {
+            since: Some("2026-02-01".to_string()),
+            until: Some("2026-02-28".to_string()),
+            ..ReportOptions::default()
+        };
+        let exempt = BTreeSet::from(["droid".to_string()]);
+
+        let mut sink = GraphSink::new(
+            Some(&options),
+            Some(&exempt),
+            None,
+            GraphPricingRequirement::Lenient,
+        );
+        for message in [
+            message("droid", "2025-12-01"),
+            message("droid", "2026-02-10"),
+            message("codex", "2025-12-01"),
+            message("codex", "2026-02-10"),
+        ] {
+            sink.accept(message);
+        }
+        let result = sink.finish(std::time::Instant::now(), &tz).expect("graph");
+
+        let droid_days: Vec<&str> = result
+            .contributions
+            .iter()
+            .filter(|day| day.clients.iter().any(|c| c.client == "droid"))
+            .map(|day| day.date.as_str())
+            .collect();
+        assert_eq!(droid_days, vec!["2025-12-01", "2026-02-10"]);
+        let codex_days: Vec<&str> = result
+            .contributions
+            .iter()
+            .filter(|day| day.clients.iter().any(|c| c.client == "codex"))
+            .map(|day| day.date.as_str())
+            .collect();
+        assert_eq!(codex_days, vec!["2026-02-10"]);
     }
 
     #[test]
@@ -18746,7 +19061,7 @@ mod tests {
         recovery::merge(&mut collector.messages, vec![recovered], vec![], |_| true);
         assert_eq!(collector.messages.len(), 2);
         let calculations = scan.detailed_calculation_count();
-        let mut sink = GraphSink::new(None, Some(&scan), GraphPricingRequirement::Lenient);
+        let mut sink = GraphSink::new(None, None, Some(&scan), GraphPricingRequirement::Lenient);
         for message in collector.messages {
             let source = collector.cost_estimates.take(&message);
             if message.session_id == "native" {
@@ -21669,6 +21984,105 @@ mod tests {
         assert_eq!(parsed.messages[0].session_id, "external-session");
     }
 
+    /// The recount proof must be built from the same rows the snapshot is,
+    /// with the request_id duplicates generation 2 drops counted on the
+    /// `previous` side only; and a database that cannot be read must show up
+    /// in the source summary rather than pass as "no usage".
+    #[test]
+    fn devin_cli_scan_proves_request_id_duplicates_and_reports_unreadable_sources() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_dir = temp_dir.path().join(".local/share/devin/cli");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let conn = rusqlite::Connection::open(db_dir.join("sessions.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                 id TEXT PRIMARY KEY,
+                 working_directory TEXT NOT NULL,
+                 backend_type TEXT NOT NULL,
+                 model TEXT NOT NULL,
+                 title TEXT,
+                 agent_mode TEXT NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 last_activity_at INTEGER NOT NULL
+             );
+             CREATE TABLE message_nodes (
+                 row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_id TEXT NOT NULL,
+                 node_id INTEGER NOT NULL,
+                 parent_node_id INTEGER,
+                 chat_message TEXT NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 metadata TEXT
+             );
+             INSERT INTO sessions (id, working_directory, backend_type, model, agent_mode, created_at, last_activity_at)
+             VALUES ('sess', '/tmp/project', 'windsurf', 'gpt-5', 'accept-edits', 1, 1);",
+        )
+        .unwrap();
+        let rows = [
+            // One API request persisted twice: generation 1 counted both.
+            r#"{"role":"assistant","metadata":{"request_id":"req-1","generation_model":"gpt-5","metrics":{"input_tokens":67,"output_tokens":103}}}"#,
+            r#"{"role":"assistant","metadata":{"request_id":"req-1","generation_model":"gpt-5","metrics":{"input_tokens":67,"output_tokens":103},"extensions":{"chisel/tool_call_content":{}}}}"#,
+            r#"{"role":"assistant","metadata":{"request_id":"req-2","generation_model":"gpt-5","metrics":{"input_tokens":10,"output_tokens":5}}}"#,
+            // An older row without request_id keeps its row key in both.
+            r#"{"role":"assistant","metadata":{"generation_model":"gpt-5","metrics":{"input_tokens":20,"output_tokens":5}}}"#,
+        ];
+        for chat in rows {
+            conn.execute(
+                "INSERT INTO message_nodes (session_id, node_id, chat_message, created_at) VALUES ('sess', 1, ?1, 1700000000)",
+                [chat],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        // A second discovered database that is not a database at all. The
+        // parser reads nothing from it, exactly as it would from an empty one.
+        let broken_dir = temp_dir.path().join("broken");
+        std::fs::create_dir_all(&broken_dir).unwrap();
+        std::fs::write(broken_dir.join("sessions.db"), b"not a sqlite database").unwrap();
+        let mut extra_scan_paths = std::collections::BTreeMap::new();
+        extra_scan_paths.insert("devin-cli".to_string(), vec![broken_dir]);
+
+        let mut messages: Vec<UnifiedMessage> = Vec::new();
+        let outcome = super::parse_all_messages_streaming(
+            temp_dir.path().to_str().unwrap(),
+            &["devin-cli".to_string()],
+            None,
+            false,
+            &scanner::ScannerSettings {
+                extra_scan_paths,
+                ..Default::default()
+            },
+            SourceCachePolicy::InMemory,
+            &mut messages,
+        );
+
+        assert_eq!(
+            messages.len(),
+            3,
+            "generation 2 collapses the duplicate request"
+        );
+        let proof = outcome
+            .recount_proofs
+            .get("devin-cli")
+            .expect("devin-cli recount proof");
+        let date = messages[0].date.clone();
+        assert!(messages.iter().all(|message| message.date == date));
+        let entry = &proof[&date]["gpt-5"];
+        assert_eq!(entry.corrected.tokens.input, 67 + 10 + 20);
+        assert_eq!(entry.corrected.tokens.output, 103 + 5 + 5);
+        assert_eq!(entry.corrected.messages, 3);
+        assert_eq!(entry.previous.tokens.input, 67 * 2 + 10 + 20);
+        assert_eq!(entry.previous.tokens.output, 103 * 2 + 5 + 5);
+        assert_eq!(entry.previous.messages, 4);
+        assert_eq!(proof.len(), 1);
+
+        let reads = outcome.source_reads["devin-cli"];
+        assert_eq!(reads.discovered, 2);
+        assert_eq!(reads.unreadable, 1);
+        assert!(!reads.complete());
+    }
+
     #[test]
     fn test_parse_local_clients_devin_zero_cli_usage_does_not_suppress_desktop() {
         let temp_dir = tempfile::TempDir::new().unwrap();
@@ -22165,6 +22579,7 @@ mod tests {
                 },
                 None,
                 GraphPricingRequirement::Lenient,
+                None,
             ))
             .unwrap();
 
