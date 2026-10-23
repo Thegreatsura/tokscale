@@ -2012,7 +2012,11 @@ fn parser_version(client: ClientId) -> u32 {
         // either added to a shared family (its version then derives from
         // the family's driver base) or given an explicit independent arm.
         ClientId::Gemini => 1,
-        ClientId::Qwen => 1,
+        // v1->v2: split the cached prefix out of `promptTokenCount`, and the
+        // reasoning out of `candidatesTokenCount` when the recorded total
+        // shows it inside. Unchanged transcripts must not replay the old
+        // double-counted buckets.
+        ClientId::Qwen => 2,
         ClientId::Mux => 1,
         ClientId::Crush => 1,
         ClientId::Goose => 1,
@@ -2297,6 +2301,7 @@ impl From<LegacyUnifiedMessageV7> for UnifiedMessage {
             session_title: message.session_title,
             parent_session_id: None,
             copilot_context: None,
+            machine_label: None,
             is_turn_start: message.is_turn_start,
             model_attribution_conflicted: message.model_attribution_conflicted,
             billing_identity: crate::sessions::BillingIdentity::Unknown,
@@ -2386,6 +2391,7 @@ impl From<LegacyUnifiedMessageV8> for UnifiedMessage {
             session_title: message.session_title,
             parent_session_id: None,
             copilot_context: None,
+            machine_label: None,
             is_turn_start: message.is_turn_start,
             model_attribution_conflicted: message.model_attribution_conflicted,
             billing_identity: crate::sessions::BillingIdentity::Unknown,
@@ -2473,6 +2479,7 @@ impl From<LegacyUnifiedMessageV9> for UnifiedMessage {
             session_title: message.session_title,
             parent_session_id: None,
             copilot_context: None,
+            machine_label: None,
             is_turn_start: message.is_turn_start,
             model_attribution_conflicted: message.model_attribution_conflicted,
             billing_identity: crate::sessions::BillingIdentity::Unknown,
@@ -2633,6 +2640,7 @@ impl From<LegacyUnifiedMessageV10> for UnifiedMessage {
             is_turn_start: message.is_turn_start,
             model_attribution_conflicted: message.model_attribution_conflicted,
             copilot_context: None,
+            machine_label: None,
             billing_identity: crate::sessions::BillingIdentity::Unknown,
             pricing_model_id: None,
             estimate_status: crate::sessions::EstimateStatus::Unpriced,
@@ -6340,6 +6348,11 @@ mod tests {
     #[test]
     fn test_kimi_parser_version_invalidates_v4_entries() {
         assert_eq!(parser_version(ClientId::Kimi), 5);
+    }
+
+    #[test]
+    fn test_qwen_parser_version_invalidates_v1_entries() {
+        assert_eq!(parser_version(ClientId::Qwen), 2);
     }
 
     #[test]
