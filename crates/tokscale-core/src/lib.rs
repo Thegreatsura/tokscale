@@ -855,30 +855,33 @@ pub struct UnpricedSubmissionUsage {
 
 /// Submission clients the receiver only admits from a complete snapshot:
 /// the versioned-parser high-water set (`SUPPORTED_VERSIONED_PARSERS` on the
-/// receiver) plus the atomic MiMo and Antigravity source families. A
-/// date-filtered submission cannot shrink their coverage without freezing
-/// their stored history — a partial window for one of these is not
-/// submittable at all — so the submission graph keeps their messages
-/// regardless of `since`/`until`/`year`, and the scan scope names them in
-/// `fullHistoryClients`.
+/// receiver) plus the atomic MiMo and Antigravity source families, less
+/// [`COMPLETE_DAY_SUBMIT_CLIENTS`]. A date-filtered submission cannot shrink
+/// their coverage without freezing their stored history — a partial window
+/// for one of these is not submittable at all — so the submission graph keeps
+/// their messages regardless of `since`/`until`/`year`, and the scan scope
+/// names them in `fullHistoryClients`.
 ///
-/// Devin CLI and Cursor are in the set since their generation-2 registrations:
-/// without full-history authority their submissions freeze, and their recount
-/// proofs only ride on snapshots declared complete. A source that partly failed
-/// to read is handled after the scan, when `source_reads` withholds the
-/// declaration from exactly that client.
+/// A source that partly failed to read is handled after the scan, when
+/// `source_reads` withholds the declaration from exactly that client.
 pub const FULL_HISTORY_SUBMIT_CLIENTS: &[&str] = &[
     "amp",
     "antigravity",
     "antigravity-cli",
     "antigravity-extension",
     "copilot",
-    "cursor",
-    "devin-cli",
     "droid",
     "micode",
     "micode-desktop",
 ];
+
+/// Versioned submission clients whose growth the receiver budgets per day
+/// (`PER_DAY_GROWTH_CLIENTS`). A date-filtered submission ships only their
+/// window and names them in `completeDayClients`, since every day it dates was
+/// read in full. The receiver credits those days once a full-history
+/// submission has set the client's baseline, and applies their recount proofs
+/// only from a full-history submission.
+pub const COMPLETE_DAY_SUBMIT_CLIENTS: &[&str] = &["cursor", "devin-cli"];
 
 #[derive(Debug, Clone, Default)]
 pub struct ReportOptions {
@@ -3541,29 +3544,36 @@ fn parse_all_messages_streaming<S: MessageSink>(
         // request-heavy source, then feed each VS Code message through the same
         // tail instead of rebuilding `all_messages`.
         flush_lane(&mut all_messages, &flush_context, sink);
-        // One file per call, so each message knows the file it came from.
-        for path in &scan_result.copilot_vscode_sessions {
-            let machine_label = machine_labeler.configured_label_for(path);
-            sessions::copilot_vscode::parse_copilot_vscode_sessions_into(
-                std::slice::from_ref(path),
-                &mut |mut message| {
-                    let key_unique = message
-                        .dedup_key
-                        .as_deref()
-                        .is_none_or(|key| !existing_dedup_keys.contains(key));
-                    let session_timestamp_unique = existing_copilot_session_timestamps
-                        .get(message.session_id.as_str())
-                        .is_none_or(|timestamps| !timestamps.contains(&message.timestamp));
-                    if !key_unique || !session_timestamp_unique {
-                        return;
-                    }
+        // One call for the whole lane: files that hold copies of the same
+        // session are grouped so a request stored in both is counted once.
+        let machine_labels: HashMap<&Path, Option<&str>> = scan_result
+            .copilot_vscode_sessions
+            .iter()
+            .map(|path| (path.as_path(), machine_labeler.configured_label_for(path)))
+            .collect();
+        sessions::copilot_vscode::parse_copilot_vscode_sessions_into(
+            &scan_result.copilot_vscode_sessions,
+            &mut |path, mut message| {
+                let key_unique = message
+                    .dedup_key
+                    .as_deref()
+                    .is_none_or(|key| !existing_dedup_keys.contains(key));
+                let session_timestamp_unique = existing_copilot_session_timestamps
+                    .get(message.session_id.as_str())
+                    .is_none_or(|timestamps| !timestamps.contains(&message.timestamp));
+                if !key_unique || !session_timestamp_unique {
+                    return;
+                }
 
-                    message.machine_label = machine_label.map(str::to_string);
-                    apply_pricing_if_available(&mut message, pricing);
-                    flush_message(message, &flush_context, sink);
-                },
-            );
-        }
+                message.machine_label = machine_labels
+                    .get(path)
+                    .copied()
+                    .flatten()
+                    .map(str::to_string);
+                apply_pricing_if_available(&mut message, pricing);
+                flush_message(message, &flush_context, sink);
+            },
+        );
     }
 
     let gemini_outcomes: Vec<(PathBuf, CachedParseOutcome)> = scan_result
@@ -9523,6 +9533,74 @@ mod tests {
                 assert_eq!(direct.counts.get(ClientId::Copilot), expected_rows as i32);
             }
         }
+    }
+
+    /// Migrated VS Code copies count a request once in either parse path, and
+    /// an OTEL row still takes precedence over both session-file copies.
+    #[test]
+    #[serial_test::serial]
+    fn copilot_vscode_copies_dedup_and_yield_to_otel() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+
+        let otel = source_home.path().join(".copilot/otel");
+        std::fs::create_dir_all(&otel).unwrap();
+        std::fs::write(
+            otel.join("copilot.jsonl"),
+            r#"{"type":"span","traceId":"11111111111111111111111111111111","spanId":"1111111111111111","name":"chat gpt-4o","startTime":[1775934260,0],"attributes":{"gen_ai.operation.name":"chat","gen_ai.response.model":"gpt-4o","gen_ai.conversation.id":"961e8400-e29b-41d4-a716-446655440008","gen_ai.usage.input_tokens":40}}"#,
+        )
+        .unwrap();
+
+        let workspace_sessions = source_home
+            .path()
+            .join("AppData/Roaming/Code/User/workspaceStorage/2f1c9a/chatSessions");
+        let empty_window_sessions = source_home
+            .path()
+            .join("AppData/Roaming/Code/User/globalStorage/emptyWindowChatSessions");
+        std::fs::create_dir_all(&workspace_sessions).unwrap();
+        std::fs::create_dir_all(&empty_window_sessions).unwrap();
+        let contents = "{\"kind\":0,\"v\":{\"requests\":[{\"timestamp\":1775934260000,\"modelId\":\"copilot/gpt-4o\",\"promptTokens\":999},{\"timestamp\":1775934261000,\"modelId\":\"copilot/gpt-4o\",\"promptTokens\":50}]}}\n";
+        let file_name = "961e8400-e29b-41d4-a716-446655440008.jsonl";
+        std::fs::write(workspace_sessions.join(file_name), contents).unwrap();
+        std::fs::write(empty_window_sessions.join(file_name), contents).unwrap();
+
+        let clients = ["copilot".to_string()];
+        let messages = parse_all_messages_with_pricing_with_env_strategy(
+            source_home.path().to_str().unwrap(),
+            &clients,
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+        );
+        let mut streamed_rows = messages
+            .iter()
+            .map(|message| (message.timestamp, message.tokens.input))
+            .collect::<Vec<_>>();
+        streamed_rows.sort_unstable();
+        assert_eq!(
+            streamed_rows,
+            vec![(1775934260000, 40), (1775934261000, 50)]
+        );
+
+        let direct = parse_local_clients(LocalParseOptions {
+            home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(clients.to_vec()),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings::default(),
+        })
+        .unwrap();
+        let mut direct_rows = direct
+            .messages
+            .iter()
+            .map(|message| (message.timestamp, message.input))
+            .collect::<Vec<_>>();
+        direct_rows.sort_unstable();
+        assert_eq!(direct_rows, streamed_rows);
+        assert_eq!(direct.counts.get(ClientId::Copilot), 2);
     }
 
     #[test]

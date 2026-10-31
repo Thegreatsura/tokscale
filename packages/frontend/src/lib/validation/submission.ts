@@ -254,6 +254,9 @@ const SubmissionDataSchema = z.preprocess(normalizeLegacySources, z.object({
     // New CLIs declare completeness per client. Absence preserves the legacy
     // meaning where `fullHistory` applies to every declared parser.
     fullHistoryClients: z.array(SourceSchema).optional(),
+    // Clients a date-bounded scan read in full for every day it dates. Only
+    // clients whose growth the receiver budgets per day can use it.
+    completeDayClients: z.array(SourceSchema).optional(),
     // Retained protocol metadata. The high-water cannot yet use it as proof
     // that local history was pruned.
     retentionFloors: z

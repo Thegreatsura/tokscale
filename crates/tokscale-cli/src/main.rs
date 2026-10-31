@@ -1639,15 +1639,8 @@ fn cursor_setup_state(home_dir: &Option<String>) -> Option<CursorSetupState> {
     } else {
         cursor::is_cursor_logged_in()
     };
-    let has_cache = cursor::has_cursor_usage_cache_in_home(&home_path);
-    let cache_glob = if home_override {
-        home_path
-            .join(".config/tokscale/cursor-cache/usage*.json")
-            .to_string_lossy()
-            .to_string()
-    } else {
-        "~/.config/tokscale/cursor-cache/usage*.json".to_string()
-    };
+    let has_cache = cursor::has_cursor_usage_cache_in_home(&home_path, !home_override);
+    let cache_glob = cursor::usage_cache_glob(&home_path, !home_override);
 
     Some(CursorSetupState {
         has_credentials,
@@ -5126,7 +5119,8 @@ fn describe_path_for_home(path: &str, exists: bool, home: &Path) -> String {
 }
 
 fn format_number(n: i32) -> String {
-    if n >= 1_000_000 {
+    // Switch to millions where `{:.1}` would round the thousands up to "1000.0K".
+    if n >= 999_950 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
     } else if n >= 1_000 {
         format!("{:.1}K", n as f64 / 1_000.0)
@@ -5336,6 +5330,11 @@ struct TsScanScope {
     parser_versions: std::collections::BTreeMap<String, u32>,
     full_history: bool,
     full_history_clients: Vec<String>,
+    /// Clients a date-bounded scan read in full for every day it dates
+    /// (`COMPLETE_DAY_SUBMIT_CLIENTS`). Empty on a full-history scan, whose
+    /// `full_history_clients` already cover every day.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    complete_day_clients: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     retention_floors: Option<std::collections::BTreeMap<String, String>>,
     /// Per-day correction evidence for clients whose declared generation
@@ -5350,15 +5349,15 @@ struct TsScanScope {
     recount_proofs: Option<TsRecountProofs>,
 }
 
-/// Strip full-history authority from clients whose history this scan could
-/// only partially read.
+/// Strip full-history and complete-day authority from clients whose history
+/// this scan could only partially read.
 ///
 /// `full_history` so far meant "no date filter was passed". A client whose
 /// session sources partly failed to open satisfies that and still reports less
 /// than it has, and on the receiver a full-history snapshot is what may
-/// rewrite or re-baseline stored history. Withholding the bit keeps those
-/// stored rows untouched until a later scan reads everything.
-fn withhold_full_history_for_clients(
+/// rewrite or re-baseline stored history. Withholding the declaration keeps
+/// those stored rows untouched until a later scan reads everything.
+fn withhold_coverage_for_clients(
     scope: &mut TsScanScope,
     incomplete_clients: &std::collections::BTreeSet<String>,
 ) {
@@ -5368,6 +5367,9 @@ fn withhold_full_history_for_clients(
     let declared = scope.parser_versions.len();
     scope
         .full_history_clients
+        .retain(|client| !incomplete_clients.contains(client));
+    scope
+        .complete_day_clients
         .retain(|client| !incomplete_clients.contains(client));
     scope.full_history = scope.full_history && scope.full_history_clients.len() == declared;
 }
@@ -5666,7 +5668,9 @@ fn full_history_exempt_clients<'a>(
 /// scan can establish or advance a cumulative rollout high-water. A partial
 /// scan still names the clients whose messages it ships unfiltered — their
 /// snapshot semantics make a partial window unsubmittable, so the graph
-/// exempts them from the date filter (see `FULL_HISTORY_SUBMIT_CLIENTS`).
+/// exempts them from the date filter (see `FULL_HISTORY_SUBMIT_CLIENTS`) —
+/// and the clients whose window it ships with every day complete (see
+/// `COMPLETE_DAY_SUBMIT_CLIENTS`).
 fn submit_scan_scope(
     clients: Option<&[String]>,
     full_history: bool,
@@ -5696,14 +5700,48 @@ fn submit_scan_scope(
     } else {
         full_history_exempt_clients(clients, amp_full_history_safe).collect()
     };
+    let complete_day_clients = if full_history {
+        Vec::new()
+    } else {
+        clients
+            .iter()
+            .filter(|client| tokscale_core::COMPLETE_DAY_SUBMIT_CLIENTS.contains(&client.as_str()))
+            .cloned()
+            .collect()
+    };
     let every_client_complete = full_history_clients.len() == clients.len();
     Some(TsScanScope {
         parser_versions,
         // Fail closed for receivers predating `fullHistoryClients`.
         full_history: full_history && every_client_complete,
         full_history_clients,
+        complete_day_clients,
         retention_floors: None,
         recount_proofs: None,
+    })
+}
+
+/// Names the clients a date-bounded submit ships with their whole history, so
+/// a `--week` date range reaching back months reads as intended.
+fn full_history_note(
+    scope: Option<&TsScanScope>,
+    full_history_scan: bool,
+    submitted_clients: &[String],
+) -> Option<String> {
+    if full_history_scan {
+        return None;
+    }
+    let names: Vec<&str> = scope?
+        .full_history_clients
+        .iter()
+        .filter(|client| submitted_clients.contains(client))
+        .map(String::as_str)
+        .collect();
+    (!names.is_empty()).then(|| {
+        format!(
+            "Full history: {} (the server counts these clients only from a complete snapshot)",
+            names.join(", ")
+        )
     })
 }
 
@@ -7397,7 +7435,7 @@ fn run_submit_command(
     let incomplete_source_clients = incompletely_read_clients(&graph_result.source_reads);
     report_incompletely_read_sources(&graph_result.source_reads);
     let scan_scope = scan_scope.map(|mut scope| {
-        withhold_full_history_for_clients(&mut scope, &incomplete_source_clients);
+        withhold_coverage_for_clients(&mut scope, &incomplete_source_clients);
         scope
     });
 
@@ -7410,6 +7448,13 @@ fn run_submit_command(
         )
         .bright_black()
     );
+    if let Some(note) = full_history_note(
+        scan_scope.as_ref(),
+        full_history_scan,
+        &graph_result.summary.clients,
+    ) {
+        println!("{}", format!("    {note}").bright_black());
+    }
     println!(
         "{}",
         format!("    Active days: {}", graph_result.summary.active_days).bright_black()
@@ -7531,7 +7576,8 @@ fn post_submission(
 
             println!("\n  {}", "Successfully submitted!".green());
             println!();
-            println!("{}", "  Summary:".white());
+            // The server reports the profile after merging, not this payload.
+            println!("{}", "  Profile totals:".white());
             if let Some(id) = body.submission_id {
                 println!("{}", format!("    Submission ID: {}", id).bright_black());
             }
@@ -8285,6 +8331,13 @@ mod tests {
         calculate_summary_v2, calculate_years_v2, ClientContributionV2, DailyContributionV2,
         DailyTotalsV2, GraphMeta, GraphResultV2, TokenBreakdown,
     };
+
+    #[test]
+    fn format_number_promotes_to_millions_at_the_rounding_boundary() {
+        assert_eq!(format_number(999_949), "999.9K");
+        assert_eq!(format_number(999_950), "1.0M");
+        assert_eq!(format_number(1_500), "1.5K");
+    }
 
     #[test]
     fn model_token_breakdown_json_preserves_all_buckets_in_camel_case() {
@@ -10558,12 +10611,11 @@ mod tests {
         assert_eq!(together.full_history_clients, family);
     }
 
-    /// The exemption list mirrors the receiver's snapshot-integrity set. A
-    /// bounded submit that filtered a recounting client would freeze on the
-    /// receiver and discard the window's usage, and its proof only rides on a
-    /// declared-complete snapshot.
+    /// The receiver budgets Cursor and Devin CLI growth per day, so a bounded
+    /// submit ships only their window and declares each day it dates complete
+    /// instead of shipping their whole history.
     #[test]
-    fn submit_scan_scope_names_recount_clients_complete_on_a_partial_scan() {
+    fn submit_scan_scope_declares_per_day_clients_complete_by_day_on_a_partial_scan() {
         let clients = vec![
             "codex".to_string(),
             "cursor".to_string(),
@@ -10572,12 +10624,17 @@ mod tests {
         let scope = submit_scan_scope(Some(&clients), false, true).expect("scope");
 
         assert!(!scope.full_history);
+        assert!(scope.full_history_clients.is_empty());
         assert_eq!(
-            scope.full_history_clients,
+            scope.complete_day_clients,
             vec!["cursor".to_string(), "devin-cli".to_string()]
         );
         assert_eq!(scope.parser_versions.get("cursor"), Some(&2));
         assert_eq!(scope.parser_versions.get("devin-cli"), Some(&2));
+
+        let full = submit_scan_scope(Some(&clients), true, true).expect("scope");
+        assert_eq!(full.full_history_clients, clients);
+        assert!(full.complete_day_clients.is_empty());
     }
 
     /// The blocker class from #1414 applies to the bounded path too: a client
@@ -10594,32 +10651,54 @@ mod tests {
             "droid".to_string(),
         ];
         let mut scope = submit_scan_scope(Some(&clients), false, true).expect("scope");
+        assert_eq!(scope.full_history_clients, vec!["droid".to_string()]);
         assert_eq!(
-            scope.full_history_clients,
-            vec![
-                "cursor".to_string(),
-                "devin-cli".to_string(),
-                "droid".to_string(),
-            ]
+            scope.complete_day_clients,
+            vec!["cursor".to_string(), "devin-cli".to_string()]
         );
 
         let mut reads = std::collections::BTreeMap::new();
-        reads.insert(
-            "cursor".to_string(),
-            tokscale_core::SourceReadSummary {
-                discovered: 2,
-                unreadable: 1,
-            },
-        );
-        withhold_full_history_for_clients(&mut scope, &incompletely_read_clients(&reads));
+        for client in ["cursor", "droid"] {
+            reads.insert(
+                client.to_string(),
+                tokscale_core::SourceReadSummary {
+                    discovered: 2,
+                    unreadable: 1,
+                },
+            );
+        }
+        withhold_coverage_for_clients(&mut scope, &incompletely_read_clients(&reads));
 
         assert!(!scope.full_history);
-        assert_eq!(
-            scope.full_history_clients,
-            vec!["devin-cli".to_string(), "droid".to_string()]
-        );
-        // Identity stays declared; only Cursor's completeness authority is gone.
+        assert!(scope.full_history_clients.is_empty());
+        assert_eq!(scope.complete_day_clients, vec!["devin-cli".to_string()]);
+        // Identity stays declared; only the unread clients lose completeness.
         assert_eq!(scope.parser_versions.get("cursor"), Some(&2));
+    }
+
+    #[test]
+    fn full_history_note_names_only_bounded_clients_that_shipped_history() {
+        let clients: Vec<String> = ["codex", "cursor", "droid", "copilot"]
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        let bounded = submit_scan_scope(Some(&clients), false, true);
+        let submitted = vec![
+            "codex".to_string(),
+            "cursor".to_string(),
+            "droid".to_string(),
+        ];
+
+        assert_eq!(
+            full_history_note(bounded.as_ref(), false, &submitted).as_deref(),
+            Some("Full history: droid (the server counts these clients only from a complete snapshot)")
+        );
+        let full = submit_scan_scope(Some(&clients), true, true);
+        assert_eq!(full_history_note(full.as_ref(), true, &submitted), None);
+        assert_eq!(
+            full_history_note(bounded.as_ref(), false, &["codex".to_string()]),
+            None
+        );
     }
 
     /// Generation 2 lowers both recounting clients: Devin CLI collapses
@@ -10730,10 +10809,8 @@ mod tests {
             0
         );
 
-        // A date-bounded submit still ships devin-cli complete (it is in
-        // `FULL_HISTORY_SUBMIT_CLIENTS`), so the client keeps per-client
-        // full-history authority and its proof rides along: the payload
-        // dates every day the proof describes.
+        // A date-bounded submit ships only devin-cli's window, and the
+        // receiver applies no proof from one.
         let bounded = to_ts_token_contribution_data(
             &graph,
             None,
@@ -10741,16 +10818,19 @@ mod tests {
         );
         let bounded_scope = bounded.scan_scope.as_ref().expect("bounded scope");
         assert!(!bounded_scope.full_history);
-        assert_eq!(bounded_scope.full_history_clients, clients);
-        let bounded_proofs = bounded_scope
-            .recount_proofs
-            .as_ref()
-            .expect("bounded submit ships the proof for a declared client");
-        assert!(bounded_proofs.contains_key("devin-cli"));
+        assert!(bounded_scope.full_history_clients.is_empty());
+        assert_eq!(bounded_scope.complete_day_clients, clients);
+        assert!(bounded_scope.recount_proofs.is_none());
+        let bounded_json = serde_json::to_value(&bounded).unwrap();
+        assert_eq!(
+            bounded_json["scanScope"]["completeDayClients"],
+            serde_json::json!(["devin-cli"])
+        );
+        assert!(json["scanScope"].get("completeDayClients").is_none());
 
         // Full-history authority withheld for this client withholds its proof.
         let mut withheld = submit_scan_scope(Some(&clients), true, true).unwrap();
-        withhold_full_history_for_clients(
+        withhold_coverage_for_clients(
             &mut withheld,
             &["devin-cli".to_string()].into_iter().collect(),
         );
@@ -10831,8 +10911,7 @@ mod tests {
             0
         );
 
-        // A bounded CLI request still carries full-history authority for Cursor:
-        // its rows are exempt from the date filter, so the proof is safe.
+        // A bounded request ships Cursor's window, which carries no proof.
         let bounded = to_ts_token_contribution_data(
             &graph,
             None,
@@ -10841,14 +10920,10 @@ mod tests {
         assert!(bounded
             .scan_scope
             .as_ref()
-            .and_then(|scope| scope.recount_proofs.as_ref())
-            .is_some_and(|proofs| proofs.contains_key("cursor")));
+            .is_some_and(|scope| scope.recount_proofs.is_none()));
 
         let mut withheld = submit_scan_scope(Some(&clients), true, true).unwrap();
-        withhold_full_history_for_clients(
-            &mut withheld,
-            &["cursor".to_string()].into_iter().collect(),
-        );
+        withhold_coverage_for_clients(&mut withheld, &["cursor".to_string()].into_iter().collect());
         let withheld = to_ts_token_contribution_data(&graph, None, Some(withheld));
         assert!(withheld
             .scan_scope
@@ -10885,7 +10960,7 @@ mod tests {
         let clients = vec!["claude".to_string(), "devin-cli".to_string()];
         let mut scope = submit_scan_scope(Some(&clients), true, true).unwrap();
         assert!(scope.full_history);
-        withhold_full_history_for_clients(&mut scope, &incomplete);
+        withhold_coverage_for_clients(&mut scope, &incomplete);
         // Fail closed for receivers predating `fullHistoryClients`, but keep
         // the complete sibling's authority for receivers that read it.
         assert!(!scope.full_history);
@@ -10894,7 +10969,7 @@ mod tests {
 
         // Nothing unreadable leaves the scope untouched.
         let mut intact = submit_scan_scope(Some(&clients), true, true).unwrap();
-        withhold_full_history_for_clients(&mut intact, &std::collections::BTreeSet::new());
+        withhold_coverage_for_clients(&mut intact, &std::collections::BTreeSet::new());
         assert!(intact.full_history);
         assert_eq!(intact.full_history_clients.len(), 2);
     }

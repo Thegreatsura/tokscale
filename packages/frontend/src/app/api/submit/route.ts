@@ -874,6 +874,15 @@ export async function POST(request: Request) {
             return stored ? [[day.date, stored] as const] : [];
           })
         );
+        const state = ownValue(deviceParserStates, client);
+        const persistedVersion = ownValue(
+          submittedDevice.parserVersions as Record<string, number> | undefined,
+          client
+        );
+        const incomingDays = foldParserClientSnapshot(data.contributions, client);
+        const completeDays =
+          !isBackfill &&
+          (data.scanScope?.completeDayClients ?? []).includes(client);
         const plan = planParserHighWaterSubmission({
           client,
           incomingVersion: isBackfill
@@ -885,6 +894,7 @@ export async function POST(request: Request) {
                 client
               ),
           fullHistory: scanScopeCoversFullHistory(data.scanScope, [client]),
+          completeDays,
           retentionFloor: isBackfill
             ? undefined
             : ownValue(
@@ -894,12 +904,9 @@ export async function POST(request: Request) {
                 client
               ),
           existingLegacyDays: existingClientDays,
-          incomingDays: foldParserClientSnapshot(data.contributions, client),
-          state: ownValue(deviceParserStates, client),
-          persistedVersion: ownValue(
-            submittedDevice.parserVersions as Record<string, number> | undefined,
-            client
-          ),
+          incomingDays,
+          state,
+          persistedVersion,
           recountProof: isBackfill
             ? undefined
             : ownValue(
@@ -921,6 +928,17 @@ export async function POST(request: Request) {
         } else if (plan.mode === "replace") {
           warnings.push(
             `Rewrote ${label} daily layout from the full parser snapshot without changing the lifetime high-water.`
+          );
+        } else if (
+          plan.mode === "freeze" &&
+          completeDays &&
+          Object.keys(incomingDays).length > 0 &&
+          (state == null
+            ? persistedVersion == null
+            : state.baselineEstablished === false)
+        ) {
+          warnings.push(
+            `Ignored ${label} changes from this date-bounded submit because this device has no ${label} baseline yet. Run \`tokscale submit\` without a date filter once; later date-bounded submits then count.`
           );
         } else if (plan.mode === "freeze") {
           warnings.push(
@@ -1216,6 +1234,10 @@ export async function POST(request: Request) {
               submitted,
               {
                 transition: plan.recountTransition === true,
+                residueModels: ownValue(
+                  plan.residueDays ?? {},
+                  incomingDay.date
+                ),
                 costIsComplete: incomingCostIsComplete,
                 storedCostIsFloor: stored.provenance?.costIsComplete === false,
                 costUnsafeModels: new Set(plan.recountCostUnsafeModels ?? []),
