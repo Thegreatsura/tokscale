@@ -7,6 +7,7 @@ import { usePathname } from "next/navigation";
 import styled, { css, keyframes } from "styled-components";
 import { GearIcon, PersonIcon, SignOutIcon } from "@/components/ui/Icons";
 import { trackEvent } from "@/lib/analytics/events";
+import { avatarSrc } from "@/lib/avatar";
 
 interface User {
   id: string;
@@ -429,10 +430,6 @@ async function signOut() {
   window.location.href = "/leaderboard";
 }
 
-function avatarSrc(user: User): string {
-  return user.avatarUrl || `https://github.com/${user.username}.png`;
-}
-
 function UserMenu({ user }: { user: User }) {
   const [open, setOpen] = useState(false);
   const wrapperRef = useRef<HTMLDivElement>(null);
@@ -468,7 +465,7 @@ function UserMenu({ user }: { user: User }) {
         aria-controls="account-menu"
         onClick={() => setOpen((value) => !value)}
       >
-        <Avatar src={avatarSrc(user)} alt="" width={32} height={32} />
+        <Avatar src={avatarSrc(user.avatarUrl, user.username, 32)} alt="" width={32} height={32} />
       </AvatarButton>
       {open && (
         <UserMenuPanel id="account-menu">
@@ -477,7 +474,7 @@ function UserMenu({ user }: { user: User }) {
             <UserHandle>@{user.username}</UserHandle>
           </UserInfo>
           <MenuGroup>
-            <MenuLink href={`/u/${user.username}`} onClick={() => close(false)}>
+            <MenuLink href={`/u/${user.username}`} prefetch={false} onClick={() => close(false)}>
               <PersonIcon />
               Your profile
             </MenuLink>
@@ -607,13 +604,13 @@ export function Navigation() {
           {isLoading ? null : user ? (
             <>
               <MobileUserRow>
-                <MobileAvatar src={avatarSrc(user)} alt="" width={32} height={32} />
+                <MobileAvatar src={avatarSrc(user.avatarUrl, user.username, 32)} alt="" width={32} height={32} />
                 <div>
                   <UserName>{user.displayName || user.username}</UserName>
                   <UserHandle>@{user.username}</UserHandle>
                 </div>
               </MobileUserRow>
-              <MobileAction href={`/u/${user.username}`} onClick={closeMobile}>
+              <MobileAction href={`/u/${user.username}`} prefetch={false} onClick={closeMobile}>
                 <PersonIcon />
                 Your profile
               </MobileAction>

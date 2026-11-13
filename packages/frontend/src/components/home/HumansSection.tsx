@@ -16,6 +16,7 @@ import {
   wholeNumber,
 } from "./format";
 import { Arrow, Container, Eyebrow, Lead, Section, SectionHeader, SectionTitle, TextLink, VisuallyHidden } from "./primitives";
+import { avatarSrc } from "@/lib/avatar";
 
 interface HumansSectionProps {
   human: HumanRow | null;
@@ -55,9 +56,9 @@ function FeaturedProfile({ human, coverage }: { human: HumanRow; coverage: Cover
 
   return (
     <Card aria-labelledby="featured-human-name">
-      <Identity href={profileHref}>
+      <Identity href={profileHref} prefetch={false}>
         <Avatar
-          src={human.avatarUrl || `https://github.com/${encodeURIComponent(human.username)}.png?size=128`}
+          src={avatarSrc(human.avatarUrl, human.username, 56)}
           alt=""
           width={56}
           height={56}

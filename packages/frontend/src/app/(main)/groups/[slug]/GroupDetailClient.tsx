@@ -16,6 +16,7 @@ import {
   MetricValue,
   MobileRankingList,
   MobileRankingRow,
+  ROW_AVATAR_PX,
   SecondaryActionLink,
   SecondaryButton,
   SegmentedControl,
@@ -26,6 +27,7 @@ import type { GroupLeaderboardData, GroupLeaderboardUser } from "@/lib/groups/ge
 import type { SortBy } from "@/lib/leaderboard/types";
 import type { GroupPeriod } from "@/lib/reportingPeriods";
 import { GroupReportingSettings } from "@/components/leaderboard/GroupReportingSettings";
+import { avatarSrc } from "@/lib/avatar";
 
 type GroupRole = "owner" | "admin" | "member";
 
@@ -460,10 +462,11 @@ function GroupRow({
       <Td>
         <UserCell
           href={`/u/${user.username}`}
+          prefetch={false}
           data-row-primary=""
           aria-current={isCurrentUser ? "true" : undefined}
         >
-          <UserAvatar src={user.avatarUrl || `https://github.com/${user.username}.png`} alt="" />
+          <UserAvatar src={avatarSrc(user.avatarUrl, user.username, ROW_AVATAR_PX)} alt="" loading="lazy" decoding="async" />
           <span>
             {user.displayName || user.username}
             <Muted>@{user.username}</Muted>

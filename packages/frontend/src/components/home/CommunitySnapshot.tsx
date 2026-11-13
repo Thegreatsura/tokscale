@@ -8,6 +8,7 @@ import { ModelMark } from "@/components/explore/ModelMark";
 import { InstantTooltip } from "@/components/ui/InstantTooltip";
 import { Arrow, focusRing, VisuallyHidden } from "./primitives";
 import { compactCost, compactNumber, userChange, wholeNumber } from "./format";
+import { avatarSrc } from "@/lib/avatar";
 
 interface CommunitySnapshotProps {
   snapshot: Snapshot | null;
@@ -80,11 +81,11 @@ function HumanItem({ human }: { human: HumanRow }) {
   const topAgent = human.topAgents[0];
   return (
     <li>
-      <RowLink href={`/u/${encodeURIComponent(human.username)}`} $kind="humans">
+      <RowLink href={`/u/${encodeURIComponent(human.username)}`} prefetch={false} $kind="humans">
         <Rank>{human.rank}</Rank>
         <Identity>
           <AvatarImg
-            src={human.avatarUrl || `https://github.com/${encodeURIComponent(human.username)}.png?size=48`}
+            src={avatarSrc(human.avatarUrl, human.username, 22)}
             alt=""
             width={22}
             height={22}
@@ -132,7 +133,7 @@ function ModelItem({ model }: { model: ModelUsageRow }) {
   const change = userChange(model);
   return (
     <li>
-      <RowLink href={`/models/${encodeURIComponent(model.key)}`} $kind="models">
+      <RowLink href={`/models/${encodeURIComponent(model.key)}`} prefetch={false} $kind="models">
         <Rank>{model.rank}</Rank>
         <Identity>
           <ModelMark model={model} size={22} />

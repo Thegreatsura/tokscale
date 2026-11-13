@@ -13,6 +13,7 @@ import {
   MetricValue,
   MobileRankingList,
   MobileRankingRow,
+  ROW_AVATAR_PX,
   SegmentedControl,
 } from "@/components/leaderboard/RankingUI";
 import { getLeaderboardPeriodLabel } from "@/components/leaderboard/presentation";
@@ -25,6 +26,7 @@ import {
 import { parseCustomDateRange } from "@/lib/leaderboard/dateRange";
 import { trackEvent, type AnalyticsEventMap } from "@/lib/analytics/events";
 import type { LeaderboardData, LeaderboardUser, Period } from "@/lib/leaderboard/types";
+import { avatarSrc } from "@/lib/avatar";
 
 const Section = styled.div`
   display: grid;
@@ -844,12 +846,15 @@ const LeaderboardRow = memo(function LeaderboardRow({
       <TableCell>
         <UserContainer
           href={`/u/${user.username}`}
+          prefetch={false}
           data-row-primary=""
           aria-current={isCurrentUser ? "true" : undefined}
         >
           <DesktopAvatar
-            src={user.avatarUrl || `https://github.com/${user.username}.png`}
+            src={avatarSrc(user.avatarUrl, user.username, ROW_AVATAR_PX)}
             alt=""
+            loading="lazy"
+            decoding="async"
           />
           <UserInfo>
             <UserDisplayName>
@@ -1176,10 +1181,10 @@ export default function LeaderboardClient({ initialData, currentUser, initialSor
       )}
 
       {currentUser && currentUserRank && (
-        <CurrentUserCard href={`/u/${currentUser.username}`}>
+        <CurrentUserCard href={`/u/${currentUser.username}`} prefetch={false}>
           <CurrentUserInfo>
             <CurrentUserAvatar
-              src={currentUser.avatarUrl || `https://github.com/${currentUser.username}.png`}
+              src={avatarSrc(currentUser.avatarUrl, currentUser.username, 48)}
               alt=""
             />
             <CurrentUserDetails>
